@@ -26,3 +26,13 @@ Try it: [examples/call](examples/call) is a LiveView group call with video.
 
 Native apps join the same rooms with the Swift client for iOS and macOS:
 see [swift/README.md](swift/README.md).
+
+## Tests
+
+```sh
+bin/test            # Elixir, the browser client (Node 22+) and the Swift client
+bin/test all        # also builds the iOS example app (needs xcodegen)
+bin/test swift js   # just those
+```
+
+None of the suites needs Cloudflare or the network.

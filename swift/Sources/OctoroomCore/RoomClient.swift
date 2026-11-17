@@ -151,6 +151,9 @@ public final class RoomClient {
   public func join() async throws -> JSONValue {
     guard state == .idle else { throw OctoroomError.invalidState("can't join while \(state)") }
     setState(.joining)
+    // `leave()` mid-join tears down and bumps the generation: this join
+    // then stops at its next step instead of carrying on with a dead client.
+    let generation = self.generation
 
     do {
       socket.connect()
@@ -182,14 +185,16 @@ public final class RoomClient {
           }
         }
       }
+      try checkCurrent(generation)
       onJoinReply(reply)
 
-      try await openLocalMedia()
+      try await openLocalMedia(generation)
       try await connectMedia()
+      try checkCurrent(generation)
       setState(.joined)
       return reply
     } catch {
-      teardown(.failed)
+      if self.generation == generation { teardown(.failed) }
       throw error
     }
   }
@@ -198,6 +203,10 @@ public final class RoomClient {
   public func leave() {
     guard state != .idle else { return }
     teardown(.left)
+  }
+
+  private func checkCurrent(_ generation: Int) throws {
+    if self.generation != generation { throw OctoroomError.channelClosed }
   }
 
   private func joinParams() -> JSONValue {
@@ -253,13 +262,18 @@ public final class RoomClient {
   }
 
   // The mic (and the camera, with `video`), provided or opened by the engine.
-  private func openLocalMedia() async throws {
+  private func openLocalMedia(_ generation: Int) async throws {
     let owned = providedMedia == nil
     let media: [Source: any LocalMediaTrack]
     if let providedMedia {
       media = providedMedia
     } else {
       media = try await engine.openLocalMedia(audio: audio, video: video)
+      // Left while the engine was opening devices (e.g. at a permission prompt).
+      if self.generation != generation {
+        for track in media.values { track.stop() }
+        throw OctoroomError.channelClosed
+      }
     }
     for (source, track) in media { local[source] = LocalEntry(media: track, owned: owned) }
     if local.isEmpty { throw OctoroomError.media("nothing to publish: no audio or video track") }

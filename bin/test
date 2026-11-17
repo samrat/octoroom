@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Runs Octoroom's test suites locally and prints a summary.
+#
+#   bin/test                 elixir, js and swift
+#   bin/test swift js        just those, in that order
+#   bin/test all             the three, plus the iOS example app's build
+#
+# Suites:
+#   elixir  mix test
+#   js      the browser client (priv/static/octoroom.mjs) on Node's test runner
+#   swift   swift test: the core against fakes, the WebRTC engine over loopback
+#   ios     builds examples/ios for the simulator (needs xcodegen; slow)
+#
+# Every suite runs even when an earlier one fails; the exit status is 1 if
+# any failed. None of them needs Cloudflare or the network.
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+suites=("$@")
+if [ ${#suites[@]} -eq 0 ]; then suites=(elixir js swift); fi
+if [ "${suites[*]}" = "all" ]; then suites=(elixir js swift ios); fi
+
+bold=$'\e[1m' red=$'\e[31m' green=$'\e[32m' reset=$'\e[0m'
+if [ ! -t 1 ]; then bold="" red="" green="" reset=""; fi
+
+summary=()
+failed=0
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "${red}$1 not found: $2${reset}"
+    return 1
+  fi
+}
+
+suite_elixir() {
+  need mix "install Elixir (see .tool-versions or mix.exs)" && mix test
+}
+
+suite_js() {
+  need node "install Node 22 or later" || return 1
+  local major
+  major=$(node -p 'process.versions.node.split(".")[0]')
+  if [ "$major" -lt 22 ]; then
+    echo "${red}node $major is too old: the tests need Node 22 or later${reset}"
+    return 1
+  fi
+  local files=(test/js/*.test.mjs)
+  if [ ! -e "${files[0]}" ]; then
+    echo "${red}no test/js/*.test.mjs files${reset}"
+    return 1
+  fi
+  node --test "${files[@]}"
+}
+
+suite_swift() {
+  need swift "install Xcode or a Swift toolchain" && swift test
+}
+
+suite_ios() {
+  need xcodegen "brew install xcodegen" || return 1
+  need xcodebuild "install Xcode" || return 1
+  (
+    cd examples/ios &&
+      xcodegen generate --quiet &&
+      xcodebuild -project OctoroomCall.xcodeproj -scheme OctoroomCall \
+        -destination 'generic/platform=iOS Simulator' \
+        -derivedDataPath .build build -quiet
+  )
+}
+
+for suite in "${suites[@]}"; do
+  if ! declare -F "suite_$suite" >/dev/null; then
+    echo "${red}unknown suite: $suite (elixir, js, swift, ios, all)${reset}"
+    exit 2
+  fi
+  echo
+  echo "${bold}==> $suite${reset}"
+  start=$SECONDS
+  if "suite_$suite"; then
+    summary+=("${green}  ok${reset}    $suite ($((SECONDS - start))s)")
+  else
+    summary+=("${red}  FAIL${reset}  $suite ($((SECONDS - start))s)")
+    failed=1
+  fi
+done
+
+echo
+echo "${bold}Summary${reset}"
+printf '%s\n' "${summary[@]}"
+exit $failed

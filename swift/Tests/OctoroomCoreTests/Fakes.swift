@@ -109,6 +109,9 @@ final class FakeEngine: MediaEngine {
   var peers: [FakePeer] = []
   var opened: [FakeLocalTrack] = []
   var pc: FakePeer { peers.last! }
+  /// Runs before opening devices: a test holds it to act mid-open, as a
+  /// permission prompt would.
+  var beforeOpen: (() async -> Void)?
 
   func makePeerConnection(iceServers: [IceServer]) throws -> any PeerConnection {
     let peer = FakePeer(iceServers: iceServers)
@@ -117,6 +120,7 @@ final class FakeEngine: MediaEngine {
   }
 
   func openLocalMedia(audio: Bool, video: Bool) async throws -> [Source: any LocalMediaTrack] {
+    await beforeOpen?()
     var media: [Source: any LocalMediaTrack] = [:]
     if audio { media[.mic] = track(.audio) }
     if video { media[.camera] = track(.video) }

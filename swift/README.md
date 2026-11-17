@@ -101,5 +101,5 @@ An example app is in [examples/ios](../examples/ios).
   `VideoView`. It re-exports `OctoroomCore`.
 
 ```sh
-swift test   # from the repository root
+bin/test swift   # or plain `swift test`, from the repository root
 ```
