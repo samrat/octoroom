@@ -128,23 +128,40 @@ defmodule Octoroom.Room do
   starting the room if needed. The caller is monitored: when it exits, the
   participant leaves.
 
-  Returns `{:ok, %{participant_id, participants, ice_servers}, server}`.
+  Returns `{:ok, reply, server}`, where `reply` has `participant_id`,
+  `participants`, `ice_servers`, `resumed` (false) and `resume`: the data a
+  resume token carries (see `resume/4`).
   """
   def join(module, room_id, meta, opts \\ []) do
-    join(module, room_id, meta, opts, 5)
+    call_starting(module, room_id, {:join, self(), meta}, opts, 5)
   end
 
-  defp join(module, room_id, meta, opts, attempts) do
+  @doc """
+  Brings a participant back from its resume data (what the join reply's
+  `resume` held, signed into a token by the channel): after its connection
+  dropped, after the room server crashed, or after the node restarted.
+
+  If the room still has the participant, only its process is replaced. If
+  not (the room was restarted), the participant is re-added with the same id
+  and metadata and its Cloudflare session is adopted as it is, so nobody
+  renegotiates. `reply.resumed` is false when there was nothing to adopt and
+  the client must publish again.
+  """
+  def resume(module, room_id, data, opts \\ []) do
+    call_starting(module, room_id, {:resume, self(), data}, opts, 5)
+  end
+
+  defp call_starting(module, room_id, message, opts, attempts) do
     with {:ok, server} <- ensure_started(module, room_id, opts),
-         {:ok, reply} <- GenServer.call(server, {:join, self(), meta}) do
+         {:ok, reply} <- GenServer.call(server, message) do
       {:ok, reply, server}
     end
   catch
-    # The room stopped (its last participant left) between lookup and call,
-    # and its supervisor may still be shutting down.
+    # The room stopped (its last participant left, or it crashed) between
+    # lookup and call, and its supervisor may still be shutting down.
     :exit, _ when attempts > 1 ->
       Process.sleep(10)
-      join(module, room_id, meta, opts, attempts - 1)
+      call_starting(module, room_id, message, opts, attempts - 1)
   end
 
   defp ensure_started(module, room_id, opts) do

@@ -50,8 +50,24 @@ defmodule Octoroom.Cloudflare do
   @doc "Closes WebSocket adapters, so Cloudflare stops dialing and billing."
   @callback close_adapters(config, [String.t()]) :: :ok | {:error, term}
 
-  @doc "Reads back a session's tracks."
-  @callback session_state(config, session_id) :: {:ok, map} | {:error, term}
+  @typedoc """
+  A track as Cloudflare reports it in a session: pushed (`:local`) or pulled
+  (`:remote`, with the session it's pulled from).
+  """
+  @type session_track :: %{
+          location: :local | :remote,
+          track_name: String.t(),
+          mid: mid,
+          session_id: session_id | nil,
+          status: :active | :inactive | term
+        }
+
+  @doc """
+  Reads back a session's tracks. `{:error, :disconnected}` when the
+  session's peer connection is gone.
+  """
+  @callback session_state(config, session_id) ::
+              {:ok, %{tracks: [session_track]}} | {:error, :disconnected | term}
 
   @doc "The config from `config :octoroom, cloudflare: [...]`, with the HTTP client by default."
   def config do

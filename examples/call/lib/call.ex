@@ -9,9 +9,14 @@ defmodule Call.Application do
     if cf[:app_id] in [nil, ""] or cf[:app_secret] in [nil, ""],
       do: raise("Set OCTOROOM_CLOUDFLARE_APP_ID and OCTOROOM_CLOUDFLARE_APP_SECRET (see README)")
 
-    children = [{Phoenix.PubSub, name: Call.PubSub}, Call.Endpoint]
+    children = [{Phoenix.PubSub, name: Call.PubSub}, Call.Presence, Call.Endpoint]
     Supervisor.start_link(children, strategy: :one_for_one, name: Call.Supervisor)
   end
+end
+
+defmodule Call.Presence do
+  @moduledoc "Who has this room's page open, in the call or not."
+  use Phoenix.Presence, otp_app: :call, pubsub_server: Call.PubSub
 end
 
 defmodule Call.Room do
@@ -21,7 +26,9 @@ defmodule Call.Room do
     * a private two-second echo for each participant who turns it on, which
       only they hear;
     * a room-wide metronome, when the room's `:metronome` assign is set;
-    * a recorder hearing every mic, when the room's `:recording` assign is set.
+    * a recorder hearing every mic, when the room's `:recording` assign is set;
+    * live captions of every mic, when the room's `:captions` assign is set
+      (needs `SONIOX_API_KEY`).
   """
   use Octoroom.Room
 
@@ -52,8 +59,15 @@ defmodule Call.Room do
         do: [worker("recorder", Call.Recorder, inputs: Enum.map(room.participants, &mic/1))],
         else: []
 
-    metronome ++ echoes ++ recorder
+    captioner =
+      if room.assigns[:captions] && room.participants != [] && captions_available?(),
+        do: [worker("captioner", Call.Captioner, inputs: Enum.map(room.participants, &mic/1))],
+        else: []
+
+    metronome ++ echoes ++ recorder ++ captioner
   end
+
+  def captions_available?, do: Application.get_env(:call, :soniox_api_key) not in [nil, ""]
 
   @impl true
   def subscriptions(listener, room) do
@@ -119,6 +133,10 @@ defmodule Call.Layouts do
           .warn { background: #f3802022; border-radius: 10px; padding: 10px 12px; margin: 12px 0 0; }
           .recorded { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 12px; }
           .recorded .dir { width: 100%; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+          .viewers { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
+          .captions { background: var(--card); border-radius: 10px; padding: 8px 12px; margin-top: 12px; }
+          .captions .line { margin: 4px 0; }
+          .captions .partial { color: var(--muted); }
         </style>
         <script type="importmap">
           {"imports": {
@@ -143,18 +161,26 @@ defmodule Call.CallLive do
   def mount(params, _session, socket) do
     room = params["room"] || "lobby"
 
+    viewer = Base.url_encode64(:crypto.strong_rand_bytes(6), padding: false)
+
     if connected?(socket) do
       Octoroom.subscribe(room)
       # Outlet stats (queue length, underruns) change without room events.
       :timer.send_interval(1_000, :refresh)
+      Phoenix.PubSub.subscribe(Call.PubSub, presence_topic(room))
+      {:ok, _} = Call.Presence.track(self(), presence_topic(room), viewer, %{name: nil})
     end
 
     socket =
       assign(socket,
         room: room,
         me: nil,
+        viewer: viewer,
+        viewers: viewers(room),
+        captions: [],
         recorded: %{},
         recording_dir: nil,
+        captions?: Call.Room.captions_available?(),
         public_url?: Application.get_env(:octoroom, :public_ws_url) not in [nil, ""]
       )
 
@@ -167,6 +193,15 @@ defmodule Call.CallLive do
         socket
       ),
       do: {:noreply, assign(socket, recorded: seconds, recording_dir: dir)}
+
+  def handle_info(
+        {:octoroom, _room, {:worker_event, "captioner", {:caption, track, line}}},
+        socket
+      ),
+      do: {:noreply, assign(socket, captions: caption(socket.assigns.captions, track, line))}
+
+  def handle_info(%Phoenix.Socket.Broadcast{event: "presence_diff"}, socket),
+    do: {:noreply, assign(socket, viewers: viewers(socket.assigns.room))}
 
   def handle_info({:octoroom, _room, _event}, socket), do: {:noreply, load(socket)}
   def handle_info(:refresh, socket), do: {:noreply, load(socket)}
@@ -194,7 +229,8 @@ defmodule Call.CallLive do
     {:noreply, socket}
   end
 
-  def handle_event("toggle", %{"assign" => key}, socket) when key in ~w(metronome recording) do
+  def handle_event("toggle", %{"assign" => key}, socket)
+      when key in ~w(metronome recording captions) do
     key = String.to_existing_atom(key)
     on = get_in(socket.assigns, [:assigns, key]) || false
     Octoroom.Room.assign(socket.assigns.room, key, not on)
@@ -219,6 +255,7 @@ defmodule Call.CallLive do
 
     stats = Map.new(outputs, fn {name, _} -> {name, Octoroom.Outlet.stats(room, name)} end)
     me = Enum.find(participants, &(&1.id == socket.assigns.me))
+    socket = present_as(socket, me && me.meta.name)
 
     assign(socket,
       participants: participants,
@@ -232,6 +269,40 @@ defmodule Call.CallLive do
   end
 
   defp name(names, track), do: Map.get(names, track, track)
+
+  defp presence_topic(room), do: "viewers:#{room}"
+
+  # Shown in the call under `name` (nil when not in it). Checked on every
+  # load, since after a server restart the page may come back before its
+  # participant does.
+  defp present_as(socket, name) do
+    if connected?(socket) and socket.assigns[:presence_name] != name do
+      topic = presence_topic(socket.assigns.room)
+      Call.Presence.update(self(), topic, socket.assigns.viewer, %{name: name})
+      assign(socket, presence_name: name)
+    else
+      socket
+    end
+  end
+
+  # One entry per open page: `nil` for pages not in the call.
+  defp viewers(room) do
+    for {_id, %{metas: [meta | _]}} <- Call.Presence.list(presence_topic(room)), do: meta.name
+  end
+
+  # The newest lines last. A track's line in progress is replaced as Soniox
+  # revises it; a done line stays.
+  defp caption(captions, track, line) do
+    entry = %{track: track, text: line.text, done: line.done}
+
+    captions =
+      case Enum.find_index(captions, &(&1.track == track and not &1.done)) do
+        nil -> captions ++ [entry]
+        i -> List.replace_at(captions, i, entry)
+      end
+
+    Enum.take(captions, -8)
+  end
 
   defp input_note(worker, input) do
     dropped = worker.dropped[input] || 0
@@ -287,6 +358,24 @@ defmodule Call.CallLive do
         <button phx-click="toggle" phx-value-assign="recording">
           {if @assigns[:recording], do: "Stop recording", else: "Record"}
         </button>
+        <button :if={@captions?} phx-click="toggle" phx-value-assign="captions">
+          {if @assigns[:captions], do: "Captions off", else: "Captions on"}
+        </button>
+      </div>
+
+      <p class="viewers">
+        <strong>Here now:</strong>
+        {length(@viewers)} page(s) open{case Enum.reject(@viewers, &is_nil/1) do
+          [] -> ""
+          names -> ", in the call: " <> Enum.join(Enum.sort(names), ", ")
+        end}
+      </p>
+
+      <div :if={@assigns[:captions]} class="captions" id="captions">
+        <p :if={@captions == []} class="empty">Captions are on. Say something…</p>
+        <p :for={c <- @captions} class={["line", not c.done && "partial"]}>
+          <strong>{name(@names, c.track)}:</strong> {c.text}
+        </p>
       </div>
 
       <table :if={@participants != []}>

@@ -108,7 +108,7 @@ defmodule Octoroom.WorkerTest do
                     {:octoroom_signal, :reply, :pub, {:ok, %{sdp: "answer:" <> session}}}}
 
     assert name == client.name
-    FakeCloudflare.mark_live(ctx.fake, session, "mic")
+    FakeCloudflare.mark_live(ctx.fake, session, "#{client.id}/mic")
     Server.connected(client.server, client.id)
     Map.put(client, :session, session)
   end
@@ -164,16 +164,17 @@ defmodule Octoroom.WorkerTest do
 
     alice = publish(ctx, alice)
     session = alice.session
+    mic = "#{alice.id}/mic"
 
     assert_receive {:cloudflare, :new_adapters,
-                    [[%{location: "remote", sessionId: ^session, trackName: "mic"} = in_]]}
+                    [[%{location: "remote", sessionId: ^session, trackName: ^mic} = in_]]}
 
     assert in_.endpoint =~ ~r"^wss://example.test/octoroom/egress/"
-    wait_until(fn -> egress_adapter?(ctx, session, "mic") end)
+    wait_until(fn -> egress_adapter?(ctx, session, mic) end)
 
     # Nothing to pull until the echo has sent a frame.
     refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 50
-    FakeCloudflare.egress(ctx.fake, session, "mic", @frame)
+    FakeCloudflare.egress(ctx.fake, session, mic, @frame)
     assert_receive {:ingest, ^cf_track, frame}
     assert byte_size(frame) == 3_840
 
@@ -242,7 +243,7 @@ defmodule Octoroom.WorkerTest do
     refute_received {:cloudflare, :close_adapters, _}
     refute_received {:client, "alice", {:octoroom_signal, :renegotiate, _}}
     refute_received {:client, "alice", {:octoroom_signal, :close, _}}
-    FakeCloudflare.egress(ctx.fake, alice.session, "mic", @frame)
+    FakeCloudflare.egress(ctx.fake, alice.session, "#{alice.id}/mic", @frame)
     assert_receive {:ingest, ^cf_track, _}
   end
 
@@ -273,8 +274,9 @@ defmodule Octoroom.WorkerTest do
     # Bob's input is connected once his mic is live.
     bob = publish(ctx, bob)
     session = bob.session
-    assert_receive {:cloudflare, :new_adapters, [[%{sessionId: ^session, trackName: "mic"}]]}
-    wait_until(fn -> egress_adapter?(ctx, session, "mic") end)
+    mic = "#{bob.id}/mic"
+    assert_receive {:cloudflare, :new_adapters, [[%{sessionId: ^session, trackName: ^mic}]]}
+    wait_until(fn -> egress_adapter?(ctx, session, mic) end)
 
     wait_until(fn ->
       [%{connected: connected}] = Octoroom.Room.state(ctx.room_id).workers
@@ -305,5 +307,34 @@ defmodule Octoroom.WorkerTest do
     refute_receive {:cloudflare, :new_adapters, _}, 50
     assert [%{running: true}] = Octoroom.Room.state(ctx.room_id).workers
     Client.stop(alice)
+  end
+
+  defmodule Doomed do
+    use Octoroom.Worker
+
+    @impl true
+    def init(_args, _ctx), do: {:stop, :nope}
+
+    @impl true
+    def handle_audio(_input, _pcm, s), do: {:ok, s}
+  end
+
+  defmodule DoomedRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def workers(_room), do: [worker("doomed", Octoroom.WorkerTest.Doomed, [])]
+  end
+
+  test "a worker that keeps failing is given up, and the room is told", ctx do
+    Octoroom.subscribe(ctx.room_id)
+    opts = Keyword.put(ctx.opts, :retry_base_ms, 1)
+    Client.join("a", DoomedRoom, ctx.room_id, %{}, opts)
+
+    assert_receive {:octoroom, _, {:error, {:worker, "doomed"}, _reason}}, 1_000
+    refute_receive {:octoroom, _, {:error, _, _}}, 100
   end
 end

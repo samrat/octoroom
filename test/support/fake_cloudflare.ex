@@ -24,7 +24,15 @@ defmodule Octoroom.Test.FakeCloudflare do
   def start_link(test),
     do:
       Agent.start_link(fn ->
-        %{test: test, sessions: %{}, live: MapSet.new(), n: 0, fail: %{}, adapters: %{}}
+        %{
+          test: test,
+          sessions: %{},
+          live: MapSet.new(),
+          n: 0,
+          fail: %{},
+          adapters: %{},
+          disconnected: MapSet.new()
+        }
       end)
 
   def config(fake), do: %{client: __MODULE__, fake: fake}
@@ -36,6 +44,21 @@ defmodule Octoroom.Test.FakeCloudflare do
   def fail_next(fake, call, reason), do: Agent.update(fake, &put_in(&1.fail[call], reason))
 
   def tracks(fake, session), do: Agent.get(fake, & &1.sessions[session].tracks)
+
+  @doc "The session's peer connection closed: its tracks stop, and reads say so."
+  def disconnect(fake, session) do
+    Agent.update(fake, fn s ->
+      live = MapSet.reject(s.live, fn {sess, _} -> sess == session end)
+      %{s | live: live, disconnected: MapSet.put(s.disconnected, session)}
+    end)
+  end
+
+  @doc "Stops a track's packets, e.g. an ingest adapter's socket dropping."
+  def mark_dead(fake, session, track),
+    do: Agent.update(fake, &%{&1 | live: MapSet.delete(&1.live, {session, track})})
+
+  @doc "Every session's id."
+  def sessions(fake), do: Agent.get(fake, &Map.keys(&1.sessions))
 
   @doc "Open adapters: adapter id => `%{role, session_id, track_name}`."
   def adapters(fake),
@@ -198,8 +221,33 @@ defmodule Octoroom.Test.FakeCloudflare do
   end
 
   @impl true
-  def session_state(%{fake: fake}, session),
-    do: op(fake, :session_state, [session], &{{:ok, &1.sessions[session]}, &1})
+  def session_state(%{fake: fake}, session) do
+    op(fake, :session_state, [session], fn s ->
+      cond do
+        MapSet.member?(s.disconnected, session) ->
+          {{:error, :disconnected}, s}
+
+        sess = s.sessions[session] ->
+          tracks =
+            for {mid, t} <- Enum.sort(sess.tracks) do
+              source = t.remote || session
+
+              %{
+                location: if(t.remote, do: :remote, else: :local),
+                track_name: t.name,
+                mid: mid,
+                session_id: t.remote,
+                status: if(MapSet.member?(s.live, {source, t.name}), do: :active, else: :inactive)
+              }
+            end
+
+          {{:ok, %{tracks: tracks}}, s}
+
+        true ->
+          {{:error, {:cloudflare, "/sessions/#{session}", 404, "not found"}}, s}
+      end
+    end)
+  end
 
   defp op(fake, call, args, fun) do
     Agent.get_and_update(fake, fn s ->

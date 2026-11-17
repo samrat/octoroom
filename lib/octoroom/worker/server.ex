@@ -21,7 +21,7 @@ defmodule Octoroom.Worker.Server do
   def via(room_id, id), do: {:via, Registry, {Octoroom.Registry, {:worker, room_id, id}}}
 
   @impl true
-  def init(%{room_id: room_id, spec: spec, participants: participants}) do
+  def init(%{room_id: room_id, spec: spec, participants: participants} = opts) do
     # So `terminate/2` runs when the room shuts the worker down.
     Process.flag(:trap_exit, true)
     module = spec.module
@@ -32,7 +32,8 @@ defmodule Octoroom.Worker.Server do
       id: spec.id,
       inputs: spec.inputs,
       outputs: spec.outputs,
-      participants: participants
+      participants: participants,
+      resumed: Map.get(opts, :resumed)
     }
 
     state = %{

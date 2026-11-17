@@ -21,7 +21,8 @@ defmodule Call.MixProject do
       {:phoenix, "~> 1.8"},
       {:phoenix_live_view, "~> 1.1"},
       {:bandit, "~> 1.5"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:websockex, "~> 0.5.1"}
     ]
   end
 end

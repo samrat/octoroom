@@ -13,7 +13,9 @@ defmodule Octoroom.Reconciler do
   Operations, in the order they should be applied:
 
     1. `{:close_subscription, participant_id, name}`: open, but no longer
-       desired or no longer published.
+       desired, no longer published, or `stale: true` (pulled from a session
+       that's gone, such as a worker output's before a restart; once
+       closed, it's pulled again from the track's new session).
     2. `{:open_subscription, participant_id, name, %{gain: g}}`: desired and
        live. Subscriptions to pending tracks wait until they go live.
     3. `{:update_subscription, participant_id, name, %{gain: g}}`: open, with
@@ -48,8 +50,9 @@ defmodule Octoroom.Reconciler do
     wanted = wanted |> Enum.map(&normalize/1) |> Map.new(&{&1.name, &1})
 
     closes =
-      for {name, %{status: :open}} <- current,
-          not Map.has_key?(wanted, name) or Map.get(tracks, name) == nil,
+      for {name, %{status: :open} = sub} <- current,
+          not Map.has_key?(wanted, name) or Map.get(tracks, name) == nil or
+            Map.get(sub, :stale, false),
           do: {:close_subscription, pid, name}
 
     opens =

@@ -13,6 +13,14 @@
 // client hears: it sends Cloudflare's offers (`renegotiate`), asks for
 // transceivers to be closed (`close`), and then says which mid is which
 // track (`tracks`). Signaling is serialized: one exchange at a time.
+//
+// Reconnecting: the server hands out a resume token (refreshed with
+// `resume_token`). When the Phoenix socket reconnects, the channel rejoins
+// with it and the server takes this client back as the same participant
+// with the same Cloudflare session, even after a server restart: the peer
+// connection stays up the whole time, so audio keeps flowing. If there was
+// nothing to resume, the client publishes again on a new peer connection.
+// Events: "reconnecting", "reconnected" ({resumed}).
 
 const ICE_GATHERING_TIMEOUT_MS = 2_000
 const CONNECT_TIMEOUT_MS = 15_000
@@ -39,6 +47,7 @@ export class RoomClient {
     this.remote = new Map() // mid => {mid, track, participant_id, gain, element}
     this.queue = Promise.resolve()
     this.state = "idle"
+    this.resumeToken = null
   }
 
   on(event, fn) {
@@ -66,53 +75,102 @@ export class RoomClient {
     this.setState("joining")
 
     try {
-      const channel = this.socket.channel(this.topic, this.params)
+      // A function, so a rejoin sends the latest resume token.
+      const channel = this.socket.channel(this.topic, () =>
+        this.resumeToken ? {...this.params, resume_token: this.resumeToken} : this.params,
+      )
       this.channel = channel
       channel.on("renegotiate", (p) => this.serially(() => this.onRenegotiate(p)))
       channel.on("close", (p) => this.serially(() => this.onClose(p)))
       channel.on("tracks", (p) => this.serially(() => this.onTracks(p)))
       channel.on("gain", ({mid, gain}) => this.setGain(mid, gain))
       channel.on("room_event", (event) => this.onRoomEvent(event))
-      channel.onError(() => this.state === "joined" && this.emit("error", new Error("channel error")))
+      channel.on("resume_token", ({token}) => (this.resumeToken = token))
+      channel.on("republish", () => this.serially(() => this.restartMedia()))
+      channel.onError(() => this.state === "joined" && this.emit("reconnecting"))
       channel.onClose(() => this.channel === channel && this.teardown("closed"))
 
       const reply = await new Promise((resolve, reject) => {
+        let joined = false
         channel
           .join(PUSH_TIMEOUT_MS)
-          .receive("ok", resolve)
-          .receive("error", (r) => reject(new Error(r?.reason || "join failed")))
-          .receive("timeout", () => reject(new Error("join timed out")))
+          // Phoenix runs these again on every rejoin.
+          .receive("ok", (reply) => (joined ? this.onRejoined(reply) : ((joined = true), resolve(reply))))
+          .receive("error", (r) => !joined && reject(new Error(r?.reason || "join failed")))
+          .receive("timeout", () => !joined && reject(new Error("join timed out")))
       })
-      this.participantId = reply.participant_id
-      this.participants = reply.participants
-      this.emit("participants", this.participants)
+      this.onJoinReply(reply)
 
       this.stream =
         this.providedStream || (await navigator.mediaDevices.getUserMedia({audio: this.audioConstraints}))
 
-      const pc = new RTCPeerConnection({iceServers: reply.ice_servers, bundlePolicy: "max-bundle"})
-      this.pc = pc
-      pc.onconnectionstatechange = () => {
-        this.emit("connection", pc.connectionState)
-        if (pc.connectionState === "failed") this.emit("error", new Error("connection failed"))
-      }
-
-      const [track] = this.stream.getAudioTracks()
-      const mic = pc.addTransceiver(track, {direction: "sendonly", streams: [this.stream]})
-      await pc.setLocalDescription(await pc.createOffer())
-      // Cloudflare takes no trickle ICE: send the offer with its candidates.
-      await iceGathered(pc, ICE_GATHERING_TIMEOUT_MS)
-
-      const {sdp} = await this.push("publish", {sdp: pc.localDescription.sdp, mids: {mic: mic.mid}})
-      await pc.setRemoteDescription({type: "answer", sdp})
-      await peerConnected(pc, CONNECT_TIMEOUT_MS)
-      await this.push("connected", {})
+      await this.connectMedia()
+      // Closing the tab looks like a dropped connection, which the server
+      // holds for a while in case it comes back: say goodbye instead.
+      this.onPageHide = () => this.leave()
+      window.addEventListener("pagehide", this.onPageHide)
       this.setState("joined")
       return reply
     } catch (error) {
       this.teardown("failed")
       throw error
     }
+  }
+
+  onJoinReply(reply) {
+    this.participantId = reply.participant_id
+    this.participants = reply.participants
+    this.iceServers = reply.ice_servers
+    this.resumeToken = reply.resume_token
+    this.emit("participants", this.participants)
+  }
+
+  onRejoined(reply) {
+    this.onJoinReply(reply)
+    this.emit("reconnected", {resumed: reply.resumed})
+    // Nothing to resume (the token expired, or the session was never
+    // published): start over as a new participant.
+    if (!reply.resumed && this.state === "joined") this.serially(() => this.restartMedia())
+  }
+
+  // A peer connection to Cloudflare with the mic published on it.
+  async connectMedia() {
+    const pc = new RTCPeerConnection({iceServers: this.iceServers, bundlePolicy: "max-bundle"})
+    this.pc = pc
+    pc.onconnectionstatechange = () => {
+      if (this.pc !== pc) return
+      this.emit("connection", pc.connectionState)
+      if (pc.connectionState === "failed") this.emit("error", new Error("connection failed"))
+    }
+
+    const [track] = this.stream.getAudioTracks()
+    const mic = pc.addTransceiver(track, {direction: "sendonly", streams: [this.stream]})
+    await pc.setLocalDescription(await pc.createOffer())
+    // Cloudflare takes no trickle ICE: send the offer with its candidates.
+    await iceGathered(pc, ICE_GATHERING_TIMEOUT_MS)
+
+    const {sdp} = await this.push("publish", {sdp: pc.localDescription.sdp, mids: {mic: mic.mid}})
+    await pc.setRemoteDescription({type: "answer", sdp})
+    await peerConnected(pc, CONNECT_TIMEOUT_MS)
+    await this.push("connected", {})
+  }
+
+  // The server lost this client's session: publish again on a new one.
+  async restartMedia() {
+    if (!this.stream) return
+    this.clearRemote()
+    this.pc?.close()
+    this.pc = null
+    await this.connectMedia()
+  }
+
+  clearRemote() {
+    for (const info of this.remote.values()) {
+      info.element.srcObject = null
+      info.element.remove()
+    }
+    this.remote.clear()
+    this.emit("tracks", [])
   }
 
   async leave() {
@@ -173,7 +231,15 @@ export class RoomClient {
     await pc.setRemoteDescription({type: "answer", sdp})
   }
 
-  onTracks({added, removed}) {
+  onTracks({added, removed, reset}) {
+    // After a reconnect the server sends everything this client hears: drop
+    // what it didn't mention, and keep what's unchanged playing as it is.
+    if (reset) {
+      const now = new Map(added.map((info) => [info.mid, info]))
+      removed = [...this.remote.keys()].filter((mid) => now.get(mid)?.track !== this.remote.get(mid).track)
+      added = added.filter((info) => this.remote.get(info.mid)?.track !== info.track)
+    }
+
     for (const mid of removed) {
       const info = this.remote.get(mid)
       if (info) {
@@ -231,11 +297,9 @@ export class RoomClient {
   }
 
   teardown(reason) {
-    for (const info of this.remote.values()) {
-      info.element.srcObject = null
-      info.element.remove()
-    }
-    this.remote.clear()
+    if (this.onPageHide) window.removeEventListener("pagehide", this.onPageHide)
+    this.onPageHide = null
+    this.clearRemote()
     this.pc?.close()
     this.pc = null
     if (!this.providedStream) this.stream?.getTracks().forEach((t) => t.stop())
@@ -244,9 +308,9 @@ export class RoomClient {
     this.channel = null
     if (reason !== "closed") channel?.leave()
     this.participants = []
+    this.resumeToken = null
     this.queue = Promise.resolve()
     this.emit("participants", [])
-    this.emit("tracks", [])
     // "left": leave() was called; "closed": the server removed this client;
     // "failed": join() failed. Either way the client can join again.
     this.emit("left", reason)

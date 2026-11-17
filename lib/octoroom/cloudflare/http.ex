@@ -3,6 +3,12 @@ defmodule Octoroom.Cloudflare.HTTP do
   `Octoroom.Cloudflare` over Cloudflare's HTTP API. Needs `:app_id` and
   `:app_secret` in the config. `:request_fun` (default `&Req.request/1`) is
   for tests.
+
+  Calls Cloudflare didn't carry out are retried, up to `:attempts` in all
+  (default 3) with `:backoff_ms` (default 200) doubling in between: 429,
+  502, 503 and 504 for every call, and transport errors (the request may not
+  have arrived) only for calls that are safe to repeat, `GET`s and closing
+  adapters. Pulling or pushing twice would add tracks twice.
   """
 
   @behaviour Octoroom.Cloudflare
@@ -88,7 +94,28 @@ defmodule Octoroom.Cloudflare.HTTP do
   end
 
   @impl true
+  # Cloudflare takes at most 4 adapters per request (closing says so:
+  # "Expecting at most 4 track in the request", observed 2026-11-17), so
+  # larger batches are split. If a later chunk fails, the adapters already
+  # created are closed, so the caller's all-or-nothing view holds.
+  @adapter_batch 4
+
   def new_adapters(config, tracks) do
+    tracks
+    |> Enum.chunk_every(@adapter_batch)
+    |> Enum.reduce_while({:ok, []}, fn chunk, {:ok, created} ->
+      case new_adapter_chunk(config, chunk) do
+        {:ok, more} ->
+          {:cont, {:ok, created ++ more}}
+
+        error ->
+          close_adapters(config, Enum.map(created, & &1.adapter_id))
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp new_adapter_chunk(config, tracks) do
     with {:ok, resp} <- request(config, :post, "/adapters/websocket/new", %{tracks: tracks}),
          :ok <- no_track_errors(resp) do
       {:ok,
@@ -103,22 +130,95 @@ defmodule Octoroom.Cloudflare.HTTP do
   def close_adapters(_config, []), do: :ok
 
   def close_adapters(config, ids) do
-    body = %{tracks: Enum.map(ids, &%{adapterId: &1})}
+    ids
+    |> Enum.chunk_every(@adapter_batch)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      body = %{tracks: Enum.map(chunk, &%{adapterId: &1})}
 
-    case request(config, :post, "/adapters/websocket/close", body) do
-      {:ok, _} -> :ok
-      error -> error
-    end
+      case request(config, :post, "/adapters/websocket/close", body) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   @impl true
-  def session_state(config, session), do: request(config, :get, "/sessions/#{session}", nil)
+  def session_state(config, session) do
+    case request(config, :get, "/sessions/#{session}", nil) do
+      {:ok, %{"tracks" => tracks}} ->
+        {:ok, %{tracks: Enum.map(tracks, &session_track/1)}}
+
+      {:ok, body} when map_size(body) == 0 ->
+        {:ok, %{tracks: []}}
+
+      # 410 "Session appears to be disconnected" (observed 2026-11-17): its
+      # peer connection is gone.
+      {:error, {:cloudflare, _path, 410, _}} ->
+        {:error, :disconnected}
+
+      {:error, {:cloudflare, _path, "session_error", _}} ->
+        {:error, :disconnected}
+
+      {:ok, body} ->
+        {:error, {:unexpected_cloudflare_response, body}}
+
+      error ->
+        error
+    end
+  end
+
+  defp session_track(t) do
+    %{
+      location: if(t["location"] == "remote", do: :remote, else: :local),
+      track_name: t["trackName"],
+      mid: t["mid"],
+      session_id: t["sessionId"],
+      status:
+        case t["status"] do
+          "active" -> :active
+          "inactive" -> :inactive
+          other -> other
+        end
+    }
+  end
 
   @doc """
   One API call. Returns the decoded body, or an error for HTTP failures and
   for an error Cloudflare reports at the top level of a 2xx body.
   """
   def request(config, method, path, body) do
+    attempts = Map.get(config, :attempts, 3)
+    backoff = Map.get(config, :backoff_ms, 200)
+    request(config, method, path, body, 1, attempts, backoff)
+  end
+
+  defp request(config, method, path, body, attempt, attempts, backoff) do
+    result = request_once(config, method, path, body)
+
+    if attempt < attempts and retry?(method, path, result) do
+      Logger.info(
+        "Cloudflare #{method} #{path} failed (#{inspect(result)}), retrying in #{backoff} ms"
+      )
+
+      Process.sleep(backoff)
+      request(config, method, path, body, attempt + 1, attempts, backoff * 2)
+    else
+      result
+    end
+  end
+
+  # Cloudflare answered that it didn't carry the call out.
+  defp retry?(_method, _path, {:error, {:cloudflare, _, status, _}})
+       when status in [429, 502, 503, 504],
+       do: true
+
+  # The request may not have arrived: only safe to repeat when idempotent.
+  defp retry?(method, path, {:error, {:cloudflare, _, %{__exception__: true}}}),
+    do: method == :get or path == "/adapters/websocket/close"
+
+  defp retry?(_method, _path, _result), do: false
+
+  defp request_once(config, method, path, body) do
     request_fun = Map.get(config, :request_fun, &Req.request/1)
     started = System.monotonic_time(:millisecond)
 

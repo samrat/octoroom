@@ -26,5 +26,12 @@ config :octoroom,
     app_secret: fetch.("OCTOROOM_CLOUDFLARE_APP_SECRET")
   ]
 
+# SONIOX_API_KEY: for live captions (optional).
+config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
+
+# OCTOROOM_STORE: where the room store's snapshot lives, so rooms survive a
+# restart of this app (defaults to the system temp directory).
+if path = fetch.("OCTOROOM_STORE"), do: config(:octoroom, store: {Octoroom.Store.ETS, path: path})
+
 if port = System.get_env("PORT"),
   do: config(:call, Call.Endpoint, http: [port: String.to_integer(port)])

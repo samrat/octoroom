@@ -18,6 +18,12 @@ milestone 3 adds:
   and flat; watch the Queued and Underruns columns.
 - **Record:** `Call.Recorder` writes every mic to its own WAV file and
   reports seconds recorded per person. People joining don't restart it.
+- **Captions on:** `Call.Captioner` streams every mic to Soniox's real-time
+  speech-to-text and `emit`s captions, which the page shows as they arrive.
+  Needs `SONIOX_API_KEY`; without it the button is hidden.
+
+"Here now" uses Phoenix Presence: how many pages have the room open, and
+who of them is in the call.
 
 ## Run it
 
@@ -75,3 +81,10 @@ Cloudflare sessions on your account; stop it when you're done.
   half a second, and the browser doesn't renegotiate.
 - **Cleanup:** after Echo off or leaving, the worker's adapters are closed
   (the server logs any close that fails).
+- **Server restart:** with people in the call, stop the server (Ctrl-C
+  twice, or `kill -9` for a crash) and start it again. Audio between people
+  keeps flowing while it's down; the page says it's reconnecting, then
+  "resumed the same session" with no new peer connection. Workers go quiet
+  and come back, and the room's buttons (metronome, recording, captions)
+  are as they were. Rooms are kept in `OCTOROOM_STORE` (a file; the system
+  temp directory by default), and a restart within 10 minutes resumes them.

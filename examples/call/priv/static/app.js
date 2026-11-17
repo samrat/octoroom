@@ -69,6 +69,10 @@ const Call = {
       if (room.state === "joined") this.status(`In the call. Playing ${tracks.length} track(s).`)
     })
     room.on("error", (error) => this.status(`Error: ${error.message}`))
+    room.on("reconnecting", () => this.status("Lost the server; reconnecting (audio keeps flowing)…"))
+    room.on("reconnected", ({resumed}) =>
+      this.status(resumed ? "Reconnected: resumed the same session." : "Reconnected as a new participant; publishing again…"),
+    )
     room.on("left", () => this.cleanup())
 
     this.status(this.tone ? `Joining with a ${this.tone.frequency} Hz test tone…` : "Joining…")
@@ -111,6 +115,12 @@ const Call = {
     this.tone = null
     this.$("#mute").textContent = "Mute"
     document.querySelectorAll("[id^=level-]").forEach((el) => (el.style.width = "0"))
+  },
+
+  // LiveView reconnected (e.g. after a server restart): its server side
+  // starts afresh and needs to know who this tab is again.
+  reconnected() {
+    if (this.room) this.pushEvent("client", {state: this.room.state, participant_id: this.room.participantId})
   },
 
   destroyed() {

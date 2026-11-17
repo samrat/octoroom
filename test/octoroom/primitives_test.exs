@@ -90,6 +90,137 @@ defmodule Octoroom.PrimitivesTest do
       assert {:error, {:cloudflare, "/sessions/new", 400, "bad"}} = HTTP.new_session(config(bad))
     end
 
+    test "retries what Cloudflare didn't carry out" do
+      {:ok, calls} = Agent.start_link(fn -> [] end)
+
+      fun = fn responses ->
+        fn opts ->
+          n = Agent.get_and_update(calls, &{length(&1), [opts[:method] | &1]})
+          Enum.at(responses, n, List.last(responses))
+        end
+      end
+
+      config = fn f -> %{config(f) | request_fun: f} |> Map.put(:backoff_ms, 1) end
+
+      ok = {:ok, %{status: 200, body: %{"sessionId" => "s1"}}}
+      busy = {:ok, %{status: 503, body: "busy"}}
+      assert {:ok, "s1"} = HTTP.new_session(config.(fun.([busy, busy, ok])))
+      assert Agent.get(calls, &length/1) == 3
+
+      # Gives up after three attempts.
+      Agent.update(calls, fn _ -> [] end)
+      assert {:error, {:cloudflare, _, 503, _}} = HTTP.new_session(config.(fun.([busy])))
+      assert Agent.get(calls, &length/1) == 3
+
+      # A transport error isn't retried for a POST that may have arrived...
+      Agent.update(calls, fn _ -> [] end)
+      down = {:error, %Req.TransportError{reason: :closed}}
+      assert {:error, _} = HTTP.new_session(config.(fun.([down, ok])))
+      assert Agent.get(calls, &length/1) == 1
+
+      # ...but is for a read.
+      Agent.update(calls, fn _ -> [] end)
+      state = {:ok, %{status: 200, body: %{"tracks" => []}}}
+      assert {:ok, %{tracks: []}} = HTTP.session_state(config.(fun.([down, state])), "s")
+      assert Agent.get(calls, &length/1) == 2
+    end
+
+    test "session state comes back normalized, and a dead session as :disconnected" do
+      body = %{
+        "tracks" => [
+          %{"location" => "local", "trackName" => "a/mic", "mid" => "0", "status" => "active"},
+          %{
+            "location" => "remote",
+            "sessionId" => "s2",
+            "trackName" => "b/mic",
+            "mid" => "1",
+            "status" => "inactive"
+          }
+        ]
+      }
+
+      assert {:ok, %{tracks: [local, remote]}} =
+               HTTP.session_state(config(fn _ -> {:ok, %{status: 200, body: body}} end), "s1")
+
+      assert local == %{
+               location: :local,
+               track_name: "a/mic",
+               mid: "0",
+               session_id: nil,
+               status: :active
+             }
+
+      assert remote == %{
+               location: :remote,
+               track_name: "b/mic",
+               mid: "1",
+               session_id: "s2",
+               status: :inactive
+             }
+
+      gone = fn _ ->
+        {:ok,
+         %{
+           status: 410,
+           body: %{
+             "errorCode" => "session_error",
+             "errorDescription" => "Session appears to be disconnected."
+           }
+         }}
+      end
+
+      assert {:error, :disconnected} = HTTP.session_state(config(gone), "s1")
+    end
+
+    test "adapter calls go in batches of four" do
+      test = self()
+
+      fun = fn opts ->
+        n = length(opts[:json].tracks)
+        send(test, {:batch, opts[:url], n})
+
+        tracks =
+          for i <- 1..n, do: %{"adapterId" => "a#{System.unique_integer([:positive])}-#{i}"}
+
+        {:ok, %{status: 200, body: %{"tracks" => tracks}}}
+      end
+
+      ids = for i <- 1..9, do: "id#{i}"
+      assert :ok = HTTP.close_adapters(config(fun), ids)
+      assert_received {:batch, _, 4}
+      assert_received {:batch, _, 4}
+      assert_received {:batch, _, 1}
+
+      tracks = for i <- 1..5, do: %{location: "local", trackName: "t#{i}"}
+      assert {:ok, created} = HTTP.new_adapters(config(fun), tracks)
+      assert length(created) == 5
+    end
+
+    test "a failed adapter batch closes the ones already created" do
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+      fun = fn opts ->
+        n = Agent.get_and_update(calls, &{&1, &1 + 1})
+
+        cond do
+          String.ends_with?(opts[:url], "/close") ->
+            send(self(), {:closed, Enum.map(opts[:json].tracks, & &1.adapterId)})
+            {:ok, %{status: 200, body: %{}}}
+
+          n == 0 ->
+            {:ok,
+             %{status: 200, body: %{"tracks" => for(i <- 1..4, do: %{"adapterId" => "a#{i}"})}}}
+
+          true ->
+            {:ok, %{status: 400, body: "nope"}}
+        end
+      end
+
+      tracks = for i <- 1..6, do: %{location: "local", trackName: "t#{i}"}
+      assert {:error, _} = HTTP.new_adapters(config(fun), tracks)
+      assert_received {:closed, ["a1", "a2", "a3", "a4"]}
+    end
+
     test "push fails on a per-track error" do
       resp = fn _ -> {:ok, %{status: 200, body: %{"tracks" => [%{"errorCode" => "bad_mid"}]}}} end
 

@@ -49,7 +49,7 @@ defmodule Octoroom.RoomTest do
                     {:octoroom_signal, :reply, :pub, {:ok, %{sdp: "answer:" <> session}}}}
 
     assert name == client.name
-    FakeCloudflare.mark_live(ctx.fake, session, "mic")
+    FakeCloudflare.mark_live(ctx.fake, session, "#{client.id}/mic")
     Server.connected(client.server, client.id)
     Map.put(client, :session, session)
   end
@@ -101,10 +101,11 @@ defmodule Octoroom.RoomTest do
     assert alice_id == alice.id
 
     assert_receive {:cloudflare, :pull_tracks,
-                    [session, [%{session_id: bob_session, track_name: "mic"}]]}
+                    [session, [%{session_id: bob_session, track_name: bob_mic}]]}
                    when session == alice.session
 
     assert bob_session == bob.session
+    assert bob_mic == "#{bob.id}/mic"
     assert hears(ctx) == %{"alice" => ["#{bob.id}/mic"], "bob" => ["#{alice.id}/mic"]}
     assert_receive {:octoroom, _, {:subscriptions, ^alice_id, [_]}}
 
@@ -152,7 +153,7 @@ defmodule Octoroom.RoomTest do
     accept_pull(bob)
     refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 100
 
-    FakeCloudflare.mark_live(ctx.fake, session, "mic")
+    FakeCloudflare.mark_live(ctx.fake, session, "#{bob.id}/mic")
     accept_pull(alice, 1_500)
   end
 

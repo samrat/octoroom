@@ -15,7 +15,22 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     between the browser and the room server, which owns every session.
 
     Client → server: `publish`, `connected`, `answer`, `close_offer`.
-    Server → client: `renegotiate`, `close`, `tracks`, `gain`, `room_event`.
+    Server → client: `renegotiate`, `close`, `tracks`, `gain`, `room_event`,
+    `resume_token`, `republish`.
+
+    ## Resuming
+
+    The join reply carries a `resume_token`, refreshed with a
+    `resume_token` push whenever what it holds changes (the participant's
+    Cloudflare session, its metadata). The JS client rejoins with it after
+    its connection drops, including when the node restarted, and comes back
+    as the same participant with the same session: the room adopts it, so
+    nobody renegotiates. The token is encrypted with the endpoint's
+    `secret_key_base` and accepted for `config :octoroom, resume_max_age:`
+    seconds (default 600), which is the longest outage a room survives.
+
+    When the room server crashes while the channel stays up, the channel
+    resumes on its own.
     """
 
     import Phoenix.Channel, only: [push: 3, reply: 2, socket_ref: 1]
@@ -46,20 +61,58 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       end
     end
 
+    @salt "octoroom resume"
+
     @doc false
     def __join__(module, topic, params, socket) do
       [_prefix, room_id] = String.split(topic, ":", parts: 2)
+      {token, params} = Map.pop(params, "resume_token")
 
-      with {:ok, meta} <- module.join(params, socket),
-           {:ok, reply, server} <- Octoroom.Room.join(module, room_id, meta) do
-        Process.monitor(server)
+      result =
+        case verify(socket, token, room_id) do
+          {:ok, data} ->
+            Octoroom.Room.resume(module, room_id, data)
 
-        room = %{room_id: room_id, server: server, participant_id: reply.participant_id}
-        {:ok, reply, assign(socket, :octoroom, room)}
-      else
-        {:error, reason} -> {:error, %{reason: format(reason)}}
+          :error ->
+            with {:ok, meta} <- module.join(params, socket),
+                 do: Octoroom.Room.join(module, room_id, meta)
+        end
+
+      case result do
+        {:ok, reply, server} ->
+          room = %{
+            module: module,
+            room_id: room_id,
+            server: server,
+            monitor: Process.monitor(server),
+            participant_id: reply.participant_id,
+            resume: reply.resume
+          }
+
+          {resume, reply} = Map.pop(reply, :resume)
+          reply = Map.put(reply, :resume_token, sign(socket, room_id, resume))
+          {:ok, reply, assign(socket, :octoroom, room)}
+
+        {:error, reason} ->
+          {:error, %{reason: format(reason)}}
       end
     end
+
+    defp sign(socket, room_id, data),
+      do: Phoenix.Token.encrypt(socket, @salt, Map.put(data, :room_id, room_id))
+
+    defp verify(_socket, nil, _room_id), do: :error
+
+    defp verify(socket, token, room_id) when is_binary(token) do
+      max_age = Application.get_env(:octoroom, :resume_max_age, 600)
+
+      case Phoenix.Token.decrypt(socket, @salt, token, max_age: max_age) do
+        {:ok, %{room_id: ^room_id} = data} -> {:ok, Map.delete(data, :room_id)}
+        _ -> :error
+      end
+    end
+
+    defp verify(_socket, _token, _room_id), do: :error
 
     @doc false
     def __handle_in__("publish", %{"sdp" => sdp, "mids" => mids}, socket) do
@@ -111,26 +164,59 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     def __handle_info__({:octoroom_signal, kind, payload}, socket)
-        when kind in [:renegotiate, :close, :tracks, :gain] do
+        when kind in [:renegotiate, :close, :tracks, :gain, :republish] do
       push(socket, Atom.to_string(kind), payload)
       {:noreply, socket}
     end
 
-    def __handle_info__({:DOWN, _ref, :process, pid, _reason}, socket) do
-      if match?(%{server: ^pid}, socket.assigns[:octoroom]),
-        do: {:stop, {:shutdown, :room_closed}, socket},
-        else: {:noreply, socket}
+    def __handle_info__({:octoroom_signal, :resume, data}, socket) do
+      room = socket.assigns.octoroom
+      push(socket, "resume_token", %{token: sign(socket, room.room_id, data)})
+      {:noreply, assign(socket, :octoroom, %{room | resume: data})}
+    end
+
+    def __handle_info__({:DOWN, ref, :process, _pid, reason}, socket) do
+      case socket.assigns[:octoroom] do
+        %{monitor: ^ref} = room -> room_down(room, reason, socket)
+        _ -> {:noreply, socket}
+      end
     end
 
     def __handle_info__(_message, socket), do: {:noreply, socket}
 
+    # The room stopped on purpose (it was shut down): so does the channel.
+    # It crashed: the channel brings this participant back into a new run.
+    defp room_down(_room, reason, socket)
+         when reason in [:normal, :shutdown] or
+                (is_tuple(reason) and elem(reason, 0) == :shutdown),
+         do: {:stop, {:shutdown, :room_closed}, assign(socket, :octoroom, nil)}
+
+    defp room_down(room, _crash, socket) do
+      case Octoroom.Room.resume(room.module, room.room_id, room.resume) do
+        {:ok, reply, server} ->
+          room = %{room | server: server, monitor: Process.monitor(server), resume: reply.resume}
+          push(socket, "resume_token", %{token: sign(socket, room.room_id, reply.resume)})
+          if not reply.resumed, do: push(socket, "republish", %{reason: :room_restarted})
+          {:noreply, assign(socket, :octoroom, room)}
+
+        {:error, _reason} ->
+          {:stop, {:shutdown, :room_closed}, socket}
+      end
+    end
+
     @doc false
-    def __terminate__(_reason, socket) do
+    # Only the client leaving is a leave. A dropped connection
+    # ({:shutdown, :closed}) or the node shutting down (:shutdown) isn't:
+    # the room keeps the participant for a grace period, in case it resumes.
+    # Anything else (a crash) the room sees through its monitor.
+    def __terminate__({:shutdown, :left}, socket) do
       case socket.assigns[:octoroom] do
         %{server: server, participant_id: id} -> Server.leave(server, id)
         _ -> :ok
       end
     end
+
+    def __terminate__(_reason, _socket), do: :ok
 
     defp format(reason) when is_atom(reason), do: Atom.to_string(reason)
     defp format(reason) when is_binary(reason), do: reason

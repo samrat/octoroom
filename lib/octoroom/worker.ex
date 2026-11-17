@@ -114,15 +114,21 @@ defmodule Octoroom.Worker.Context do
   What a worker knows when it starts: its room, its id, its input and output
   track names, and the room's participants at that moment. Call
   `Octoroom.Room.state/1` for anything newer.
+
+  `resumed` is set when the worker starts while its room is recovering from
+  a crash or restart: `%{gone_ms: ms}`, about how long the room was down.
+  A worker that keeps state outside its process (a conversation so far)
+  reloads it then.
   """
 
-  defstruct [:room_id, :id, inputs: [], outputs: [], participants: []]
+  defstruct [:room_id, :id, :resumed, inputs: [], outputs: [], participants: []]
 
   @type t :: %__MODULE__{
           room_id: String.t(),
           id: String.t(),
           inputs: [String.t()],
           outputs: [String.t()],
-          participants: [Octoroom.Participant.t()]
+          participants: [Octoroom.Participant.t()],
+          resumed: nil | %{gone_ms: non_neg_integer}
         }
 end

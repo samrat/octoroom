@@ -151,3 +151,195 @@ defmodule Call.Recorder do
     :ok = :file.pwrite(io, 0, header)
   end
 end
+
+defmodule Call.Captioner do
+  @moduledoc """
+  Live captions: streams every mic it hears to Soniox's real-time
+  speech-to-text, one WebSocket per input, and emits
+  `{:caption, track, %{text: text, done: done?}}` as words arrive. A line is
+  `done` at the end of an utterance; until then its text may still change.
+
+  Needs `config :call, soniox_api_key:`. After a restart (the room
+  recovering) it starts over with new sockets: captions pause while it's
+  down, and pick up again.
+  """
+  use Octoroom.Worker, audio: [rate: 16_000, channels: 1]
+
+  require Logger
+
+  @impl true
+  def init(_args, ctx) do
+    if ctx.resumed, do: Logger.info("Captioner resumed after #{ctx.resumed.gone_ms} ms")
+
+    {:ok,
+     %{key: Application.fetch_env!(:call, :soniox_api_key), inputs: %{}, sockets: %{}, wait: %{}}}
+  end
+
+  @impl true
+  def handle_audio(input, pcm, state) do
+    case socket(state, input) do
+      {nil, state} ->
+        {:ok, state}
+
+      {socket, state} ->
+        Call.SonioxSocket.send_audio(socket, pcm)
+        {:ok, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:soniox, socket, {kind, text}}, state) when kind in [:partial, :final] do
+    case state.sockets[socket] do
+      nil -> {:ok, state}
+      input -> {:ok, state, emit: {:caption, input, %{text: text, done: kind == :final}}}
+    end
+  end
+
+  def handle_info({:soniox, socket, {:closed, reason}}, state) do
+    # Audio from that input opens a new one, after a pause so a bad key or
+    # an outage doesn't become a reconnect loop.
+    Logger.warning("Soniox socket closed: #{inspect(reason)}")
+
+    case Map.pop(state.sockets, socket) do
+      {nil, _} ->
+        {:ok, state}
+
+      {input, sockets} ->
+        wait = Map.put(state.wait, input, System.monotonic_time(:millisecond) + 5_000)
+        {:ok, %{state | sockets: sockets, inputs: Map.delete(state.inputs, input), wait: wait}}
+    end
+  end
+
+  def handle_info(_message, state), do: {:ok, state}
+
+  defp socket(state, input) do
+    # Monotonic time can be negative: no entry means not waiting.
+    waiting =
+      case state.wait[input] do
+        nil -> false
+        until -> until > System.monotonic_time(:millisecond)
+      end
+
+    case state.inputs[input] do
+      nil when waiting ->
+        {nil, state}
+
+      nil ->
+        {:ok, socket} = Call.SonioxSocket.start_link(api_key: state.key, parent: self())
+        state = %{state | inputs: Map.put(state.inputs, input, socket)}
+        {socket, put_in(state.sockets[socket], input)}
+
+      socket ->
+        {socket, state}
+    end
+  end
+end
+
+defmodule Call.SonioxSocket do
+  @moduledoc """
+  One Soniox real-time transcription stream (16 kHz mono s16le in). Sends
+  its parent `{:soniox, self(), {:partial, text}}` while an utterance is in
+  progress, `{:final, text}` when it ends, and `{:closed, reason}`.
+  """
+  use WebSockex
+
+  @endpoint "wss://stt-rt.soniox.com/transcribe-websocket"
+
+  def start_link(opts) do
+    state = %{
+      parent: Keyword.fetch!(opts, :parent),
+      key: Keyword.fetch!(opts, :api_key),
+      final: "",
+      configured: false
+    }
+
+    WebSockex.start_link(@endpoint, __MODULE__, state,
+      async: true,
+      handle_initial_conn_failure: true
+    )
+  end
+
+  def send_audio(pid, pcm), do: WebSockex.cast(pid, {:audio, pcm})
+
+  @impl true
+  def handle_connect(_conn, state) do
+    send(self(), :configure)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:configure, state) do
+    config = %{
+      api_key: state.key,
+      model: "stt-rt-v5",
+      audio_format: "pcm_s16le",
+      sample_rate: 16_000,
+      num_channels: 1,
+      enable_endpoint_detection: true
+    }
+
+    {:reply, {:text, Jason.encode!(config)}, %{state | configured: true}}
+  end
+
+  # Audio cast while connecting is queued ahead of `:configure`, and Soniox
+  # closes a stream whose first message isn't its config: drop it.
+  @impl true
+  def handle_cast({:audio, pcm}, %{configured: true} = state), do: {:reply, {:binary, pcm}, state}
+  def handle_cast({:audio, _pcm}, state), do: {:ok, state}
+
+  @impl true
+  def handle_frame({:text, json}, state) do
+    case Jason.decode(json) do
+      {:ok, %{"error_code" => code} = error} when code != nil ->
+        {:close, notify(state, {:closed, error})}
+
+      {:ok, %{"tokens" => tokens}} ->
+        {:ok, tokens(tokens, state)}
+
+      _ ->
+        {:ok, state}
+    end
+  end
+
+  def handle_frame(_frame, state), do: {:ok, state}
+
+  @impl true
+  def handle_disconnect(%{reason: reason}, state) do
+    notify(state, {:closed, reason})
+    {:ok, state}
+  end
+
+  # Final tokens accumulate until `<end>` (end of utterance); non-final ones
+  # are this moment's guess at the rest.
+  defp tokens(tokens, state) do
+    {final, ended} =
+      Enum.reduce(tokens, {state.final, false}, fn
+        %{"text" => "<end>", "is_final" => true}, {final, _} -> {final, true}
+        %{"text" => text, "is_final" => true}, {final, ended} -> {final <> text, ended}
+        _, acc -> acc
+      end)
+
+    guess = for %{"text" => t} = tok <- tokens, !tok["is_final"], into: "", do: t
+
+    cond do
+      ended and String.trim(final) != "" ->
+        notify(state, {:final, String.trim(final)})
+        %{state | final: ""}
+
+      ended ->
+        %{state | final: ""}
+
+      String.trim(final <> guess) != "" ->
+        notify(state, {:partial, String.trim(final <> guess)})
+        %{state | final: final}
+
+      true ->
+        %{state | final: final}
+    end
+  end
+
+  defp notify(state, event) do
+    send(state.parent, {:soniox, self(), event})
+    state
+  end
+end

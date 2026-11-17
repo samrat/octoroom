@@ -34,23 +34,43 @@ defmodule Octoroom.Room.Server do
 
   require Logger
 
-  alias Octoroom.{Adapter, Cloudflare, Inlet, Outlet, Participant, Reconciler, Room}
+  alias Octoroom.{Adapter, Cloudflare, Inlet, Outlet, Participant, Reconciler, Room, Store}
   alias Octoroom.Worker
 
   @mic "mic"
   @max_failures 5
   @signal_timeout 15_000
+  # How long a participant whose connection dropped is kept, and how long a
+  # recovered room holds subscriptions to participants who haven't resumed.
+  # A minute, because browsers throttle timers in background tabs: Chrome
+  # may hold a hidden tab's reconnect back for up to a minute (one measured
+  # resume took 37 s after the server was back). Holding a subscription
+  # nobody is sending on costs nothing.
+  @grace_ms 60_000
+  # How often the room record's `updated_at` is refreshed, so a recovered
+  # room knows about how long it was down.
+  @heartbeat_ms 5_000
   # A worker that ran this long before crashing starts its backoff afresh.
   @worker_stable_ms 30_000
 
   ## API (called by a participant's process)
 
+  # Each start of a room server is a new run. The run id is the registry
+  # value, so `run/1` answers without calling the server (the janitor asks).
   def start_link(opts) do
     room_id = Keyword.fetch!(opts, :room_id)
-    GenServer.start_link(__MODULE__, opts, name: via(room_id))
+    run = new_id()
+    name = {:via, Registry, {Octoroom.Registry, {:room, room_id}, run}}
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :run, run), name: name)
   end
 
-  def via(room_id), do: {:via, Registry, {Octoroom.Registry, {:room, room_id}}}
+  @doc "The run of the room server running `room_id` on this node, or nil."
+  def run(room_id) do
+    case Registry.lookup(Octoroom.Registry, {:room, room_id}) do
+      [{_pid, run}] -> run
+      [] -> nil
+    end
+  end
 
   def whereis(room_id) do
     case Registry.lookup(Octoroom.Registry, {:room, room_id}) do
@@ -83,17 +103,59 @@ defmodule Octoroom.Room.Server do
   def init(opts) do
     room_id = Keyword.fetch!(opts, :room_id)
     module = Keyword.fetch!(opts, :module)
-    {:ok, assigns} = module.mount(room_id)
+    run = Keyword.fetch!(opts, :run)
+    store = Keyword.get_lazy(opts, :store, &Store.config/0)
+    cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
     # So `terminate/2` closes the room's adapters when the room shuts down.
     Process.flag(:trap_exit, true)
+
+    # A record left behind means the previous run didn't stop cleanly (a
+    # crash, a restart, a deploy): this run recovers the room.
+    previous = Store.get(store, :rooms, room_id)
+
+    assigns =
+      case previous do
+        %{assigns: assigns} ->
+          assigns
+
+        nil ->
+          {:ok, assigns} = module.mount(room_id)
+          assigns
+      end
+
+    now = Store.now()
+    Store.put(store, :rooms, room_id, %{run: run, assigns: assigns, updated_at: now})
+    if previous, do: close_previous_runs(store, cf, room_id, run)
+    grace_ms = Keyword.get(opts, :grace_ms, @grace_ms)
+    heartbeat_ms = Keyword.get(opts, :heartbeat_ms, @heartbeat_ms)
+    Process.send_after(self(), :heartbeat, heartbeat_ms)
+    if previous, do: Process.send_after(self(), :grace_over, grace_ms)
+
+    :telemetry.execute([:octoroom, :room, :start], %{}, %{
+      room_id: room_id,
+      run: run,
+      recovered: previous != nil
+    })
 
     {:ok,
      %{
        id: room_id,
+       run: run,
        module: module,
+       store: store,
        assigns: assigns,
-       cloudflare: Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0),
+       # Set while a recovered room is in its grace period.
+       recovering: if(previous, do: %{gone_ms: max(now - previous.updated_at, 0)}),
+       # Tracks of participants who haven't resumed yet, still pulled by
+       # someone who has: name => %{session_id, track_name}. Held until they
+       # resume or the grace period ends.
+       ghosts: %{},
+       grace_ms: grace_ms,
+       heartbeat_ms: heartbeat_ms,
+       cloudflare: cf,
        signal_timeout: Keyword.get(opts, :signal_timeout, @signal_timeout),
+       # Failures back off retry_base_ms * 2^n: 0.5 s, 1 s, 2 s, ...
+       retry_base_ms: Keyword.get(opts, :retry_base_ms, 250),
        public_ws_url:
          Keyword.get_lazy(opts, :public_ws_url, fn ->
            Application.get_env(:octoroom, :public_ws_url)
@@ -112,36 +174,53 @@ defmodule Octoroom.Room.Server do
 
   @impl true
   def handle_call({:join, pid, meta}, _from, state) do
-    id = new_id()
-
-    p = %{
-      id: id,
-      meta: meta,
-      pid: pid,
-      monitor: Process.monitor(pid),
-      session_id: nil,
-      mic: :none,
-      publish_tag: nil,
-      subs: %{},
-      op: nil
-    }
-
-    state = %{
-      state
-      | participants: Map.put(state.participants, id, p),
-        order: state.order ++ [id]
-    }
-
-    event(state, {:joined, public(p)}, except: id)
-
-    reply = %{
-      participant_id: id,
-      participants: Enum.map(participants(state), &public/1),
-      ice_servers: Octoroom.ice_servers()
-    }
-
+    p = new_participant(new_id(), meta, pid)
+    state = add_participant(state, p)
+    :telemetry.execute([:octoroom, :participant, :join], %{}, %{room_id: state.id, id: p.id})
     # The participant can't hear or be heard yet, but workers may follow it.
-    {:reply, {:ok, reply}, reconcile(state)}
+    {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
+  end
+
+  # A client coming back with its resume token's data.
+  def handle_call({:resume, pid, data}, _from, state) do
+    %{participant_id: id, meta: meta} = data
+    session_id = Map.get(data, :session_id)
+    meta_ = %{room_id: state.id, id: id}
+
+    case state.participants[id] do
+      # Its connection dropped and came back while the room kept running:
+      # nothing at Cloudflare changed, so only the channel is replaced.
+      %{} = p ->
+        if p.monitor, do: Process.demonitor(p.monitor, [:flush])
+        cancel(p.disconnected)
+        p = %{p | pid: pid, monitor: Process.monitor(pid), disconnected: nil}
+        state = put_p(state, p)
+
+        :telemetry.execute(
+          [:octoroom, :participant, :resume],
+          %{},
+          Map.put(meta_, :kind, :rejoin)
+        )
+
+        {:reply, {:ok, join_reply(state, p, true)}, resync(state, p)}
+
+      # Never published: nothing to adopt, so it starts over.
+      nil when session_id == nil ->
+        p = new_participant(id, meta, pid)
+        state = add_participant(state, p)
+        :telemetry.execute([:octoroom, :participant, :join], %{}, meta_)
+        {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
+
+      # The room restarted (or this participant was dropped): adopt its
+      # Cloudflare session as it is.
+      nil ->
+        p = %{new_participant(id, meta, pid) | session_id: session_id, mic: :adopting}
+        state = add_participant(state, p)
+        cf = state.cloudflare
+        run(state, id, :adopt, fn -> Cloudflare.session_state(cf, session_id) end)
+        :telemetry.execute([:octoroom, :participant, :resume], %{}, Map.put(meta_, :kind, :adopt))
+        {:reply, {:ok, join_reply(state, p, true)}, state}
+    end
   end
 
   def handle_call({:update_meta, id, fun}, _from, state) do
@@ -153,12 +232,16 @@ defmodule Octoroom.Room.Server do
         p = %{p | meta: fun.(p.meta)}
         state = put_in(state.participants[id], p)
         event(state, {:updated, public(p)})
+        signal(p, :resume, resume_data(p))
         {:reply, :ok, reconcile(state)}
     end
   end
 
-  def handle_call({:assign, key, value}, _from, state),
-    do: {:reply, :ok, reconcile(%{state | assigns: Map.put(state.assigns, key, value)})}
+  def handle_call({:assign, key, value}, _from, state) do
+    state = %{state | assigns: Map.put(state.assigns, key, value)}
+    put_room_record(state)
+    {:reply, :ok, reconcile(state)}
+  end
 
   def handle_call(:refresh, _from, state), do: {:reply, :ok, reconcile(state)}
 
@@ -214,7 +297,7 @@ defmodule Octoroom.Room.Server do
         run(state, id, :publish, fn ->
           with {:ok, session} <- Cloudflare.new_session(cf),
                {:ok, %{sdp: answer}} <-
-                 Cloudflare.push_tracks(cf, session, sdp, [%{mid: mid, track_name: @mic}]) do
+                 Cloudflare.push_tracks(cf, session, sdp, [%{mid: mid, track_name: mic_name(id)}]) do
             {:ok, session, answer}
           end
         end)
@@ -282,6 +365,10 @@ defmodule Octoroom.Room.Server do
 
   def handle_info({:signal_timeout, id, op_id}, state) do
     case state.participants[id] do
+      # Disconnected: the request is sent again when it resumes.
+      %{op: %{id: ^op_id}, pid: nil} ->
+        {:noreply, state}
+
       %{op: %{id: ^op_id}} = p ->
         Logger.warning("Octoroom participant #{id} didn't answer signaling in time")
         signal(p, :kick, :signaling_timeout)
@@ -293,6 +380,28 @@ defmodule Octoroom.Room.Server do
   end
 
   def handle_info(:retry, state), do: {:noreply, reconcile(%{state | retry: nil})}
+
+  def handle_info({:disconnect_expired, id, ref}, state) do
+    case state.participants[id] do
+      %{disconnected: ^ref} -> remove(state, id, :left)
+      _ -> {:noreply, state}
+    end
+  end
+
+  # Whoever hasn't resumed by now has left.
+  def handle_info(:grace_over, state) do
+    :telemetry.execute([:octoroom, :room, :recovered], %{ghosts: map_size(state.ghosts)}, %{
+      room_id: state.id
+    })
+
+    {:noreply, reconcile(%{state | recovering: nil, ghosts: %{}})}
+  end
+
+  def handle_info(:heartbeat, state) do
+    put_room_record(state)
+    Process.send_after(self(), :heartbeat, state.heartbeat_ms)
+    {:noreply, state}
+  end
 
   def handle_info({:outlet_live, name, pid}, state) do
     case state.outlets[name] do
@@ -315,6 +424,17 @@ defmodule Octoroom.Room.Server do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case monitored(state, ref) do
+      # The client's channel shut down without the client leaving: its
+      # connection dropped (`{:shutdown, :closed}`), the node is draining
+      # sockets (`{:shutdown, :restart}`) or stopping (`:shutdown`). It may
+      # come back with its resume token: until then its subscriptions stay
+      # as they are. `{:shutdown, :left}` is the client leaving.
+      {:participant, id}
+      when reason != {:shutdown, :left} and
+             (reason == :shutdown or
+                (is_tuple(reason) and elem(reason, 0) == :shutdown)) ->
+        {:noreply, disconnect(state, id)}
+
       {:participant, id} ->
         remove(state, id, :left)
 
@@ -324,13 +444,13 @@ defmodule Octoroom.Room.Server do
       {:outlet, name} ->
         Logger.warning("Octoroom outlet #{name} stopped: #{inspect(reason)}")
         {outlet, outlets} = Map.pop(state.outlets, name)
-        close_adapters(state, [outlet.adapter_id])
+        close_adapters(state, [{outlet.ws_id, outlet.adapter_id}])
         {:noreply, reconcile(%{state | outlets: outlets})}
 
       {:inlet, key} ->
         Logger.warning("Octoroom inlet #{inspect(key)} stopped: #{inspect(reason)}")
         {inlet, inlets} = Map.pop(state.inlets, key)
-        close_adapters(state, [inlet.adapter_id])
+        close_adapters(state, [{inlet.ws_id, inlet.adapter_id}])
         {:noreply, reconcile(%{state | inlets: inlets})}
 
       nil ->
@@ -345,21 +465,91 @@ defmodule Octoroom.Room.Server do
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_reason, state) do
-    ids =
-      for {_, %{adapter_id: id}} <- Map.to_list(state.outlets) ++ Map.to_list(state.inlets),
+  def terminate(reason, state) do
+    adapters =
+      for {_, %{adapter_id: id} = media} <-
+            Map.to_list(state.outlets) ++ Map.to_list(state.inlets),
           id != nil,
-          do: id
+          do: {media.ws_id, id}
 
-    close_adapters(state, ids)
+    # Synchronously: when the node is shutting down, a task would be killed
+    # before Cloudflare hears about it. (The next run, or the janitor,
+    # closes anything left.)
+    if adapters != [] do
+      case Cloudflare.close_adapters(state.cloudflare, Enum.map(adapters, &elem(&1, 1))) do
+        :ok -> for {ws_id, _} <- adapters, do: Store.delete(state.store, :adapters, ws_id)
+        error -> Logger.warning("Octoroom couldn't close adapters: #{inspect(error)}")
+      end
+    end
+
+    :telemetry.execute([:octoroom, :room, :stop], %{}, %{room_id: state.id, reason: reason})
+
+    # The last participant left: nothing to recover. Otherwise (a crash, a
+    # shutdown) the record stays so the next run recovers the room.
+    if reason == :normal, do: Store.delete(state.store, :rooms, state.id)
   end
 
   ## Results of Cloudflare calls
 
   defp handle_result(state, p, :publish, {:ok, session, answer}) do
     reply(p, p.publish_tag, {:ok, %{sdp: answer}})
-    {:noreply, put_p(state, %{p | session_id: session, mic: :pending, publish_tag: nil})}
+    p = %{p | session_id: session, mic: :pending, publish_tag: nil}
+    signal(p, :resume, resume_data(p))
+    {:noreply, put_p(state, p)}
   end
+
+  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:ok, %{tracks: tracks}}) do
+    mic = mic_name(p.id)
+
+    case Enum.find(tracks, &(&1.location == :local and &1.track_name == mic)) do
+      nil ->
+        republish(state, p, :no_mic)
+
+      _local ->
+        remote = for %{location: :remote, mid: mid} = t <- tracks, mid != nil, do: t
+
+        subs =
+          Map.new(remote, fn t ->
+            {name, stale} = adopted_name(t.track_name)
+            {name, %{status: :open, gain: 1.0, mid: t.mid, stale: stale}}
+          end)
+
+        # Pulls of mics whose owners haven't resumed yet are held during the
+        # grace period, so nobody hears a gap while everyone comes back.
+        ghosts =
+          if state.recovering do
+            for t <- remote,
+                {name, false} <- [adopted_name(t.track_name)],
+                t.status == :active,
+                owner_id(name) != nil,
+                not Map.has_key?(state.participants, owner_id(name)),
+                into: state.ghosts,
+                do: {name, %{session_id: t.session_id, track_name: t.track_name}}
+          else
+            state.ghosts
+          end
+
+        p = %{p | mic: :live, subs: subs}
+        state = %{state | ghosts: Map.delete(ghosts, mic)}
+        state = put_p(state, p)
+
+        signal(p, :tracks, %{
+          reset: true,
+          added: track_infos(state, p, Map.keys(subs)),
+          removed: []
+        })
+
+        event(state, {:published, public(p)})
+        subscriptions_event(state, p)
+        {:noreply, reconcile(state)}
+    end
+  end
+
+  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:error, :disconnected}),
+    do: republish(state, p, :disconnected)
+
+  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:error, reason}),
+    do: kick(state, p, {:resume_failed, reason})
 
   defp handle_result(state, p, :publish, {:error, reason}) do
     Logger.warning("Octoroom publish failed for #{p.id}: #{inspect(reason)}")
@@ -406,8 +596,10 @@ defmodule Octoroom.Room.Server do
 
           resp.renegotiate and is_binary(resp.sdp) ->
             timer = timeout(state, p.id, op_id)
-            signal(p, :renegotiate, %{op_id: op_id, sdp: resp.sdp})
-            {:noreply, put_p(state, %{p | op: %{p.op | stage: :awaiting_answer, timer: timer}})}
+            request = {:renegotiate, %{op_id: op_id, sdp: resp.sdp}}
+            signal(p, elem(request, 0), elem(request, 1))
+            op = %{p.op | stage: :awaiting_answer, timer: timer, request: request}
+            {:noreply, put_p(state, %{p | op: op})}
 
           true ->
             {:noreply, finish_pull(state, p)}
@@ -454,19 +646,13 @@ defmodule Octoroom.Room.Server do
   defp handle_result(state, _p, _kind, _result), do: {:noreply, state}
 
   defp finish_pull(state, %{op: op} = p) do
-    added =
-      for name <- Enum.sort(op.names) do
-        sub = p.subs[name]
+    :telemetry.execute(
+      [:octoroom, :pull, :stop],
+      %{duration_ms: System.monotonic_time(:millisecond) - op.started, tracks: length(op.names)},
+      %{room_id: state.id, participant_id: p.id}
+    )
 
-        %{
-          mid: sub.mid,
-          track: name,
-          participant_id: owner(state, name),
-          worker_id: get_in(state.outlets, [name, :worker_id]),
-          gain: sub.gain
-        }
-      end
-
+    added = track_infos(state, p, op.names)
     signal(p, :tracks, %{added: added, removed: []})
     subs = Enum.reduce(op.names, p.subs, fn name, subs -> put_in(subs[name].status, :open) end)
     failures = Map.drop(state.failures, Enum.map(op.names, &{p.id, &1}))
@@ -485,7 +671,8 @@ defmodule Octoroom.Room.Server do
 
     desired =
       for %{mic: :live} = p <- participants(state), into: %{} do
-        {p.id, state.module.subscriptions(public(p), room)}
+        wanted = state.module.subscriptions(public(p), room)
+        {p.id, wanted ++ held_ghosts(state, p, wanted)}
       end
 
     actual = %{
@@ -556,7 +743,9 @@ defmodule Octoroom.Room.Server do
       sources: sources,
       names: [],
       tag: nil,
-      timer: nil
+      timer: nil,
+      request: nil,
+      started: System.monotonic_time(:millisecond)
     }
 
     put_p(state, %{p | subs: subs, op: op})
@@ -567,7 +756,8 @@ defmodule Octoroom.Room.Server do
     mids = Enum.map(names, &p.subs[&1].mid)
     subs = Enum.reduce(names, p.subs, fn name, subs -> put_in(subs[name].status, :closing) end)
     timer = timeout(state, p.id, op_id)
-    signal(p, :close, %{op_id: op_id, mids: mids})
+    request = {:close, %{op_id: op_id, mids: mids}}
+    signal(p, elem(request, 0), elem(request, 1))
 
     op = %{
       id: op_id,
@@ -576,7 +766,8 @@ defmodule Octoroom.Room.Server do
       names: names,
       mids: mids,
       tag: nil,
-      timer: timer
+      timer: timer,
+      request: request
     }
 
     put_p(state, %{p | subs: subs, op: op})
@@ -596,7 +787,31 @@ defmodule Octoroom.Room.Server do
       Enum.reduce(failed, state.failures, fn {name, reason}, acc ->
         Logger.info("Octoroom #{inspect(id)} #{inspect(name)} failed: #{inspect(reason)}")
         count = Map.get(acc, {id, name}, %{count: 0}).count + 1
-        Map.put(acc, {id, name}, %{count: count, at: now + 250 * Integer.pow(2, count)})
+
+        if count == @max_failures do
+          what =
+            case id do
+              :worker -> {:worker, name}
+              :media -> name
+              participant -> {:pull, participant, name}
+            end
+
+          Logger.warning("Octoroom gave up on #{inspect(what)}: #{inspect(reason)}")
+          Octoroom.broadcast(state.id, {:error, what, reason})
+        end
+
+        :telemetry.execute([:octoroom, :failure], %{count: count}, %{
+          room_id: state.id,
+          id: id,
+          name: name,
+          reason: reason,
+          given_up: count >= @max_failures
+        })
+
+        Map.put(acc, {id, name}, %{
+          count: count,
+          at: now + state.retry_base_ms * Integer.pow(2, count)
+        })
       end)
 
     %{state | failures: failures}
@@ -645,14 +860,14 @@ defmodule Octoroom.Room.Server do
   defp apply_worker_op({:stop_inlet, key}, state, requests) do
     {inlet, inlets} = Map.pop(state.inlets, key)
     stop_child(state, :media, inlet)
-    close_adapters(state, [inlet.adapter_id])
+    close_adapters(state, [{inlet.ws_id, inlet.adapter_id}])
     {%{state | inlets: inlets}, requests}
   end
 
   defp apply_worker_op({:stop_outlet, name}, state, requests) do
     {outlet, outlets} = Map.pop(state.outlets, name)
     stop_child(state, :media, outlet)
-    close_adapters(state, [outlet.adapter_id])
+    close_adapters(state, [{outlet.ws_id, outlet.adapter_id}])
     {%{state | outlets: outlets}, requests}
   end
 
@@ -748,7 +963,8 @@ defmodule Octoroom.Room.Server do
       opts = %{
         room_id: state.id,
         spec: spec,
-        participants: Enum.map(participants(state), &public/1)
+        participants: Enum.map(participants(state), &public/1),
+        resumed: state.recovering
       }
 
       case start_child(state, :workers, {Worker.Server, opts}) do
@@ -759,6 +975,13 @@ defmodule Octoroom.Room.Server do
             monitor: Process.monitor(pid),
             started: System.monotonic_time(:millisecond)
           }
+
+          :telemetry.execute([:octoroom, :worker, :start], %{}, %{
+            room_id: state.id,
+            id: spec.id,
+            module: spec.module,
+            resumed: state.recovering != nil
+          })
 
           put_in(state.workers[spec.id], w)
 
@@ -789,6 +1012,13 @@ defmodule Octoroom.Room.Server do
     {w, workers} = Map.pop(state.workers, id)
     Logger.warning("Octoroom worker #{id} exited: #{inspect(reason)}")
     Octoroom.broadcast(state.id, {:worker_down, id, reason})
+
+    :telemetry.execute([:octoroom, :worker, :exit], %{}, %{
+      room_id: state.id,
+      id: id,
+      reason: reason
+    })
+
     ran = System.monotonic_time(:millisecond) - w.started
 
     failures =
@@ -807,6 +1037,17 @@ defmodule Octoroom.Room.Server do
     tracks = Enum.map(requests, &elem(&1, 1))
     server = self()
 
+    # Recorded before Cloudflare is asked, so a crash between the two leaves
+    # a record the janitor can resolve.
+    for {_kind, _key, ws_id} <- keys do
+      Store.put(state.store, :adapters, ws_id, %{
+        room_id: state.id,
+        run: state.run,
+        adapter_id: nil,
+        created_at: Store.now()
+      })
+    end
+
     Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
       result =
         try do
@@ -824,6 +1065,19 @@ defmodule Octoroom.Room.Server do
   # Results come back in request order. An adapter whose owner stopped in
   # the meantime is closed at once.
   defp adapters_created(state, keys, {:ok, created}) when length(keys) == length(created) do
+    :telemetry.execute([:octoroom, :adapter, :create], %{count: length(created)}, %{
+      room_id: state.id
+    })
+
+    for {{_kind, _key, ws_id}, adapter} <- Enum.zip(keys, created) do
+      Store.put(state.store, :adapters, ws_id, %{
+        room_id: state.id,
+        run: state.run,
+        adapter_id: adapter.adapter_id,
+        created_at: Store.now()
+      })
+    end
+
     Enum.zip(keys, created)
     |> Enum.reduce(state, fn
       {{:outlet, name, ws_id}, adapter}, state ->
@@ -842,7 +1096,7 @@ defmodule Octoroom.Room.Server do
             put_in(state.outlets[name], o)
 
           _ ->
-            close_adapters(state, [adapter.adapter_id])
+            close_adapters(state, [{ws_id, adapter.adapter_id}])
             state
         end
 
@@ -852,7 +1106,7 @@ defmodule Octoroom.Room.Server do
             put_in(state.inlets[key], %{i | adapter_id: adapter.adapter_id})
 
           _ ->
-            close_adapters(state, [adapter.adapter_id])
+            close_adapters(state, [{ws_id, adapter.adapter_id}])
             state
         end
     end)
@@ -866,6 +1120,7 @@ defmodule Octoroom.Room.Server do
       end
 
     Logger.warning("Octoroom couldn't create adapters: #{inspect(reason)}")
+    for {_kind, _key, ws_id} <- keys, do: Store.delete(state.store, :adapters, ws_id)
 
     Enum.reduce(keys, state, fn
       {:outlet, name, ws_id}, state ->
@@ -892,18 +1147,22 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  defp close_adapters(state, ids) do
-    case Enum.reject(ids, &is_nil/1) do
+  # `adapters` are `{ws_id, adapter_id}`. Records are deleted once Cloudflare
+  # confirms; if it doesn't, the janitor tries again later.
+  defp close_adapters(state, adapters) do
+    case Enum.reject(adapters, fn {_, id} -> is_nil(id) end) do
       [] ->
         :ok
 
-      ids ->
+      adapters ->
         cf = state.cloudflare
+        store = state.store
+        ids = Enum.map(adapters, &elem(&1, 1))
 
         Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
           case Cloudflare.close_adapters(cf, ids) do
             :ok ->
-              :ok
+              for {ws_id, _} <- adapters, do: Store.delete(store, :adapters, ws_id)
 
             error ->
               Logger.warning(
@@ -914,6 +1173,40 @@ defmodule Octoroom.Room.Server do
 
         :ok
     end
+  end
+
+  # Adapters of this room's earlier runs died with their sockets. Closing
+  # them is idempotent, and the only way to be sure they aren't billed.
+  defp close_previous_runs(store, cf, room_id, run) do
+    stale =
+      for {ws_id, %{room_id: ^room_id, run: r, adapter_id: id}} <- Store.all(store, :adapters),
+          r != run,
+          do: {ws_id, id}
+
+    Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
+      result =
+        case for({_, id} <- stale, id != nil, do: id) do
+          [] -> :ok
+          ids -> Cloudflare.close_adapters(cf, ids)
+        end
+
+      case result do
+        :ok ->
+          for {ws_id, _} <- stale, do: Store.delete(store, :adapters, ws_id)
+
+        error ->
+          # The records stay: the janitor tries again.
+          Logger.warning("Octoroom couldn't close #{room_id}'s old adapters: #{inspect(error)}")
+      end
+    end)
+  end
+
+  defp put_room_record(state) do
+    Store.put(state.store, :rooms, state.id, %{
+      run: state.run,
+      assigns: state.assigns,
+      updated_at: Store.now()
+    })
   end
 
   defp public_ws_url(%{public_ws_url: url} = state) when url in [nil, ""] do
@@ -968,7 +1261,8 @@ defmodule Octoroom.Room.Server do
         {:noreply, state}
 
       {p, participants} ->
-        Process.demonitor(p.monitor, [:flush])
+        if p.monitor, do: Process.demonitor(p.monitor, [:flush])
+        cancel(p.disconnected)
         if p.op, do: cancel(p.op.timer)
         if p.publish_tag, do: reply(p, p.publish_tag, {:error, reason})
 
@@ -980,6 +1274,12 @@ defmodule Octoroom.Room.Server do
         }
 
         event(state, {:left, public(p)})
+
+        :telemetry.execute([:octoroom, :participant, :leave], %{}, %{
+          room_id: state.id,
+          id: id,
+          reason: reason
+        })
 
         if map_size(participants) == 0,
           do: {:stop, :normal, state},
@@ -994,6 +1294,99 @@ defmodule Octoroom.Room.Server do
   end
 
   defp participants(state), do: Enum.map(state.order, &state.participants[&1])
+
+  defp new_participant(id, meta, pid) do
+    %{
+      id: id,
+      meta: meta,
+      pid: pid,
+      monitor: Process.monitor(pid),
+      session_id: nil,
+      mic: :none,
+      publish_tag: nil,
+      subs: %{},
+      op: nil,
+      # The grace timer while its connection is down.
+      disconnected: nil
+    }
+  end
+
+  defp add_participant(state, p) do
+    state = %{
+      state
+      | participants: Map.put(state.participants, p.id, p),
+        order: state.order ++ [p.id]
+    }
+
+    event(state, {:joined, public(p)}, except: p.id)
+    state
+  end
+
+  defp join_reply(state, p, resumed) do
+    %{
+      participant_id: p.id,
+      participants: Enum.map(participants(state), &public/1),
+      ice_servers: Octoroom.ice_servers(),
+      resumed: resumed,
+      # The channel turns this into the client's resume token.
+      resume: resume_data(p)
+    }
+  end
+
+  defp resume_data(p),
+    do: %{participant_id: p.id, session_id: p.session_id, meta: p.meta}
+
+  defp disconnect(state, id) do
+    p = state.participants[id]
+    ref = make_ref()
+    Process.send_after(self(), {:disconnect_expired, id, ref}, state.grace_ms)
+    Octoroom.broadcast(state.id, {:disconnected, public(p)})
+    put_p(state, %{p | pid: nil, monitor: nil, disconnected: ref})
+  end
+
+  # After a rejoin: the client may have missed signals while it was away, so
+  # it gets the full list of what it hears, and any request still waiting on
+  # it again.
+  defp resync(state, p) do
+    open = for {name, %{status: :open}} <- p.subs, do: name
+    signal(p, :tracks, %{reset: true, added: track_infos(state, p, open), removed: []})
+
+    case p.op do
+      %{request: {kind, payload}, stage: stage} = op
+      when stage in [:awaiting_answer, :awaiting_offer] ->
+        cancel(op.timer)
+        signal(p, kind, payload)
+        put_p(state, %{p | op: %{op | timer: timeout(state, p.id, op.id)}})
+
+      _ ->
+        state
+    end
+  end
+
+  # Its Cloudflare session is gone (or never had the mic): it publishes again
+  # as if it had just joined.
+  defp republish(state, p, reason) do
+    Logger.info("Octoroom #{p.id} has to publish again: #{inspect(reason)}")
+    p = %{p | mic: :none, session_id: nil, subs: %{}, op: nil}
+    signal(p, :republish, %{reason: reason})
+    signal(p, :resume, resume_data(p))
+    {:noreply, state |> put_p(p) |> reconcile()}
+  end
+
+  defp track_infos(state, p, names) do
+    for name <- Enum.sort(names) do
+      sub = p.subs[name]
+
+      %{
+        mid: sub.mid,
+        track: name,
+        participant_id:
+          owner(state, name) || (Map.has_key?(state.ghosts, name) && owner_id(name)) || nil,
+        worker_id: get_in(state.outlets, [name, :worker_id]),
+        gain: sub.gain
+      }
+    end
+  end
 
   defp public(p), do: %Participant{id: p.id, meta: p.meta}
 
@@ -1018,7 +1411,8 @@ defmodule Octoroom.Room.Server do
         {name, status}
       end
 
-    Map.merge(outputs, mics)
+    ghosts = Map.new(state.ghosts, fn {name, _} -> {name, :live} end)
+    ghosts |> Map.merge(outputs) |> Map.merge(mics)
   end
 
   # Track name => where it lives at Cloudflare.
@@ -1027,7 +1421,7 @@ defmodule Octoroom.Room.Server do
       for {id, %{mic: mic, session_id: s}} <- state.participants,
           mic in [:pending, :live],
           into: %{} do
-        {mic_name(id), %{session_id: s, track_name: @mic}}
+        {mic_name(id), %{session_id: s, track_name: mic_name(id)}}
       end
 
     outputs =
@@ -1037,17 +1431,57 @@ defmodule Octoroom.Room.Server do
         {name, %{session_id: o.session_id, track_name: o.cf_track}}
       end
 
-    Map.merge(outputs, mics)
+    state.ghosts |> Map.merge(outputs) |> Map.merge(mics)
   end
 
+  # The mic's room-scoped name is also its track name at Cloudflare, so a
+  # pull read back from Cloudflare says whose mic it is.
   defp mic_name(id), do: "#{id}/#{@mic}"
 
   # The participant whose mic `name` is, or nil for a worker's output.
   defp owner(state, name) do
+    case owner_id(name) do
+      nil -> nil
+      id -> if Map.has_key?(state.participants, id), do: id
+    end
+  end
+
+  defp owner_id(name) do
     case String.split(name, "/") do
-      [id, @mic] -> if Map.has_key?(state.participants, id), do: id
+      [id, @mic] -> id
       _ -> nil
     end
+  end
+
+  # A pulled track's room name from its Cloudflare track name, and whether
+  # it's stale. Mics are named the same at Cloudflare. A worker output's
+  # ingest session dies with the run that created it, so its pulls are
+  # always stale after a restart.
+  defp adopted_name("out-" <> encoded) do
+    case Base.url_decode64(encoded, padding: false) do
+      {:ok, name} -> {name, true}
+      :error -> {"out-" <> encoded, true}
+    end
+  end
+
+  defp adopted_name(name) do
+    if owner_id(name), do: {name, false}, else: {name, true}
+  end
+
+  # Ghost tracks `p` still holds that its policy doesn't (yet) mention.
+  defp held_ghosts(%{ghosts: ghosts}, _p, _wanted) when map_size(ghosts) == 0, do: []
+
+  defp held_ghosts(state, p, wanted) do
+    named =
+      MapSet.new(wanted, fn
+        %Octoroom.Track{name: n} -> n
+        n when is_binary(n) -> n
+      end)
+
+    for {name, %{status: :open, gain: gain}} <- p.subs,
+        Map.has_key?(state.ghosts, name),
+        not MapSet.member?(named, name),
+        do: %Octoroom.Track{name: name, gain: gain}
   end
 
   defp put_p(state, p), do: put_in(state.participants[p.id], p)
@@ -1098,9 +1532,12 @@ defmodule Octoroom.Room.Server do
   defp cancel(nil), do: :ok
   defp cancel(timer), do: Process.cancel_timer(timer)
 
+  # A disconnected participant has no process; it's resynced on resume.
+  defp signal(%{pid: nil}, _kind, _payload), do: :ok
   defp signal(p, kind, payload), do: send(p.pid, {:octoroom_signal, kind, payload})
 
   defp reply(_p, nil, _result), do: :ok
+  defp reply(%{pid: nil}, _tag, _result), do: :ok
   defp reply(p, tag, result), do: send(p.pid, {:octoroom_signal, :reply, tag, result})
 
   defp subscriptions_event(state, p) do
