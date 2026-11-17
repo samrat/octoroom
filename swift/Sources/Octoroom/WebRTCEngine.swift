@@ -12,18 +12,13 @@ public final class WebRTCEngine: MediaEngine {
   ///   calls do) rather than the earpiece.
   public init(speaker: Bool = true) {
     Self.initializeOnce
-    #if os(iOS)
-      // WebRTC's default is playAndRecord in voiceChat mode (the earpiece).
-      // videoChat mode routes to the loudspeaker and allows Bluetooth by
-      // itself. The iOS 26 simulator's CoreAudio deadlocks (and aborts the
-      // app) when capture starts in videoChat mode, so the simulator keeps
-      // WebRTC's default; it plays through the Mac's output either way.
-      #if !targetEnvironment(simulator)
-        let changeMode = speaker
-      #else
-        let changeMode = false
-      #endif
-      if changeMode {
+    // WebRTC's default is playAndRecord in voiceChat mode (the earpiece).
+    // videoChat mode routes to the loudspeaker and allows Bluetooth by
+    // itself. The iOS 26 simulator's CoreAudio deadlocks (and aborts the
+    // app) when capture starts in videoChat mode, so the simulator keeps
+    // WebRTC's default; it plays through the Mac's output either way.
+    #if os(iOS) && !targetEnvironment(simulator)
+      if speaker {
         let config = RTCAudioSessionConfiguration.webRTC()
         config.mode = AVAudioSession.Mode.videoChat.rawValue
         RTCAudioSessionConfiguration.setWebRTC(config)
@@ -104,6 +99,7 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
   let pc: RTCPeerConnection
   var onConnectionStateChange: ((PeerConnectionState) -> Void)?
   private var gatheringWaiters: [() -> Void] = []
+  private var closed = false
   private let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
 
   init(factory: RTCPeerConnectionFactory, configuration: RTCConfiguration) throws {
@@ -191,7 +187,7 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
   }
 
   func iceGatheringComplete(timeout: Duration) async {
-    if pc.iceGatheringState == .complete { return }
+    if closed || pc.iceGatheringState == .complete { return }
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
       var done = false
       let finish = {
@@ -225,6 +221,7 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
   }
 
   func close() {
+    closed = true
     pc.delegate = nil
     pc.close()
     let waiters = gatheringWaiters

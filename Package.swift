@@ -24,6 +24,12 @@ let package = Package(
       dependencies: ["OctoroomCore", .product(name: "WebRTC", package: "WebRTC")],
       path: "swift/Sources/Octoroom"
     ),
+    // The WebRTC engine, peer to peer over loopback: no Cloudflare needed.
+    .testTarget(
+      name: "OctoroomTests",
+      dependencies: ["Octoroom", .product(name: "WebRTC", package: "WebRTC")],
+      path: "swift/Tests/OctoroomTests"
+    ),
     .testTarget(
       name: "OctoroomCoreTests",
       dependencies: ["OctoroomCore"],

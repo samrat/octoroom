@@ -68,6 +68,8 @@ export class RoomClient {
     this.queue = Promise.resolve()
     this.state = "idle"
     this.resumeToken = null
+    // Bumped by every teardown, so a join that's left part way stops.
+    this.generation = 0
   }
 
   on(event, fn) {
@@ -93,6 +95,15 @@ export class RoomClient {
   async join() {
     if (this.state !== "idle") throw new Error(`can't join while ${this.state}`)
     this.setState("joining")
+    // leave() mid-join rejects the step this join is waiting on, so it
+    // settles now rather than when that step times out, and doesn't tear
+    // down again (possibly a newer join).
+    const generation = this.generation
+    const left = new Promise((_, reject) => (this.abortJoin = () => reject(new Error("left while joining"))))
+    const step = (promise) => {
+      promise.catch(() => {})
+      return Promise.race([promise, left])
+    }
 
     try {
       // A function, so a rejoin sends the latest resume token.
@@ -111,7 +122,7 @@ export class RoomClient {
       channel.onError(() => this.state === "joined" && this.emit("reconnecting"))
       channel.onClose(() => this.channel === channel && this.teardown("closed"))
 
-      const reply = await new Promise((resolve, reject) => {
+      const reply = await step(new Promise((resolve, reject) => {
         let joined = false
         channel
           .join(PUSH_TIMEOUT_MS)
@@ -119,12 +130,13 @@ export class RoomClient {
           .receive("ok", (reply) => (joined ? this.onRejoined(reply) : ((joined = true), resolve(reply))))
           .receive("error", (r) => !joined && reject(new Error(r?.reason || "join failed")))
           .receive("timeout", () => !joined && reject(new Error("join timed out")))
-      })
+      }))
       this.onJoinReply(reply)
 
-      await this.openLocalMedia()
+      await step(this.openLocalMedia(generation))
 
-      await this.connectMedia()
+      await step(this.connectMedia())
+      this.abortJoin = null
       // Closing the tab looks like a dropped connection, which the server
       // holds for a while in case it comes back: say goodbye instead.
       this.onPageHide = () => this.leave()
@@ -132,7 +144,7 @@ export class RoomClient {
       this.setState("joined")
       return reply
     } catch (error) {
-      this.teardown("failed")
+      if (this.generation === generation) this.teardown("failed")
       throw error
     }
   }
@@ -147,13 +159,18 @@ export class RoomClient {
 
   // The mic (and the camera, with `video`) from the provided stream or
   // getUserMedia, asking for both at once so the browser prompts once.
-  async openLocalMedia() {
+  async openLocalMedia(generation) {
     let stream = this.providedStream
     let owned = false
     if (!stream) {
       const video = this.videoConstraints || false
       stream = await navigator.mediaDevices.getUserMedia({audio: this.audioConstraints, video})
       owned = true
+      // Left at the permission prompt: turn the devices back off.
+      if (this.generation !== generation) {
+        stream.getTracks().forEach((t) => t.stop())
+        throw new Error("left while joining")
+      }
     }
     this.stream = stream
     const [audio] = stream.getAudioTracks()
@@ -463,6 +480,7 @@ export class RoomClient {
   }
 
   push(event, payload) {
+    if (!this.channel) return Promise.reject(new Error(`${event}: not in a room`))
     return new Promise((resolve, reject) => {
       this.channel
         .push(event, payload, PUSH_TIMEOUT_MS)
@@ -473,6 +491,9 @@ export class RoomClient {
   }
 
   teardown(reason) {
+    this.generation++
+    this.abortJoin?.()
+    this.abortJoin = null
     if (this.onPageHide) window.removeEventListener("pagehide", this.onPageHide)
     this.onPageHide = null
     this.clearRemote()
