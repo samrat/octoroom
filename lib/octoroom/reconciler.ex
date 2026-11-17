@@ -18,8 +18,8 @@ defmodule Octoroom.Reconciler do
        closed, it's pulled again from the track's new session).
     2. `{:open_subscription, participant_id, name, %{gain: g}}`: desired and
        live. Subscriptions to pending tracks wait until they go live.
-    3. `{:update_subscription, participant_id, name, %{gain: g}}`: open, with
-       a different gain.
+    3. `{:update_subscription, participant_id, name, %{gain: g}}`: open and
+       staying open, with a different gain.
 
   Subscriptions with an operation in flight (`:opening`, `:closing`) are
   left alone; the next diff after that operation settles picks them up.
@@ -63,8 +63,9 @@ defmodule Octoroom.Reconciler do
 
     updates =
       for {name, track} <- wanted,
-          %{status: :open, gain: gain} <- [Map.get(current, name)],
+          %{status: :open, gain: gain} = sub <- [Map.get(current, name)],
           Map.get(tracks, name) != nil,
+          not Map.get(sub, :stale, false),
           gain != track.gain,
           do: {:update_subscription, pid, name, %{gain: track.gain}}
 
@@ -95,13 +96,16 @@ defmodule Octoroom.Reconciler do
 
     1. `{:stop_inlet, {worker_id, input}}`: no longer an input, or its track
        is gone.
-    2. `{:stop_outlet, name}`: no longer any worker's output.
+    2. `{:stop_outlet, name}`: no longer any worker's output, or now
+       another worker's: it's stopped here and started again for that
+       worker.
     3. `{:stop_worker, id}`: no longer in the specs.
     4. `{:start_worker, spec}`, `{:restart_worker, spec}` (its module or args
        changed) and `{:update_worker, spec}` (only its inputs or outputs
        changed: the worker keeps running).
-    5. `{:start_outlet, name, worker_id}`: an output with no outlet. If two
-       workers name the same output, the first one in the specs has it.
+    5. `{:start_outlet, name, worker_id}`: an output with no outlet of this
+       worker's. If two workers name the same output, the first one in the
+       specs has it.
     6. `{:start_inlet, {worker_id, input}}`: an input whose track is live.
        Inlets of pending tracks wait until they go live.
   """
@@ -129,8 +133,8 @@ defmodule Octoroom.Reconciler do
       for key <- Enum.sort(inlets), not MapSet.member?(wanted_inlets, key), do: {:stop_inlet, key}
 
     stop_outlets =
-      for {name, _} <- Enum.sort(outlets),
-          not List.keymember?(wanted_outlets, name, 0),
+      for {name, _} = outlet <- Enum.sort(outlets),
+          outlet not in wanted_outlets,
           do: {:stop_outlet, name}
 
     stop_workers =
@@ -141,7 +145,7 @@ defmodule Octoroom.Reconciler do
 
     start_outlets =
       for {name, id} <- wanted_outlets,
-          not Map.has_key?(outlets, name),
+          Map.get(outlets, name) != id,
           do: {:start_outlet, name, id}
 
     start_inlets =

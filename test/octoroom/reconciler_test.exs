@@ -57,6 +57,17 @@ defmodule Octoroom.ReconcilerTest do
            ]
   end
 
+  test "a stale subscription is closed, not given a new gain" do
+    desired = %{"a" => [t("bot/out", 0.5)]}
+
+    actual = %{
+      subscriptions: %{"a" => %{"bot/out" => Map.put(sub(:open), :stale, true)}},
+      tracks: %{"bot/out" => :live}
+    }
+
+    assert Reconciler.diff(desired, actual) == [{:close_subscription, "a", "bot/out"}]
+  end
+
   test "desired equals actual means no operations" do
     desired = %{"a" => [t("b/mic")], "b" => [t("a/mic")]}
 
@@ -126,6 +137,18 @@ defmodule Octoroom.ReconcilerTest do
       a = w("a", outputs: ["shared"])
       b = w("b", outputs: ["shared"])
       assert {:start_outlet, "shared", "a"} in Reconciler.diff_workers([a, b], %{})
+    end
+
+    test "an output that moves to another worker gets a new outlet" do
+      new = w("new", outputs: ["out"])
+      actual = %{workers: %{"old" => w("old", outputs: ["out"])}, outlets: %{"out" => "old"}}
+
+      assert Reconciler.diff_workers([new], actual) == [
+               {:stop_outlet, "out"},
+               {:stop_worker, "old"},
+               {:start_worker, new},
+               {:start_outlet, "out", "new"}
+             ]
     end
   end
 end

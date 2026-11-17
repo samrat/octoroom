@@ -246,6 +246,46 @@ defmodule Octoroom.WorkerTest do
     assert state.outputs == %{}
   end
 
+  # One output, from a worker named after the first participant's `owner`.
+  defmodule HandoverRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def workers(%{participants: []}), do: []
+
+    def workers(%{participants: [first | _]}) do
+      [
+        worker("w:#{first.meta.owner}", Octoroom.WorkerTest.Echo,
+          outputs: ["out"],
+          args: %{test: first.meta.test}
+        )
+      ]
+    end
+  end
+
+  test "an output that moves to another worker moves to that worker's peer", ctx do
+    alice = join(ctx, "alice", HandoverRoom, %{owner: "a"})
+    assert_receive {:worker_started, "w:a", old, _}
+    assert_receive {:cloudflare, :push_tracks, [old_session, _offer, [%{track_name: cf_track}]]}
+    assert %{"out" => %{worker: "w:a"}} = Octoroom.Room.state(ctx.room_id).outputs
+
+    :ok = Octoroom.Room.update_meta(ctx.room_id, alice.id, &%{&1 | owner: "b"})
+    assert_receive {:worker_terminated, ^old, :shutdown}
+    assert_receive {:worker_started, "w:b", _new, %{outputs: ["out"]}}
+
+    # The new worker pushes the output from its own session.
+    assert_receive {:cloudflare, :push_tracks, [new_session, _offer, [%{track_name: ^cf_track}]]},
+                   1_000
+
+    assert new_session != old_session
+    assert %{"out" => %{worker: "w:b"}} = Octoroom.Room.state(ctx.room_id).outputs
+    # The new worker's peer and outlet: the old ones are gone.
+    wait_until(fn -> length(media(ctx)) == 2 end)
+  end
+
   test "a crashed worker is restarted and its track stays published", ctx do
     Octoroom.subscribe(ctx.room_id)
     %{alice: alice, worker: worker, worker_id: id, cf_track: cf_track} = live_echo(ctx)
