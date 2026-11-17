@@ -1,0 +1,219 @@
+defmodule Octoroom.PrimitivesTest do
+  use ExUnit.Case, async: true
+
+  import Plug.Test
+
+  alias Octoroom.{Adapter, Audio}
+  alias Octoroom.Cloudflare.{HTTP, Packet}
+
+  describe "packet" do
+    test "round-trips a payload" do
+      payload = :binary.copy(<<1, 2>>, 1_920)
+      assert {:ok, %{payload: ^payload}} = payload |> Packet.encode() |> Packet.decode()
+    end
+
+    test "reads sequence number and timestamp" do
+      bin = <<0x08, 0x96, 0x01, 0x10, 0x05, 0x2A, 0x02, 9, 9>>
+      assert {:ok, %{seq: 150, timestamp: 5, payload: <<9, 9>>}} = Packet.decode(bin)
+    end
+
+    test "reports garbage" do
+      assert {:error, :invalid_packet} = Packet.decode(<<0x2A, 0x05, 1>>)
+    end
+  end
+
+  describe "audio" do
+    defp stereo(values),
+      do: for(v <- values, into: <<>>, do: <<v::little-signed-16, v::little-signed-16>>)
+
+    defp samples(pcm), do: for(<<s::little-signed-16 <- pcm>>, do: s)
+
+    test "averages three stereo frames into one 16 kHz mono sample and carries the rest" do
+      assert {<<600::little-signed-16>>, <<1, 2>>} =
+               Audio.from_adapter(stereo([300, 600, 900]) <> <<1, 2>>, 16_000, 1)
+    end
+
+    test "keeps stereo when asked" do
+      pcm =
+        <<100::little-signed-16, 200::little-signed-16, 300::little-signed-16,
+          400::little-signed-16>>
+
+      assert {out, <<>>} = Audio.from_adapter(pcm, 24_000, 2)
+      assert samples(out) == [200, 300]
+      assert Audio.from_adapter(pcm, 48_000, 2) == {pcm, <<>>}
+    end
+
+    test "interpolates 24 kHz mono to 48 kHz stereo" do
+      {out, last} = Audio.to_adapter(<<100::little-signed-16, 300::little-signed-16>>, 24_000, 1)
+      assert last == {300, 300}
+      assert samples(out) == [50, 50, 100, 100, 200, 200, 300, 300]
+    end
+
+    test "interpolates 16 kHz across calls" do
+      {_, last} = Audio.to_adapter(<<300::little-signed-16>>, 16_000, 1)
+      {out, _} = Audio.to_adapter(<<600::little-signed-16>>, 16_000, 1, last)
+      assert samples(out) == [400, 400, 500, 500, 600, 600]
+    end
+
+    test "rejects rates that don't divide 48 kHz" do
+      assert_raise ArgumentError, fn -> Audio.from_adapter(<<>>, 44_100, 1) end
+    end
+  end
+
+  describe "HTTP client" do
+    defp config(fun), do: %{app_id: "app", app_secret: "secret", request_fun: fun}
+
+    test "sends no body to /sessions/new" do
+      test = self()
+
+      config =
+        config(fn opts ->
+          send(test, {:req, opts})
+          {:ok, %{status: 201, body: %{"sessionId" => "s"}}}
+        end)
+
+      assert {:ok, "s"} = HTTP.new_session(config)
+      assert_received {:req, opts}
+      refute Keyword.has_key?(opts, :json)
+      assert opts[:url] == "https://rtc.live.cloudflare.com/v1/apps/app/sessions/new"
+      assert opts[:auth] == {:bearer, "secret"}
+    end
+
+    test "reports top-level and HTTP errors" do
+      top = fn _ ->
+        {:ok, %{status: 200, body: %{"errorCode" => "x", "errorDescription" => "y"}}}
+      end
+
+      assert {:error, {:cloudflare, "/sessions/new", "x", "y"}} = HTTP.new_session(config(top))
+
+      bad = fn _ -> {:ok, %{status: 400, body: "bad"}} end
+      assert {:error, {:cloudflare, "/sessions/new", 400, "bad"}} = HTTP.new_session(config(bad))
+    end
+
+    test "push fails on a per-track error" do
+      resp = fn _ -> {:ok, %{status: 200, body: %{"tracks" => [%{"errorCode" => "bad_mid"}]}}} end
+
+      assert {:error, {:cloudflare, :track_errors, [_]}} =
+               HTTP.push_tracks(config(resp), "s", "offer", [%{mid: "0", track_name: "mic"}])
+    end
+
+    test "pull keeps going past per-track errors" do
+      test = self()
+
+      resp = fn opts ->
+        send(test, {:req, opts})
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "requiresImmediateRenegotiation" => true,
+             "sessionDescription" => %{"type" => "offer", "sdp" => "offer"},
+             "tracks" => [
+               %{"mid" => "1", "trackName" => "mic", "sessionId" => "a"},
+               %{"errorCode" => "empty_track_error", "trackName" => "mic", "sessionId" => "b"}
+             ]
+           }
+         }}
+      end
+
+      sources = [%{session_id: "a", track_name: "mic"}, %{session_id: "b", track_name: "mic"}]
+      assert {:ok, result} = HTTP.pull_tracks(config(resp), "me", sources)
+      assert result.sdp == "offer"
+      assert result.renegotiate
+
+      assert result.tracks == [
+               %{session_id: "a", track_name: "mic", mid: "1"},
+               %{session_id: "b", track_name: "mic", error: "empty_track_error"}
+             ]
+
+      assert_received {:req, opts}
+      assert opts[:url] =~ "/sessions/me/tracks/new"
+
+      assert opts[:json].tracks == [
+               %{location: "remote", sessionId: "a", trackName: "mic"},
+               %{location: "remote", sessionId: "b", trackName: "mic"}
+             ]
+    end
+
+    test "close sends the client's offer, or forces without one" do
+      test = self()
+
+      resp = fn opts ->
+        send(test, {:req, opts})
+        {:ok, %{status: 200, body: %{"sessionDescription" => %{"sdp" => "answer"}}}}
+      end
+
+      assert {:ok, %{sdp: "answer"}} = HTTP.close_tracks(config(resp), "s", ["1"], "offer")
+      assert_received {:req, opts}
+      assert opts[:method] == :put
+
+      assert opts[:json] == %{
+               tracks: [%{mid: "1"}],
+               force: false,
+               sessionDescription: %{type: "offer", sdp: "offer"}
+             }
+
+      HTTP.close_tracks(config(resp), "s", ["1"], nil)
+      assert_received {:req, opts}
+      assert opts[:json] == %{tracks: [%{mid: "1"}], force: true}
+    end
+  end
+
+  describe "adapter socket" do
+    alias Octoroom.Adapter.Socket
+
+    test "egress forwards decoded audio to its owner" do
+      assert {:ok, state} = Socket.init(%{role: :egress, owner: self()})
+      assert_received {:octoroom_adapter_socket, :egress, socket}
+
+      assert {:ok, _} = Socket.handle_in({Packet.encode(<<1, 2>>), opcode: :binary}, state)
+      assert_received {:octoroom_pcm, ^socket, <<1, 2>>}
+    end
+
+    test "ingest encodes frames for Cloudflare" do
+      {:ok, state} = Socket.init(%{role: :ingest, owner: self()})
+      expected = Packet.encode(<<3, 4>>)
+
+      assert {:push, {:binary, ^expected}, _} =
+               Socket.handle_info({:octoroom_pcm, <<3, 4>>}, state)
+    end
+
+    test "closes when its owner stops" do
+      owner = spawn(fn -> :ok end)
+      {:ok, state} = Socket.init(%{role: :ingest, owner: owner})
+      assert_receive {:DOWN, ref, :process, ^owner, _}
+      assert ref == state.ref
+
+      assert {:stop, :normal, _} =
+               Socket.handle_info({:DOWN, ref, :process, owner, :normal}, state)
+    end
+  end
+
+  describe "plug" do
+    @opts Octoroom.Plug.init(path: "/octoroom")
+
+    test "passes other paths through" do
+      refute (conn(:get, "/other/ingest/abc") |> Octoroom.Plug.call(@opts)).halted
+    end
+
+    test "404s for an unknown id" do
+      conn = conn(:get, "/octoroom/ingest/nope") |> Octoroom.Plug.call(@opts)
+      assert conn.halted
+      assert conn.status == 404
+    end
+
+    test "400s for a non-WebSocket request to a registered id" do
+      id = Adapter.new_id()
+      {:ok, _} = Adapter.register(:ingest, id)
+      conn = conn(:get, "/octoroom/ingest/#{id}") |> Octoroom.Plug.call(@opts)
+      assert conn.halted
+      assert conn.status == 400
+    end
+
+    test "builds the URL Cloudflare dials" do
+      assert Adapter.url("wss://example.test/octoroom/", :egress, "abc") ==
+               "wss://example.test/octoroom/egress/abc"
+    end
+  end
+end
