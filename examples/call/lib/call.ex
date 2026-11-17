@@ -233,6 +233,16 @@ defmodule Call.CallLive do
 
   defp name(names, track), do: Map.get(names, track, track)
 
+  defp input_note(worker, input) do
+    dropped = worker.dropped[input] || 0
+
+    cond do
+      input not in worker.connected -> " (waiting)"
+      dropped > 0 -> " (#{dropped} frames over real time dropped)"
+      true -> ""
+    end
+  end
+
   # One outlet stat per output, as text: a bare list of integers would
   # render as raw bytes.
   defp stat(stats, outputs, key, unit \\ "") do
@@ -324,9 +334,7 @@ defmodule Call.CallLive do
 
                 inputs ->
                   inputs
-                  |> Enum.map(
-                    &(name(@names, &1) <> if(&1 in w.connected, do: "", else: " (waiting)"))
-                  )
+                  |> Enum.map(&(name(@names, &1) <> input_note(w, &1)))
                   |> Enum.join(", ")
               end}
             </td>

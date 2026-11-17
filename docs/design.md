@@ -51,8 +51,8 @@ Cloudflare reaches server-side participants over `wss://`.
   dependency on any voice-agent library. AI participants come from
   integrations; see [AI integrations](#ai-integrations).
 - Running or self-hosting an SFU. Cloudflare is the only media plane.
-- Large video rooms (simulcast layer selection, active-speaker video). Video
-  tracks should pass through, but v1 doesn't tune for them.
+- Video in v1. Rooms carry audio only; [Video](#video) describes the plan
+  and what v1 must avoid to keep it cheap to add.
 - Native mobile SDKs in v1. The browser client comes first.
 - Broadcast to thousands of passive listeners. HLS or MoQ fit that better.
 
@@ -582,6 +582,153 @@ run a worker's I/O over an `ex_webrtc` peer connection to Cloudflare
 (Opus, lower latency, needs UDP egress) without the worker changing. The
 outlet and inlet abstraction is where that split goes.
 
+## Video
+
+Not in v1. This section records the plan so v1 doesn't make video harder
+to add. Video falls into three parts, from cheapest to most expensive:
+browser-to-browser video, bandwidth control in bigger rooms, and workers
+that see or produce video.
+
+### Who needs UDP
+
+- **Browser video needs nothing new on the server.** Browsers already speak
+  WebRTC to Cloudflare, and a camera is one more track on the peer
+  connection each browser already has. The Phoenix server still only does
+  HTTPS signaling, so "only HTTPS exposed" (see [Goals](#goals)) still holds.
+- **Workers that see or produce video need the WebRTC transport** (see
+  [Worker media transport](#worker-media-transport)). Cloudflare's WebSocket
+  adapters carry PCM audio only. That transport needs *outbound* UDP only.
+  Cloudflare is ICE-lite with public addresses, so the server's `ex_webrtc`
+  peer always opens the connection, and the replies come back through the
+  same NAT mapping. There are no inbound ports and no TURN server. A
+  deployment that blocks outbound UDP (some corporate networks, Kubernetes
+  with strict egress rules) needs one rule allowing UDP to Cloudflare.
+  `transport: :webrtc` should check for this at startup and fail with a
+  clear error. Whether Cloudflare offers a TCP fallback is unverified.
+
+### Publications
+
+Today each participant has exactly one track: the room server hardcodes
+`"mic"`, and a participant's `mic: :none | :publishing | :pending | :live`
+allows a single `publish`. Video replaces that with a map of publications
+keyed by source, following LiveKit:
+
+```elixir
+tracks: %{"mic" => :live, "camera" => :pending, "screen" => :none}
+```
+
+- **Sources** are `mic`, `camera`, `screen` and `screen_audio`. A source
+  is easier for policy and permissions to refer to than a free-form name.
+  Room-scoped names stay `"<participant>/<source>"`.
+- **Publish and unpublish at any time.** Turning the camera on or starting a
+  screen share is a new `publish` (a pushed track and one renegotiation).
+  Stopping is an unpublish, which closes every pull of that track. Both go
+  through the per-session operation queue like any other change.
+- **What a participant may publish** comes from `join/2` metadata, like
+  LiveKit's `canPublishSources`. The room server rejects any other source.
+- **Mute is not unpublish.** A muted track keeps its transceiver, the
+  publisher stops sending, and subscribers see a `muted` flag. Nothing
+  renegotiates. Muting the camera uses `track.enabled = false` (the browser
+  sends black frames, so the track stays pullable), not
+  `replaceTrack(null)`, which stops packets and would stall new pulls (see
+  `empty_track_error` in [Cloudflare constraints](#cloudflare-constraints-the-reconciler-has-to-respect)).
+  *To verify:* does a pull stay healthy when its track goes quiet after it
+  went live?
+
+Room API additions: `camera(p)` and `screen(p)` next to `mic(p)`.
+`Octoroom.Track` gains `kind` (`:audio` or `:video`). `gain/2` applies only
+to audio, and video gets `quality/2` (below). The `tracks` channel payload
+carries `kind` and `source`, so the client knows whether to create a media
+element for audio or for video.
+
+### Bandwidth: simulcast and quality as policy
+
+With 20 people all watching each other, each browser downloads 19 video
+streams. That needs simulcast: cameras publish two or three layers (for
+example quarter, half and full resolution), and each subscription chooses
+one. The default is simulcast on for cameras and off for screen shares,
+which favor one sharp layer. Cloudflare's pull API has simulcast options;
+check its current parameters before building on them.
+
+Quality is a subscription option, set by policy like gain:
+
+```elixir
+def subscriptions(listener, room) do
+  speaker = room.assigns.active_speaker
+
+  for p <- others(room, listener), track <- [mic(p), camera(p)] do
+    if track.kind == :video and p.id != speaker, do: quality(track, :low), else: track
+  end
+end
+```
+
+- **Changing a layer must not renegotiate.** The active speaker changes
+  every few seconds, and `subscriptions/2` reruns each time. The reconciler
+  keeps pulls stable and emits `{:update_subscription, ...}` for a layer
+  change, just as it does for gain. Closing and re-pulling would mean an SDP
+  round trip on every speaker change.
+- **Unwatched layers are paused at the publisher** (LiveKit calls this
+  dynacast). The room server already knows which layers every subscription
+  uses, because it computes them. The reconciler emits
+  `{:set_layers, publisher, source, active_layers}`, and the publisher's
+  client applies it with `RTCRtpSender.setParameters` (`active: false` on
+  unused encodings). If nobody watches the full-resolution layer, nobody
+  encodes or uploads it. This needs nothing from Cloudflare.
+- **The client may lower quality but never raise it** (LiveKit's adaptive
+  stream, bounded by the server). The policy sets the maximum layer per
+  subscription. The client may ask for a lower one when the `<video>`
+  element is small or hidden. It can never go above the cap or receive a
+  track the policy didn't grant.
+- **Congestion** (bandwidth estimation per subscriber, dropping layers by
+  priority) happens inside the SFU. Octoroom gets whatever Cloudflare does
+  and can't add it from outside.
+
+### Video for workers
+
+Most AI uses of video don't need a stream. Several have options that avoid
+the WebRTC transport:
+
+| Need | Without the WebRTC transport |
+| --- | --- |
+| A vision agent looks at a participant's camera | That participant's browser grabs a frame, about once a second or when the participant starts speaking, and uploads a JPEG over the channel. The worker receives it in `handle_info/2`. Vision models want snapshots, not streams. |
+| Recording | Each browser records its own tracks with `MediaRecorder` and uploads chunks. Quality depends on the client, and a crash or early leave loses the end of that participant's recording. |
+| An avatar agent | The browser draws the avatar. The worker `emit`s mouth-shape timings or animation events alongside its audio, and no video track exists. |
+
+The upload options have one cost: the client decides what it sends, which
+breaks [server-authoritative routing](#security) for that input. That's fine
+for "the agent sees my camera" and wrong for "a moderator watches
+everyone". The upload has to be opted into per worker input, and the docs
+need to say it's client-supplied.
+
+When a worker needs real video (trusted inputs, server-side compositing,
+high-quality recording), it uses `transport: :webrtc`:
+
+- **Input:** the inlet's peer receives VP8 or H.264 over RTP. A recorder can
+  write RTP straight into WebM or MKV with no decoding. Anything else decodes
+  through Membrane or FFmpeg NIFs (Xav). Decoding is the real cost here, not
+  networking.
+- **Worker API:** `use Octoroom.Worker, video: [fps: 1, format: :rgb]` and
+  `handle_video(input, frame, state)`, next to `handle_audio/3`. Most workers
+  want the latest frame on demand rather than every frame, so inlets keep
+  only the latest decoded frame and drop the rest, and a worker can ask for
+  that frame when it needs one.
+- **Output:** a `play_video` action for avatars or generated video, encoded
+  and paced by the outlet the same way audio is.
+
+The worker contract stays the same with either transport. Only the inlet and
+outlet change.
+
+### Order
+
+1. Map of publications in the room server, `kind` and `source` in `Track`
+   and the `tracks` payload. Do this before v1 ships, because the single
+   mic field spreads through the room server, the reconciler and recovery.
+2. Camera and screen publishing, mute, `<video>` rendering in the client.
+3. Simulcast, `quality/2` and publisher-side layer pausing.
+4. Frame upload over the channel for vision workers.
+5. `transport: :webrtc` with `handle_video/3`, when a use case can't trust
+   the client.
+
 ## AI integrations
 
 Octoroom ships with no AI. Integrations implement `Octoroom.Worker` and live
@@ -882,11 +1029,16 @@ Findings:
 - **Egress delivers ~0.56% more audio than real time.** The recorder wrote
   60.41 s of audio in 60.08 s of wall time; the page's audio clock matched
   its wall clock, and the conversion is exact. A worker that plays its input
-  back (the echo) therefore builds latency: its outlet queue grew 320 →
-  500 ms in 30 s, about 20 s per hour. Outlets need a cap for pass-through
-  workers (drop the oldest queued audio past a bound), or such workers
-  should drop input to match real time. Not fixed yet; worth confirming on
-  a second network and browser first.
+  back (the echo) therefore built latency: its outlet queue grew 320 →
+  500 ms in 30 s, about 20 s per hour. **Fixed** by holding each inlet to
+  real time with a token bucket (20 ms of audio per 20 ms, holding up to
+  300 ms for the bursty TCP leg; frames that find it empty are dropped, and
+  `Room.state/1` reports the count per input). Re-measured the same way:
+  the recording ran +0.02% (120.18 s in 120.15 s), the echo's queue stayed
+  at 260 ms for over a minute, and inlets dropped 20 of ~3,470 frames
+  (0.58%). Dropping is a blunt fix: about one 20 ms frame every 3.6 s,
+  wherever it falls. Dropping during silence, or resampling, would be
+  smoother if it turns out to be audible.
 - **Startup underruns** come from the metronome making exactly 100 ms
   every 100 ms with no lead, so its queue touches empty while timers
   settle. A producer that wants no gaps should keep a little audio ahead.
@@ -939,8 +1091,8 @@ Findings:
    (restart the node mid-call: people keep talking, workers come back),
    telemetry, a LiveView demo app with Presence and captions from `emit`.
 5. **Interpretation demo**, with the Subvocal adapter on the Subvocal side.
-6. **Later:** WebRTC worker transport, clustering, video pass-through, Swift
-   client.
+6. **Later:** video (see [Video](#video) for its order), WebRTC worker
+   transport, clustering, Swift client.
 
 ## Open questions
 

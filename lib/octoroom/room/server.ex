@@ -187,7 +187,12 @@ defmodule Octoroom.Room.Server do
             running: running != nil,
             connected:
               for({{id, input}, %{adapter_id: a}} <- state.inlets, id == spec.id, a, do: input)
-              |> Enum.sort()
+              |> Enum.sort(),
+            # Input frames dropped to hold each input to real time.
+            dropped:
+              for {{id, input}, inlet} <- state.inlets, id == spec.id, into: %{} do
+                {input, inlet_dropped(inlet.pid)}
+              end
           })
         end,
       outputs:
@@ -935,6 +940,12 @@ defmodule Octoroom.Room.Server do
     DynamicSupervisor.terminate_child(sup_name(state, sup), pid)
   catch
     :exit, _ -> :ok
+  end
+
+  defp inlet_dropped(pid) do
+    Inlet.stats(pid).dropped
+  catch
+    :exit, _ -> 0
   end
 
   defp sup_name(state, :media), do: Room.Supervisor.media(state.id)
