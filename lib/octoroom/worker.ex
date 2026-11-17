@@ -1,0 +1,128 @@
+defmodule Octoroom.Worker do
+  @moduledoc """
+  A server-side participant: a process that hears input tracks and plays
+  output tracks as PCM, with no WebRTC in sight.
+
+      defmodule MyApp.DelayEcho do
+        use Octoroom.Worker, audio: [rate: 16_000, channels: 1]
+
+        @impl true
+        def init(_args, _ctx), do: {:ok, :queue.new()}
+
+        @impl true
+        def handle_audio(_input, pcm, q) do
+          q = :queue.in(pcm, q)
+
+          if :queue.len(q) > 100 do
+            {{:value, out}, q} = :queue.out(q)
+            {:ok, q, play: {:default, out}}
+          else
+            {:ok, q}
+          end
+        end
+      end
+
+  A room starts workers from its `workers/1` callback (see
+  `Octoroom.Room.worker/3`). `audio:` picks the PCM format the worker sees,
+  s16le at a `rate` dividing 48 kHz and 1 or 2 `channels` (default 48 kHz
+  stereo, the adapter's own format).
+
+  Callbacks return `{:ok, state}` or `{:ok, state, actions}`, where actions
+  is a keyword list of:
+
+    * `play: {output, pcm}`: queue `pcm` on an output track. Outputs are
+      paced to real time, so a worker can hand over audio faster than it
+      plays. `:default` is the worker's first output.
+    * `flush: output`: drop that output's queued, unplayed audio (barge-in).
+    * `emit: event`: broadcast `{:worker_event, worker_id, event}` to the
+      room's subscribers (see `Octoroom.subscribe/1`).
+
+  `handle_info/2` also receives `{:octoroom, :inputs, names}` and
+  `{:octoroom, :outputs, names}` when the room changes the worker's inputs or
+  outputs; the worker keeps running. A change of module or args restarts it.
+
+  A worker that crashes is restarted by its room, with backoff. Its output
+  tracks stay published while it restarts, so listeners hear a gap rather
+  than a renegotiation.
+  """
+
+  alias Octoroom.Worker.Context
+
+  @type state :: term
+  @type actions :: [
+          play: {String.t() | :default, binary},
+          flush: String.t() | :default,
+          emit: term
+        ]
+  @type result :: {:ok, state} | {:ok, state, actions}
+
+  @callback init(args :: term, ctx :: Context.t()) :: result | {:stop, reason :: term}
+  @callback handle_audio(input :: String.t(), pcm :: binary, state) :: result
+  @callback handle_info(message :: term, state) :: result
+  @callback terminate(reason :: term, state) :: term
+
+  @optional_callbacks handle_info: 2, terminate: 2
+
+  defmacro __using__(opts) do
+    audio = Keyword.get(opts, :audio, [])
+    rate = Keyword.get(audio, :rate, 48_000)
+    channels = Keyword.get(audio, :channels, 2)
+    Octoroom.Audio.validate!(rate, channels)
+
+    quote do
+      @behaviour Octoroom.Worker
+
+      @doc false
+      def __octoroom_audio__, do: {unquote(rate), unquote(channels)}
+
+      @impl true
+      def handle_info(_message, state), do: {:ok, state}
+
+      @impl true
+      def terminate(_reason, _state), do: :ok
+
+      defoverridable handle_info: 2, terminate: 2
+    end
+  end
+
+  @doc "The pid of worker `id` in room `room_id`, or nil."
+  def whereis(room_id, id) do
+    case Registry.lookup(Octoroom.Registry, {:worker, room_id, id}) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Sends `message` to a running worker's `handle_info/2`, for example from a
+  LiveView. Returns `:ok`, or `{:error, :no_worker}`.
+  """
+  def send(room_id, id, message) do
+    case whereis(room_id, id) do
+      nil ->
+        {:error, :no_worker}
+
+      pid ->
+        Kernel.send(pid, message)
+        :ok
+    end
+  end
+end
+
+defmodule Octoroom.Worker.Context do
+  @moduledoc """
+  What a worker knows when it starts: its room, its id, its input and output
+  track names, and the room's participants at that moment. Call
+  `Octoroom.Room.state/1` for anything newer.
+  """
+
+  defstruct [:room_id, :id, inputs: [], outputs: [], participants: []]
+
+  @type t :: %__MODULE__{
+          room_id: String.t(),
+          id: String.t(),
+          inputs: [String.t()],
+          outputs: [String.t()],
+          participants: [Octoroom.Participant.t()]
+        }
+end

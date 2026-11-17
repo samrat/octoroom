@@ -15,18 +15,55 @@ defmodule Call.Application do
 end
 
 defmodule Call.Room do
-  @moduledoc "A plain group call: everyone hears everyone."
+  @moduledoc """
+  A group call with a mic check: everyone hears everyone, plus
+
+    * a private two-second echo for each participant who turns it on, which
+      only they hear;
+    * a room-wide metronome, when the room's `:metronome` assign is set;
+    * a recorder hearing every mic, when the room's `:recording` assign is set.
+  """
   use Octoroom.Room
 
   @impl true
   def join(%{"name" => name}, _socket) when is_binary(name) do
     case String.trim(name) do
       "" -> {:error, :name_required}
-      name -> {:ok, %{name: String.slice(name, 0, 32)}}
+      name -> {:ok, %{name: String.slice(name, 0, 32), echo: false}}
     end
   end
 
   def join(_params, _socket), do: {:error, :name_required}
+
+  @impl true
+  def workers(room) do
+    echoes =
+      for %{meta: %{echo: true}} = p <- room.participants do
+        worker("echo:#{p.id}", Call.DelayEcho, inputs: [mic(p)], outputs: [echo(p)])
+      end
+
+    metronome =
+      if room.assigns[:metronome],
+        do: [worker("metronome", Call.Metronome, outputs: ["metronome"])],
+        else: []
+
+    recorder =
+      if room.assigns[:recording] && room.participants != [],
+        do: [worker("recorder", Call.Recorder, inputs: Enum.map(room.participants, &mic/1))],
+        else: []
+
+    metronome ++ echoes ++ recorder
+  end
+
+  @impl true
+  def subscriptions(listener, room) do
+    mics = for p <- others(room, listener), do: mic(p)
+    own_echo = if listener.meta.echo, do: [track(echo(listener))], else: []
+    metronome = if room.assigns[:metronome], do: [track("metronome")], else: []
+    mics ++ own_echo ++ metronome
+  end
+
+  def echo(participant), do: "#{participant.id}/echo"
 end
 
 defmodule Call.RoomChannel do
@@ -78,6 +115,10 @@ defmodule Call.Layouts do
           .meter { display: inline-block; width: 80px; height: 8px; background: #8883; border-radius: 4px; overflow: hidden; vertical-align: middle; }
           .meter > span { display: block; height: 100%; width: 0; background: var(--ok); transition: width .15s; }
           .empty { color: var(--muted); margin-top: 20px; }
+          .workers { margin-top: 12px; }
+          .warn { background: #f3802022; border-radius: 10px; padding: 10px 12px; margin: 12px 0 0; }
+          .recorded { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 12px; }
+          .recorded .dir { width: 100%; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
         </style>
         <script type="importmap">
           {"imports": {
@@ -101,28 +142,103 @@ defmodule Call.CallLive do
   @impl true
   def mount(params, _session, socket) do
     room = params["room"] || "lobby"
-    if connected?(socket), do: Octoroom.subscribe(room)
-    {:ok, socket |> assign(room: room, me: nil) |> load()}
+
+    if connected?(socket) do
+      Octoroom.subscribe(room)
+      # Outlet stats (queue length, underruns) change without room events.
+      :timer.send_interval(1_000, :refresh)
+    end
+
+    socket =
+      assign(socket,
+        room: room,
+        me: nil,
+        recorded: %{},
+        recording_dir: nil,
+        public_url?: Application.get_env(:octoroom, :public_ws_url) not in [nil, ""]
+      )
+
+    {:ok, load(socket)}
   end
 
   @impl true
+  def handle_info(
+        {:octoroom, _room, {:worker_event, "recorder", {:recorded, seconds, dir}}},
+        socket
+      ),
+      do: {:noreply, assign(socket, recorded: seconds, recording_dir: dir)}
+
   def handle_info({:octoroom, _room, _event}, socket), do: {:noreply, load(socket)}
+  def handle_info(:refresh, socket), do: {:noreply, load(socket)}
 
   @impl true
   def handle_event("client", %{"state" => state} = params, socket) do
     me = if state == "joined", do: params["participant_id"]
-    {:noreply, assign(socket, me: me)}
+    {:noreply, socket |> assign(me: me) |> load()}
   end
 
+  def handle_event("toggle_echo", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
+    Octoroom.Room.update_meta(socket.assigns.room, me, &%{&1 | echo: not &1.echo})
+    {:noreply, socket}
+  end
+
+  def handle_event("flush_echo", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
+    Octoroom.Worker.send(socket.assigns.room, "echo:#{me}", :flush)
+    {:noreply, socket}
+  end
+
+  def handle_event("crash_echo", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
+    if pid = Octoroom.Worker.whereis(socket.assigns.room, "echo:#{me}"),
+      do: Process.exit(pid, :kill)
+
+    {:noreply, socket}
+  end
+
+  def handle_event("toggle", %{"assign" => key}, socket) when key in ~w(metronome recording) do
+    key = String.to_existing_atom(key)
+    on = get_in(socket.assigns, [:assigns, key]) || false
+    Octoroom.Room.assign(socket.assigns.room, key, not on)
+    {:noreply, socket}
+  end
+
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
+
   defp load(socket) do
-    participants =
-      case Octoroom.Room.state(socket.assigns.room) do
-        %{participants: ps} -> ps
-        {:error, :no_room} -> []
+    room = socket.assigns.room
+
+    {participants, workers, outputs, assigns} =
+      case Octoroom.Room.state(room) do
+        %{} = s -> {s.participants, s.workers, s.outputs, s.assigns}
+        {:error, :no_room} -> {[], [], %{}, %{}}
       end
 
-    names = Map.new(participants, &{"#{&1.id}/mic", &1.meta.name})
-    assign(socket, participants: participants, names: names)
+    names =
+      Map.new(participants, &{"#{&1.id}/mic", &1.meta.name})
+      |> Map.merge(Map.new(participants, &{"#{&1.id}/echo", "#{&1.meta.name}’s echo"}))
+      |> Map.put("metronome", "metronome")
+
+    stats = Map.new(outputs, fn {name, _} -> {name, Octoroom.Outlet.stats(room, name)} end)
+    me = Enum.find(participants, &(&1.id == socket.assigns.me))
+
+    assign(socket,
+      participants: participants,
+      workers: workers,
+      outputs: outputs,
+      stats: stats,
+      assigns: assigns,
+      names: names,
+      my_echo: me != nil and me.meta.echo
+    )
+  end
+
+  defp name(names, track), do: Map.get(names, track, track)
+
+  # One outlet stat per output, as text: a bare list of integers would
+  # render as raw bytes.
+  defp stat(stats, outputs, key, unit \\ "") do
+    outputs
+    |> Enum.flat_map(fn o -> if s = stats[o], do: ["#{Map.fetch!(s, key)}#{unit}"], else: [] end)
+    |> Enum.join(", ")
   end
 
   @impl true
@@ -143,6 +259,26 @@ defmodule Call.CallLive do
         <div id="status">Not in the call.</div>
       </div>
 
+      <p :if={not @public_url?} class="warn">
+        <code>OCTOROOM_PUBLIC_WS_URL</code>
+        isn’t set, so workers run but Cloudflare can’t reach them: nobody will hear them. See the README.
+      </p>
+
+      <div class="controls workers">
+        <strong>Mic check</strong>
+        <button phx-click="toggle_echo" disabled={@me == nil}>
+          {if @my_echo, do: "Echo off", else: "Echo on"}
+        </button>
+        <button class="secondary" phx-click="flush_echo" disabled={not @my_echo}>Flush my echo</button>
+        <button class="secondary" phx-click="crash_echo" disabled={not @my_echo}>Crash my echo</button>
+        <button phx-click="toggle" phx-value-assign="metronome">
+          {if @assigns[:metronome], do: "Metronome off", else: "Metronome on"}
+        </button>
+        <button phx-click="toggle" phx-value-assign="recording">
+          {if @assigns[:recording], do: "Stop recording", else: "Record"}
+        </button>
+      </div>
+
       <table :if={@participants != []}>
         <thead>
           <tr>
@@ -159,13 +295,63 @@ defmodule Call.CallLive do
             <td>
               {case p.hears do
                 [] -> "—"
-                hears -> hears |> Enum.map(&Map.get(@names, &1, &1)) |> Enum.join(", ")
+                hears -> hears |> Enum.map(&name(@names, &1)) |> Enum.join(", ")
               end}
             </td>
           </tr>
         </tbody>
       </table>
       <p :if={@participants == []} class="empty">Nobody is here yet.</p>
+
+      <table :if={@workers != []}>
+        <thead>
+          <tr>
+            <th>Worker</th><th>Hears</th><th>Plays</th><th>Queued</th><th>Sent</th><th>Underruns</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr :for={w <- @workers} id={"w-#{w.id}"}>
+            <td>
+              {w.id |> String.split(":") |> hd()}
+              <span class={["pill", w.running && "live"]}>{if w.running,
+                do: "running",
+                else: "restarting"}</span>
+            </td>
+            <td>
+              {case w.inputs do
+                [] ->
+                  "—"
+
+                inputs ->
+                  inputs
+                  |> Enum.map(
+                    &(name(@names, &1) <> if(&1 in w.connected, do: "", else: " (waiting)"))
+                  )
+                  |> Enum.join(", ")
+              end}
+            </td>
+            <td>
+              <span :for={o <- w.outputs}>
+                {name(@names, o)}
+                <span class={["pill", get_in(@outputs, [o, :status]) == :live && "live"]}>
+                  {get_in(@outputs, [o, :status]) || "—"}
+                </span>
+              </span>
+            </td>
+            <td>{stat(@stats, w.outputs, :queued_ms, " ms")}</td>
+            <td>{stat(@stats, w.outputs, :sent)}</td>
+            <td>{stat(@stats, w.outputs, :underruns)}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div :if={@recorded != %{}} class="recorded">
+        <strong>Recorded</strong>
+        <span :for={{track, seconds} <- Enum.sort(@recorded)}>
+          {name(@names, track)}: {:erlang.float_to_binary(seconds, decimals: 1)} s
+        </span>
+        <div class="dir">{@recording_dir}</div>
+      </div>
     </main>
     """
   end
@@ -197,7 +383,8 @@ defmodule Call.Endpoint do
   socket "/live", Phoenix.LiveView.Socket
   socket "/socket", Call.UserSocket, websocket: true
 
-  # Serves the sockets Cloudflare dials for workers (milestone 3).
+  # Serves the sockets Cloudflare dials for workers: set
+  # OCTOROOM_PUBLIC_WS_URL to this path's public wss:// URL.
   plug Octoroom.Plug, path: "/octoroom"
 
   plug Plug.Static,

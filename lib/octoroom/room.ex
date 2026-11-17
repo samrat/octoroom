@@ -15,10 +15,11 @@ defmodule Octoroom.Room do
   every room change and read only the `%Octoroom.Room{}` they're given.
 
   The struct holds the room's `id`, its `participants` in join order (each an
-  `Octoroom.Participant`), its running `workers` and its `assigns`.
+  `Octoroom.Participant`), its `workers` (the specs `workers/1` last
+  returned) and its `assigns`.
   """
 
-  alias Octoroom.{Participant, Track}
+  alias Octoroom.{Participant, Room, Track}
   alias Octoroom.Room.Server
 
   defstruct [:id, participants: [], workers: [], assigns: %{}]
@@ -26,8 +27,16 @@ defmodule Octoroom.Room do
   @type t :: %__MODULE__{
           id: String.t(),
           participants: [Participant.t()],
-          workers: [map],
+          workers: [worker_spec],
           assigns: map
+        }
+
+  @type worker_spec :: %{
+          id: String.t(),
+          module: module,
+          inputs: [String.t()],
+          outputs: [String.t()],
+          args: term
         }
 
   @doc "May this client join, and with what metadata? Runs in the client's channel process."
@@ -36,8 +45,13 @@ defmodule Octoroom.Room do
   @doc "Runs once when the room process starts. Returns the room's assigns."
   @callback mount(room_id :: String.t()) :: {:ok, map}
 
-  @doc "Which server-side participants should be running now? (Milestone 3.)"
-  @callback workers(t) :: [map]
+  @doc """
+  Which server-side participants should be running now? Each is a
+  `worker/3` spec, identified by its id. Octoroom starts and stops workers
+  to match. A spec that comes back with other inputs or outputs is updated in
+  place; one with another module or args is restarted.
+  """
+  @callback workers(t) :: [worker_spec]
 
   @doc "What should `listener` hear now?"
   @callback subscriptions(listener :: Participant.t(), t) :: [Track.t() | String.t()]
@@ -85,16 +99,27 @@ defmodule Octoroom.Room do
     mics ++ outputs
   end
 
-  @doc "A worker spec. Workers arrive in milestone 3; specs are ignored until then."
+  @doc """
+  A worker spec, for `workers/1`:
+
+    * `inputs`: tracks the worker hears (`mic/1`, `track/1` or names).
+      An input is connected once its track is live.
+    * `outputs`: names of the tracks the worker plays. Output names share a
+      namespace with every other track in the room.
+    * `args`: passed to the worker's `init/2`.
+  """
   def worker(id, module, opts) when is_binary(id) and is_atom(module) do
     %{
       id: id,
       module: module,
-      inputs: Keyword.get(opts, :inputs, []),
-      outputs: Keyword.get(opts, :outputs, []),
+      inputs: opts |> Keyword.get(:inputs, []) |> Enum.map(&track_name/1) |> Enum.uniq(),
+      outputs: opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq(),
       args: Keyword.get(opts, :args, %{})
     }
   end
+
+  defp track_name(%Track{name: name}), do: name
+  defp track_name(name) when is_binary(name), do: name
 
   ## Running rooms
 
@@ -106,7 +131,7 @@ defmodule Octoroom.Room do
   Returns `{:ok, %{participant_id, participants, ice_servers}, server}`.
   """
   def join(module, room_id, meta, opts \\ []) do
-    join(module, room_id, meta, opts, 2)
+    join(module, room_id, meta, opts, 5)
   end
 
   defp join(module, room_id, meta, opts, attempts) do
@@ -115,17 +140,27 @@ defmodule Octoroom.Room do
       {:ok, reply, server}
     end
   catch
-    # The room stopped (its last participant left) between lookup and call.
-    :exit, _ when attempts > 1 -> join(module, room_id, meta, opts, attempts - 1)
+    # The room stopped (its last participant left) between lookup and call,
+    # and its supervisor may still be shutting down.
+    :exit, _ when attempts > 1 ->
+      Process.sleep(10)
+      join(module, room_id, meta, opts, attempts - 1)
   end
 
   defp ensure_started(module, room_id, opts) do
-    spec = {Server, Keyword.merge(opts, room_id: room_id, module: module)}
+    spec = {Room.Supervisor, Keyword.merge(opts, room_id: room_id, module: module)}
 
     case DynamicSupervisor.start_child(Octoroom.RoomSupervisor, spec) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
+      {:ok, _} -> server!(room_id)
+      {:error, {:already_started, _}} -> server!(room_id)
       error -> error
+    end
+  end
+
+  defp server!(room_id) do
+    case Server.whereis(room_id) do
+      nil -> exit(:room_stopping)
+      pid -> {:ok, pid}
     end
   end
 
@@ -150,5 +185,8 @@ defmodule Octoroom.Room do
       nil -> {:error, :no_room}
       pid -> GenServer.call(pid, message)
     end
+  catch
+    # The room stopped (its last participant left) after the lookup.
+    :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] -> {:error, :no_room}
   end
 end

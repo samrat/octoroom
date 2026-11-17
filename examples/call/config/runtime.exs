@@ -16,7 +16,11 @@ file_env =
 
 fetch = fn key -> System.get_env(key) || file_env[key] end
 
+# OCTOROOM_PUBLIC_WS_URL: the public wss:// URL of Octoroom.Plug's path
+# (e.g. wss://abc.trycloudflare.com/octoroom), which Cloudflare dials for
+# workers.
 config :octoroom,
+  public_ws_url: fetch.("OCTOROOM_PUBLIC_WS_URL"),
   cloudflare: [
     app_id: fetch.("OCTOROOM_CLOUDFLARE_APP_ID"),
     app_secret: fetch.("OCTOROOM_CLOUDFLARE_APP_SECRET")

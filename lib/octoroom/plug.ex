@@ -13,6 +13,8 @@ defmodule Octoroom.Plug do
 
   @behaviour Plug
 
+  require Logger
+
   alias Octoroom.Adapter
 
   @impl true
@@ -24,8 +26,20 @@ defmodule Octoroom.Plug do
   @impl true
   def call(conn, %{prefix: prefix}) do
     case Enum.split(conn.path_info, length(prefix)) do
-      {^prefix, [role, id]} when role in ["ingest", "egress"] -> upgrade(conn, role, id)
-      _ -> conn
+      {^prefix, [role, id]} when role in ["ingest", "egress"] ->
+        upgrade(conn, role, id)
+
+      {^prefix, rest} ->
+        # Under our path but not an adapter URL: pass it on, but say so,
+        # since a refused adapter dial otherwise leaves no trace.
+        Logger.warning(
+          "Octoroom.Plug ignoring #{conn.method} #{conn.request_path} (#{inspect(rest)})"
+        )
+
+        conn
+
+      _ ->
+        conn
     end
   end
 
@@ -34,6 +48,7 @@ defmodule Octoroom.Plug do
 
     case Adapter.lookup(role, id) do
       nil ->
+        Logger.warning("Octoroom.Plug: no #{role} adapter is registered as #{id}")
         conn |> Plug.Conn.send_resp(404, "not found") |> Plug.Conn.halt()
 
       owner ->
@@ -45,6 +60,7 @@ defmodule Octoroom.Plug do
     end
   rescue
     error in WebSockAdapter.UpgradeError ->
+      Logger.warning("Octoroom.Plug refused #{conn.request_path}: #{Exception.message(error)}")
       conn |> Plug.Conn.send_resp(400, Exception.message(error)) |> Plug.Conn.halt()
   end
 end

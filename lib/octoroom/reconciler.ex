@@ -68,6 +68,97 @@ defmodule Octoroom.Reconciler do
     Enum.sort(closes) ++ Enum.sort(opens) ++ Enum.sort(updates)
   end
 
+  @type worker_op ::
+          {:stop_inlet, {String.t(), String.t()}}
+          | {:stop_outlet, String.t()}
+          | {:stop_worker, String.t()}
+          | {:start_worker, map}
+          | {:restart_worker, map}
+          | {:update_worker, map}
+          | {:start_outlet, String.t(), String.t()}
+          | {:start_inlet, {String.t(), String.t()}}
+
+  @doc """
+  Diffs the worker specs `workers/1` returned against the running workers
+  and their media. `actual` has:
+
+    * `:workers`: worker id => the spec it runs
+    * `:outlets`: output track name => the id of the worker it belongs to
+    * `:inlets`: a list of `{worker_id, input track name}`
+    * `:tracks`: the track directory, as for `diff/2`
+
+  Operations, in the order they should be applied: tear down first, so
+  capacity and billing go down before they go up.
+
+    1. `{:stop_inlet, {worker_id, input}}`: no longer an input, or its track
+       is gone.
+    2. `{:stop_outlet, name}`: no longer any worker's output.
+    3. `{:stop_worker, id}`: no longer in the specs.
+    4. `{:start_worker, spec}`, `{:restart_worker, spec}` (its module or args
+       changed) and `{:update_worker, spec}` (only its inputs or outputs
+       changed: the worker keeps running).
+    5. `{:start_outlet, name, worker_id}`: an output with no outlet. If two
+       workers name the same output, the first one in the specs has it.
+    6. `{:start_inlet, {worker_id, input}}`: an input whose track is live.
+       Inlets of pending tracks wait until they go live.
+  """
+  @spec diff_workers([map], map) :: [worker_op]
+  def diff_workers(specs, actual) do
+    running = Map.get(actual, :workers, %{})
+    outlets = Map.get(actual, :outlets, %{})
+    inlets = actual |> Map.get(:inlets, []) |> MapSet.new()
+    tracks = Map.get(actual, :tracks, %{})
+
+    specs = Enum.uniq_by(specs, & &1.id)
+    wanted = Map.new(specs, &{&1.id, &1})
+
+    wanted_outlets =
+      specs
+      |> Enum.flat_map(fn s -> Enum.map(s.outputs, &{&1, s.id}) end)
+      |> Enum.uniq_by(&elem(&1, 0))
+
+    wanted_inlets =
+      for s <- specs, input <- s.inputs, Map.get(tracks, input) == :live, into: MapSet.new() do
+        {s.id, input}
+      end
+
+    stop_inlets =
+      for key <- Enum.sort(inlets), not MapSet.member?(wanted_inlets, key), do: {:stop_inlet, key}
+
+    stop_outlets =
+      for {name, _} <- Enum.sort(outlets),
+          not List.keymember?(wanted_outlets, name, 0),
+          do: {:stop_outlet, name}
+
+    stop_workers =
+      for {id, _} <- Enum.sort(running), not Map.has_key?(wanted, id), do: {:stop_worker, id}
+
+    workers =
+      for s <- specs, op = worker_op(s, running[s.id]), do: op
+
+    start_outlets =
+      for {name, id} <- wanted_outlets,
+          not Map.has_key?(outlets, name),
+          do: {:start_outlet, name, id}
+
+    start_inlets =
+      for {id, input} = key <- Enum.sort(wanted_inlets),
+          not MapSet.member?(inlets, key),
+          do: {:start_inlet, {id, input}}
+
+    stop_inlets ++ stop_outlets ++ stop_workers ++ workers ++ start_outlets ++ start_inlets
+  end
+
+  defp worker_op(spec, nil), do: {:start_worker, spec}
+
+  defp worker_op(spec, old) do
+    cond do
+      old.module != spec.module or old.args != spec.args -> {:restart_worker, spec}
+      old.inputs != spec.inputs or old.outputs != spec.outputs -> {:update_worker, spec}
+      true -> nil
+    end
+  end
+
   @doc "A policy result entry as a track: a name means full gain."
   def normalize(%Track{} = track), do: track
   def normalize(name) when is_binary(name), do: %Track{name: name}

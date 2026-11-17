@@ -1,8 +1,9 @@
 # Octoroom design
 
-Status: **milestones 1 and 2 implemented** (2026-11-17). See
-[Implementation notes](#implementation-notes-milestones-12) for where the code
-differs from this draft.
+Status: **milestones 1–3 implemented** (2026-11-17). Milestone 3 was
+checked against real Cloudflare; see [the results](#milestone-3-against-real-cloudflare-2026-11-17).
+See [Implementation notes](#implementation-notes-milestones-13) for where the
+code differs from this draft.
 
 ## Summary
 
@@ -770,7 +771,7 @@ Also worth reading before writing the reconciler: Software Mansion's archived
 `membrane_rtc_engine` and `fishjam`. They're Elixir room engines with their
 own SFU, and their room, peer and track bookkeeping is a useful reference.
 
-## Implementation notes (milestones 1–2)
+## Implementation notes (milestones 1–3)
 
 Where the code differs from the draft above, and why:
 
@@ -805,6 +806,99 @@ Where the code differs from the draft above, and why:
   packet loss; after a leave Cloudflare closed the pull and reused the mid
   for the next one.
 
+Milestone 3 (workers):
+
+- **Inlets are processes**, one per (worker, live input), under the room's
+  media supervisor next to the outlets. An inlet owns its egress adapter's
+  socket and forwards frames to the worker by registered name, so a
+  restarted worker picks up the same streams: egress adapters are *not*
+  recreated when a worker crashes (the draft said they would be).
+- **The room server restarts crashed workers**, not a supervisor's restart
+  strategy. Workers are temporary children of the room's workers
+  supervisor; the room server monitors them, and a crash becomes a
+  `{:worker, id}` failure with the same backoff as pulls (0.5 s, 1 s, ...,
+  given up after five). A worker that ran 30 s before crashing starts its
+  backoff afresh. `{:worker_down, id, reason}` goes to the room's
+  subscribers.
+- **Per-room supervisor** (`Octoroom.Room.Supervisor`, `rest_for_one`): the
+  room server, then a media supervisor (inlets and outlets), then a workers
+  supervisor. Cloudflare calls still run under the global
+  `Octoroom.TaskSupervisor`. The room server is a `significant` child, so
+  when it stops the room shuts down; the server traps exits so its
+  `terminate/2` closes every adapter the room still holds.
+- **Reconciler:** `Reconciler.diff_workers/2` is a second pure diff next to
+  `diff/2`. It produces `stop_inlet`, `stop_outlet`, `stop_worker`,
+  `start_worker`/`restart_worker`/`update_worker`, `start_outlet` and
+  `start_inlet`, in that order. Worker specs are reconciled first on every
+  reconcile, so `room.workers` (the specs) is current when
+  `subscriptions/2` runs. Joining now reconciles too, so a participant's
+  workers start before its mic is live.
+- **Adapters are created in one batched call per reconcile**, after the
+  owning outlet or inlet has registered its id (Cloudflare may dial before
+  the HTTP response returns). An outlet that sends its first frame before
+  its adapter's response arrives is marked live when the response does.
+  An adapter whose owner stopped in the meantime is closed at once.
+- **Outlets drop audio that comes due before Cloudflare dials in**, rather
+  than holding it, as a live stream would. The clock stops when the queue
+  runs dry and restarts on the next `play`; a lag over 100 ms restarts it
+  rather than sending a burst. `Octoroom.Outlet.stats/2` reports queued
+  ms, frames sent and dropped, and underruns.
+- **Ingest track names** at Cloudflare are `"out-" <> base64url(name)`;
+  each ingest adapter gets its own Cloudflare session.
+- **Worker events** (`emit`) go to `Octoroom.subscribe/1` subscribers as
+  `{:worker_event, id, event}`, not to browsers over the channel yet.
+  `Octoroom.Worker.send/3` reaches a worker's `handle_info/2` from outside,
+  for example to flush from a LiveView.
+- **`tracks` payloads** carry `worker_id` (nil for mics), and
+  `participant_id` is nil for worker outputs.
+- **Without `public_ws_url`** workers still run, but no adapters are
+  created and the room logs an error once.
+- **Cloudflare dials the endpoint while creating an adapter** (observed
+  2026-11-17). If it can't connect, `POST /adapters/websocket/new` answers
+  503 with `internal_error` / "Backend error" for each track, even for the
+  spike's exact request. So an unreachable `public_ws_url` looks like a
+  Cloudflare outage: the room retries with backoff and gives up after five
+  tries, and the worker runs with its inputs waiting and no output status.
+  This is why the owning outlet or inlet must be registered before the
+  request goes out.
+
+### Milestone 3 against real Cloudflare (2026-11-17)
+
+`examples/call` on a Mac, reached through a `cloudflared` quick tunnel, with
+the built-in browser joining with the test tone. One run:
+
+| Check | Result |
+| --- | --- |
+| Echo goes live, only its owner hears it | Yes: pulled into the owner's session once its first frame was sent. |
+| Echo delay | 2.45–2.58 s, from beep onsets on the mic against the echo (2 s + ~500 ms). Muting left exactly two echo beeps in flight. |
+| Flush | No echo for 2.8 s after flushing, as expected when the 2 s held is dropped. |
+| Pacing | Metronome: 1,499 frames in 30.0 s, then 10,314 frames over ~3.4 min with the queue flat at 80 ms. Underruns: 27 in the first 20 s, then one more every couple of minutes. |
+| Recorder | Valid 16 kHz mono WAV, 220.5 s; kept writing through every other change. |
+| Worker crash | Killed the echo worker: restarted after the 0.5 s backoff, same mids in the browser, 0 renegotiations, output stayed live (underruns +5 during the gap). |
+| Cleanup | Open adapter WebSockets through the tunnel: 4 → 2 after Echo off → 0 after leaving, and still 0 after 20 s. Cloudflare dialed each adapter once and never redialed. |
+
+Findings:
+
+- **Egress delivers ~0.56% more audio than real time.** The recorder wrote
+  60.41 s of audio in 60.08 s of wall time; the page's audio clock matched
+  its wall clock, and the conversion is exact. A worker that plays its input
+  back (the echo) therefore builds latency: its outlet queue grew 320 →
+  500 ms in 30 s, about 20 s per hour. Outlets need a cap for pass-through
+  workers (drop the oldest queued audio past a bound), or such workers
+  should drop input to match real time. Not fixed yet; worth confirming on
+  a second network and browser first.
+- **Startup underruns** come from the metronome making exactly 100 ms
+  every 100 ms with no lead, so its queue touches empty while timers
+  settle. A producer that wants no gaps should keep a little audio ahead.
+- **Cloudflare dials the adapter endpoint while creating it.** If the
+  dial fails, creation fails: 503 `internal_error` when the host is
+  unreachable, 503 `websocket_handshake_failed` when it answers without
+  upgrading. `Octoroom.Plug` now logs every request it refuses, since these
+  otherwise leave no trace on the server.
+- `cloudflared` quick tunnels apply `~/.cloudflared/config.yml`'s ingress
+  rules when that file exists, which can answer every request with 404;
+  `--config /dev/null` avoids it (see the demo's README).
+
 ## Milestones
 
 1. **Port the primitives.** Cloudflare client behind a behaviour with a fake,
@@ -813,7 +907,34 @@ Where the code differs from the draft above, and why:
    subscriptions only), channel, JS client. Two browsers hear each other,
    and leave/rejoin works. No workers.
 3. **Workers.** Outlets with pacing and flush, inlets, worker supervision, the
-   `DelayEcho` example, pending→live handling for worker outputs.
+   `DelayEcho` example, pending→live handling for worker outputs. Start with
+   an output-only metronome worker (a beep a second) to check pacing before
+   inlets exist. The demo is a "mic check" room in `examples/call`, with no AI:
+   - **Private echo.** Each participant gets their own `DelayEcho` worker,
+     whose output is in only that participant's `subscriptions/2`: you hear
+     yourself 2 s late and nobody else does. This exercises per-participant
+     workers started and stopped by `workers/1`, routing a worker output to
+     one listener, and pending→live (the echo is audible only once frames
+     flow).
+   - **Echo on/off and Flush buttons** in the LiveView. The toggle is an
+     `update_meta` that drops the worker from `workers/1`, so its adapters
+     close. Flush cuts the queued 2 s off at once: the action AI workers need
+     for barge-in.
+   - **A shared recorder** that hears every mic, writes one WAV per input,
+     and `emit`s seconds recorded per participant for the LiveView to show.
+     It checks inputs labelled by participant, an input added on join
+     without restarting the worker (the WAVs continue without a gap), and
+     `emit` reaching the LiveView.
+
+   Done when, against real Cloudflare:
+   - the echo's delay measures ~2 s plus the adapter round trip (~500 ms,
+     the spike's echo through two adapters), checked with a clap;
+   - after 5 minutes the outlet queue length is flat and each WAV's length
+     matches wall-clock time (no drift);
+   - killing a worker process gets it restarted, while its output track
+     stays live: listeners hear a gap, and browsers don't renegotiate;
+   - after the toggle or a leave, Cloudflare shows the worker's adapters
+     closed, so nothing keeps running or billing.
 4. **Robustness.** Store, janitor, retries, resume tokens and recovery
    (restart the node mid-call: people keep talking, workers come back),
    telemetry, a LiveView demo app with Presence and captions from `emit`.

@@ -67,4 +67,65 @@ defmodule Octoroom.ReconcilerTest do
 
     assert Reconciler.diff(desired, actual) == []
   end
+
+  describe "diff_workers/2" do
+    defp w(id, opts \\ []), do: Octoroom.Room.worker(id, Keyword.get(opts, :module, M), opts)
+
+    test "starts workers and outlets, and inlets only for live inputs" do
+      specs = [w("echo", inputs: ["a/mic", "b/mic"], outputs: ["a/echo"])]
+      actual = %{tracks: %{"a/mic" => :live, "b/mic" => :pending}}
+
+      assert Reconciler.diff_workers(specs, actual) == [
+               {:start_worker, hd(specs)},
+               {:start_outlet, "a/echo", "echo"},
+               {:start_inlet, {"echo", "a/mic"}}
+             ]
+    end
+
+    test "tears down before building up, and leaves settled workers alone" do
+      keep = w("keep", inputs: ["a/mic"], outputs: ["keep"])
+      new = w("new", outputs: ["new"])
+
+      actual = %{
+        workers: %{"keep" => keep, "gone" => w("gone", outputs: ["gone"])},
+        outlets: %{"keep" => "keep", "gone" => "gone"},
+        inlets: [{"keep", "a/mic"}, {"gone", "a/mic"}, {"keep", "x/mic"}],
+        tracks: %{"a/mic" => :live, "keep" => :live, "gone" => :live}
+      }
+
+      assert Reconciler.diff_workers([keep, new], actual) == [
+               {:stop_inlet, {"gone", "a/mic"}},
+               {:stop_inlet, {"keep", "x/mic"}},
+               {:stop_outlet, "gone"},
+               {:stop_worker, "gone"},
+               {:start_worker, new},
+               {:start_outlet, "new", "new"}
+             ]
+    end
+
+    test "a changed module or args restarts; changed inputs or outputs update in place" do
+      old = w("a", inputs: ["a/mic"], args: %{n: 1})
+      actual = %{workers: %{"a" => old}, inlets: [{"a", "a/mic"}], tracks: %{"a/mic" => :live}}
+
+      restarted = %{old | args: %{n: 2}}
+      assert Reconciler.diff_workers([restarted], actual) == [{:restart_worker, restarted}]
+
+      moved = %{old | module: N}
+      assert Reconciler.diff_workers([moved], actual) == [{:restart_worker, moved}]
+
+      more = w("a", inputs: ["a/mic", "b/mic"], args: %{n: 1})
+      actual = put_in(actual.tracks["b/mic"], :live)
+
+      assert Reconciler.diff_workers([more], actual) == [
+               {:update_worker, more},
+               {:start_inlet, {"a", "b/mic"}}
+             ]
+    end
+
+    test "the first worker to name an output has it" do
+      a = w("a", outputs: ["shared"])
+      b = w("b", outputs: ["shared"])
+      assert {:start_outlet, "shared", "a"} in Reconciler.diff_workers([a, b], %{})
+    end
+  end
 end

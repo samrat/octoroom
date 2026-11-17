@@ -7,6 +7,14 @@ defmodule Octoroom.Test.FakeCloudflare do
   # stands in for the first packet arriving. Every call is reported to the
   # test process as `{:cloudflare, call, args}`.
   #
+  # WebSocket adapters: creating one makes the fake "dial" its endpoint, the
+  # way Cloudflare would: a process looks up the adapter id's owner and sends
+  # it `{:octoroom_adapter_socket, role, self()}`, as `Octoroom.Adapter.Socket`
+  # does. An ingest adapter's first frame makes its track live; each frame
+  # is reported to the test as `{:ingest, cf_track_name, frame}` and passed
+  # on to egress adapters of that track. `egress/4` streams a frame to every
+  # egress adapter of a track, as if its publisher had sent it.
+  #
   # Use `config(test_pid)` as a room server's `:cloudflare` option.
 
   @behaviour Octoroom.Cloudflare
@@ -16,7 +24,7 @@ defmodule Octoroom.Test.FakeCloudflare do
   def start_link(test),
     do:
       Agent.start_link(fn ->
-        %{test: test, sessions: %{}, live: MapSet.new(), n: 0, fail: %{}}
+        %{test: test, sessions: %{}, live: MapSet.new(), n: 0, fail: %{}, adapters: %{}}
       end)
 
   def config(fake), do: %{client: __MODULE__, fake: fake}
@@ -28,6 +36,19 @@ defmodule Octoroom.Test.FakeCloudflare do
   def fail_next(fake, call, reason), do: Agent.update(fake, &put_in(&1.fail[call], reason))
 
   def tracks(fake, session), do: Agent.get(fake, & &1.sessions[session].tracks)
+
+  @doc "Open adapters: adapter id => `%{role, session_id, track_name}`."
+  def adapters(fake),
+    do: Agent.get(fake, &Map.new(&1.adapters, fn {id, a} -> {id, Map.delete(a, :pid)} end))
+
+  @doc "Sends `frame` to every egress adapter of `{session, track}`."
+  def egress(fake, session, track, frame) do
+    for {_, %{role: :egress, session_id: ^session, track_name: ^track, pid: pid}} <-
+          Agent.get(fake, & &1.adapters),
+        do: send(pid, {:frame, frame})
+
+    :ok
+  end
 
   @impl true
   def new_session(%{fake: fake}) do
@@ -90,10 +111,91 @@ defmodule Octoroom.Test.FakeCloudflare do
   end
 
   @impl true
-  def new_adapters(%{fake: fake}, tracks), do: op(fake, :new_adapters, [tracks], &{{:ok, []}, &1})
+  def new_adapters(%{fake: fake}, tracks) do
+    result =
+      op(fake, :new_adapters, [tracks], fn s ->
+        Enum.map_reduce(tracks, s, fn t, s ->
+          {id, s} = next(s, "adapter")
+
+          {adapter, s} =
+            case t.location do
+              "local" ->
+                {session, s} = next(s, "adapter-session")
+                s = put_in(s.sessions[session], %{tracks: %{}, mid: 0})
+                {%{role: :ingest, session_id: session, track_name: t.trackName}, s}
+
+              "remote" ->
+                {%{role: :egress, session_id: t.sessionId, track_name: t.trackName}, s}
+            end
+
+          adapter = Map.put(adapter, :endpoint, t.endpoint)
+          {{id, adapter}, put_in(s.adapters[id], adapter)}
+        end)
+        |> then(fn {created, s} -> {{:ok, created}, s} end)
+      end)
+
+    case result do
+      {:ok, created} ->
+        for {id, adapter} <- created do
+          pid = spawn(fn -> dial(fake, adapter) end)
+
+          Agent.update(fake, fn s ->
+            if s.adapters[id], do: put_in(s.adapters[id][:pid], pid), else: s
+          end)
+        end
+
+        {:ok, for({id, a} <- created, do: %{adapter_id: id, session_id: a.session_id})}
+
+      error ->
+        error
+    end
+  end
 
   @impl true
-  def close_adapters(%{fake: fake}, ids), do: op(fake, :close_adapters, [ids], &{:ok, &1})
+  def close_adapters(%{fake: fake}, ids) do
+    op(fake, :close_adapters, [ids], fn s ->
+      for id <- ids, pid = get_in(s.adapters, [id, :pid]), do: Process.exit(pid, :kill)
+      {:ok, %{s | adapters: Map.drop(s.adapters, ids)}}
+    end)
+  end
+
+  # Plays Cloudflare's end of one adapter's WebSocket.
+  defp dial(fake, %{role: role, endpoint: endpoint} = adapter) do
+    ws_id = endpoint |> String.split("/") |> List.last()
+
+    case Octoroom.Adapter.lookup(role, ws_id) do
+      nil ->
+        :ok
+
+      owner ->
+        ref = Process.monitor(owner)
+        send(owner, {:octoroom_adapter_socket, role, self()})
+        socket_loop(fake, adapter, owner, ref)
+    end
+  end
+
+  defp socket_loop(fake, adapter, owner, ref) do
+    receive do
+      # Ingest: a frame from the outlet.
+      {:octoroom_pcm, frame} ->
+        key = {adapter.session_id, adapter.track_name}
+
+        test =
+          Agent.get_and_update(fake, fn s -> {s.test, %{s | live: MapSet.put(s.live, key)}} end)
+
+        send(test, {:ingest, adapter.track_name, frame})
+        egress(fake, adapter.session_id, adapter.track_name, frame)
+        socket_loop(fake, adapter, owner, ref)
+
+      # Egress: a frame from the track's publisher.
+      {:frame, frame} ->
+        send(owner, {:octoroom_pcm, self(), frame})
+        socket_loop(fake, adapter, owner, ref)
+
+      {:DOWN, ^ref, :process, _, _} ->
+        :ok
+    end
+  end
 
   @impl true
   def session_state(%{fake: fake}, session),
