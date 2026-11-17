@@ -8,7 +8,8 @@ defmodule Octoroom.MixProject do
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
 
@@ -22,6 +23,11 @@ defmodule Octoroom.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
+  # The browser client's tests run on Node's own test runner: no npm.
+  defp aliases do
+    ["test.js": ["cmd node --test test/js/*.test.mjs"]]
+  end
+
   defp deps do
     [
       {:req, "~> 0.5"},
@@ -31,7 +37,8 @@ defmodule Octoroom.MixProject do
       # Only its Opus NIFs (Membrane.Opus.{Encoder,Decoder}.Native), which
       # ship with a precompiled libopus.
       {:membrane_opus_plugin, "~> 0.20"},
-      {:phoenix, "~> 1.7", optional: true}
+      {:phoenix, "~> 1.7", optional: true},
+      {:stream_data, "~> 1.1", only: :test}
     ]
   end
 end
