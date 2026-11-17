@@ -19,6 +19,9 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     Server → client: `renegotiate`, `close`, `push`, `tracks`, `gain`,
     `room_event`, `resume_token`, `republish`.
 
+    A known event whose body has the wrong shape is refused with
+    `{reason: "bad_payload"}`, an unknown event with `unknown_event`.
+
     ## Resuming
 
     The join reply carries a `resume_token`, refreshed with a
@@ -63,6 +66,7 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     @salt "octoroom resume"
+    @events ~w(publish publish_tracks push_offer unpublish mute connected answer close_offer)
 
     @doc false
     def __join__(module, topic, params, socket) do
@@ -115,23 +119,41 @@ if Code.ensure_loaded?(Phoenix.Channel) do
 
     defp verify(_socket, _token, _room_id), do: :error
 
+    # The channel is where untrusted payloads come in, so each event's body
+    # is checked against the protocol's shapes here: a known event with a
+    # bad body gets `bad_payload`. The room server checks again, for
+    # callers that don't come through a channel.
     @doc false
-    def __handle_in__("publish", %{"sdp" => sdp, "mids" => mids}, socket) do
-      %{server: server, participant_id: id} = socket.assigns.octoroom
-      Server.publish(server, id, sdp, mids, socket_ref(socket))
-      {:noreply, socket}
+    def __handle_in__("publish", %{"sdp" => sdp, "mids" => mids}, socket)
+        when is_binary(sdp) and is_map(mids) do
+      if mids?(mids) do
+        %{server: server, participant_id: id} = socket.assigns.octoroom
+        Server.publish(server, id, sdp, mids, socket_ref(socket))
+        {:noreply, socket}
+      else
+        bad_payload(socket)
+      end
     end
 
     def __handle_in__("publish_tracks", %{"sources" => sources}, socket) when is_list(sources) do
-      %{server: server, participant_id: id} = socket.assigns.octoroom
-      Server.publish_tracks(server, id, sources, socket_ref(socket))
-      {:noreply, socket}
+      if Enum.all?(sources, &is_binary/1) do
+        %{server: server, participant_id: id} = socket.assigns.octoroom
+        Server.publish_tracks(server, id, sources, socket_ref(socket))
+        {:noreply, socket}
+      else
+        bad_payload(socket)
+      end
     end
 
-    def __handle_in__("push_offer", %{"sdp" => sdp, "op_id" => op_id, "mids" => mids}, socket) do
-      %{server: server, participant_id: id} = socket.assigns.octoroom
-      Server.push_offer(server, id, op_id, sdp, mids, socket_ref(socket))
-      {:noreply, socket}
+    def __handle_in__("push_offer", %{"sdp" => sdp, "op_id" => op_id, "mids" => mids}, socket)
+        when is_binary(sdp) and is_binary(op_id) and is_map(mids) do
+      if mids?(mids) do
+        %{server: server, participant_id: id} = socket.assigns.octoroom
+        Server.push_offer(server, id, op_id, sdp, mids, socket_ref(socket))
+        {:noreply, socket}
+      else
+        bad_payload(socket)
+      end
     end
 
     def __handle_in__("unpublish", %{"source" => source}, socket) when is_binary(source) do
@@ -153,20 +175,30 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       {:reply, :ok, socket}
     end
 
-    def __handle_in__("answer", %{"sdp" => sdp, "op_id" => op_id}, socket) do
+    def __handle_in__("answer", %{"sdp" => sdp, "op_id" => op_id}, socket)
+        when is_binary(sdp) and is_binary(op_id) do
       %{server: server, participant_id: id} = socket.assigns.octoroom
       Server.answer(server, id, op_id, sdp, socket_ref(socket))
       {:noreply, socket}
     end
 
-    def __handle_in__("close_offer", %{"sdp" => sdp, "op_id" => op_id}, socket) do
+    def __handle_in__("close_offer", %{"sdp" => sdp, "op_id" => op_id}, socket)
+        when is_binary(sdp) and is_binary(op_id) do
       %{server: server, participant_id: id} = socket.assigns.octoroom
       Server.close_offer(server, id, op_id, sdp, socket_ref(socket))
       {:noreply, socket}
     end
 
+    def __handle_in__(event, _payload, socket) when event in @events, do: bad_payload(socket)
+
     def __handle_in__(_event, _payload, socket),
       do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+    # Source => mid, both strings.
+    defp mids?(mids),
+      do: Enum.all?(mids, fn {source, mid} -> is_binary(source) and is_binary(mid) end)
+
+    defp bad_payload(socket), do: {:reply, {:error, %{reason: "bad_payload"}}, socket}
 
     @doc false
     def __handle_info__({:octoroom_signal, :reply, ref, result}, socket) do

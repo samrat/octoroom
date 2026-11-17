@@ -140,9 +140,7 @@ defmodule Octoroom.Room.Server do
   def init(opts) do
     room_id = Keyword.fetch!(opts, :room_id)
     module = Keyword.fetch!(opts, :module)
-    run = Keyword.fetch!(opts, :run)
     store = Keyword.get_lazy(opts, :store, &Store.config/0)
-    cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
     # So `terminate/2` runs when the room shuts down.
     Process.flag(:trap_exit, true)
 
@@ -150,16 +148,31 @@ defmodule Octoroom.Room.Server do
     # crash, a restart, a deploy): this run recovers the room.
     previous = Store.get(store, :rooms, room_id)
 
-    assigns =
-      case previous do
-        %{assigns: assigns} ->
-          assigns
+    case mount(%{id: room_id, module: module}, previous) do
+      {:ok, assigns} -> init_state(opts, store, previous, assigns)
+      # Fails the join that started the room, with a reason that says why.
+      {:error, reason} -> {:stop, {:mount_failed, reason}}
+    end
+  end
 
-        nil ->
-          {:ok, assigns} = module.mount(room_id)
-          assigns
-      end
+  defp mount(_room, %{assigns: assigns}), do: {:ok, assigns}
 
+  defp mount(room, nil) do
+    case call_room(fn -> room.module.mount(room.id) end, &match?({:ok, %{}}, &1), "{:ok, map}") do
+      {:ok, {:ok, assigns}} ->
+        {:ok, assigns}
+
+      {:error, {reason, _} = error} ->
+        policy_failed(room, :mount, error)
+        {:error, reason}
+    end
+  end
+
+  defp init_state(opts, store, previous, assigns) do
+    room_id = Keyword.fetch!(opts, :room_id)
+    module = Keyword.fetch!(opts, :module)
+    run = Keyword.fetch!(opts, :run)
+    cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
     now = Store.now()
     Store.put(store, :rooms, room_id, %{run: run, assigns: assigns, updated_at: now})
     grace_ms = Keyword.get(opts, :grace_ms, @grace_ms)
@@ -203,6 +216,10 @@ defmodule Octoroom.Room.Server do
        inlets: %{},
        order: [],
        failures: %{},
+       # Policy callbacks failing as of the last reconcile: `:workers` or
+       # `{:subscriptions, participant_id}` => reason. Each is reported when
+       # it starts failing or fails differently, not on every pass.
+       policy_errors: %{},
        retry: nil
      }}
   end
@@ -264,11 +281,18 @@ defmodule Octoroom.Room.Server do
         {:reply, {:error, :no_participant}, state}
 
       p ->
-        p = %{p | meta: fun.(p.meta)}
-        state = put_in(state.participants[id], p)
-        event(state, {:updated, public(p)})
-        signal(p, :resume, resume_data(p))
-        {:reply, :ok, reconcile(state)}
+        case call_room(fn -> fun.(p.meta) end, &is_map/1, "a map") do
+          {:ok, meta} ->
+            p = %{p | meta: meta}
+            state = put_in(state.participants[id], p)
+            event(state, {:updated, public(p)})
+            signal(p, :resume, resume_data(p))
+            {:reply, :ok, reconcile(state)}
+
+          {:error, {reason, _} = error} ->
+            policy_failed(state, {:update_meta, id}, error)
+            {:reply, {:error, reason}, state}
+        end
     end
   end
 
@@ -324,8 +348,52 @@ defmodule Octoroom.Room.Server do
     {:reply, snapshot, state}
   end
 
+  # Requests carry what a browser sent. The channel checks their shape, but
+  # the server is called without it too (`Room.join/4` is public), and a
+  # payload that raises here would take the whole room down. Values of the
+  # right shape that are still wrong (an unknown source, a stale op id) are
+  # refused further in.
   @impl true
-  def handle_cast({:publish, id, sdp, mids, tag}, state) do
+  def handle_cast(request, state) do
+    if well_formed?(request) do
+      cast(request, state)
+    else
+      with %{} = p <- state.participants[elem(request, 1)],
+           do: reply(p, request_tag(request), {:error, :bad_payload})
+
+      {:noreply, state}
+    end
+  end
+
+  defp well_formed?({:publish, _, sdp, mids, _}), do: is_binary(sdp) and mids?(mids)
+
+  defp well_formed?({:publish_tracks, _, sources, _}),
+    do: is_list(sources) and Enum.all?(sources, &source?/1)
+
+  defp well_formed?({:push_offer, _, op_id, sdp, mids, _}),
+    do: is_binary(op_id) and is_binary(sdp) and mids?(mids)
+
+  defp well_formed?({:unpublish, _, source, _}), do: source?(source)
+  defp well_formed?({:mute, _, source, muted}), do: source?(source) and is_boolean(muted)
+
+  defp well_formed?({kind, _, op_id, sdp, _}) when kind in [:answer, :close_offer],
+    do: is_binary(op_id) and is_binary(sdp)
+
+  defp well_formed?(_request), do: true
+
+  # Source names are strings from a browser; atoms are accepted from Elixir
+  # callers, as `to_string/1` below turns them into the same names.
+  defp source?(source), do: is_binary(source) or is_atom(source)
+
+  defp mids?(mids),
+    do:
+      is_map(mids) and Enum.all?(mids, fn {source, mid} -> source?(source) and is_binary(mid) end)
+
+  # `mute` has no reply.
+  defp request_tag({:mute, _, _, _}), do: nil
+  defp request_tag(request), do: elem(request, tuple_size(request) - 1)
+
+  defp cast({:publish, id, sdp, mids, tag}, state) do
     with_participant(state, id, fn
       %{media: :none} = p ->
         mids = Map.new(mids, fn {source, mid} -> {to_string(source), mid} end)
@@ -357,7 +425,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:publish_tracks, id, sources, tag}, state) do
+  defp cast({:publish_tracks, id, sources, tag}, state) do
     with_participant(state, id, fn p ->
       sources = Enum.map(sources, &to_string/1)
 
@@ -389,7 +457,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:push_offer, id, op_id, sdp, mids, tag}, state) do
+  defp cast({:push_offer, id, op_id, sdp, mids, tag}, state) do
     with_op(state, id, op_id, :awaiting_push_offer, tag, fn p, op ->
       cancel(op.timer)
       mids = Map.new(mids, fn {source, mid} -> {to_string(source), mid} end)
@@ -411,7 +479,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:unpublish, id, source, tag}, state) do
+  defp cast({:unpublish, id, source, tag}, state) do
     with_participant(state, id, fn p ->
       source = to_string(source)
 
@@ -435,7 +503,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:mute, id, source, muted}, state) do
+  defp cast({:mute, id, source, muted}, state) do
     with_participant(state, id, fn p ->
       source = to_string(source)
 
@@ -452,7 +520,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:connected, id}, state) do
+  defp cast({:connected, id}, state) do
     with_participant(state, id, fn p ->
       pending = for {source, %{status: :pending}} <- p.tracks, do: source
 
@@ -472,7 +540,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:answer, id, op_id, sdp, tag}, state) do
+  defp cast({:answer, id, op_id, sdp, tag}, state) do
     with_op(state, id, op_id, :awaiting_answer, tag, fn p, op ->
       cancel(op.timer)
       cf = state.cloudflare
@@ -485,7 +553,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:close_offer, id, op_id, sdp, tag}, state) do
+  defp cast({:close_offer, id, op_id, sdp, tag}, state) do
     with_op(state, id, op_id, :awaiting_offer, tag, fn p, op ->
       cancel(op.timer)
       cf = state.cloudflare
@@ -499,7 +567,7 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  def handle_cast({:leave, id}, state), do: remove(state, id, :left)
+  defp cast({:leave, id}, state), do: remove(state, id, :left)
 
   @impl true
   def handle_info({:result, id, kind, result}, state) do
@@ -850,16 +918,37 @@ defmodule Octoroom.Room.Server do
 
   ## Reconcile
 
+  # A policy callback that fails keeps its last good answer: the room keeps
+  # its workers, or a listener its subscriptions (other listeners still
+  # reconcile). Tracks that leave the directory still close.
   defp reconcile(state) do
-    specs = state.module.workers(room(state))
-    state = reconcile_workers(%{state | worker_specs: Enum.uniq_by(specs, & &1.id)})
     room = room(state)
 
-    desired =
-      for %{media: :live} = p <- participants(state), into: %{} do
-        wanted = state.module.subscriptions(public(p), room)
-        {p.id, wanted ++ held_ghosts(state, p, wanted)}
+    {specs, errors} =
+      case call_room(fn -> state.module.workers(room) end, &worker_specs?/1, "worker specs") do
+        {:ok, specs} -> {Enum.uniq_by(specs, & &1.id), %{}}
+        {:error, error} -> {state.worker_specs, %{workers: error}}
       end
+
+    state = reconcile_workers(%{state | worker_specs: specs})
+    room = room(state)
+
+    {desired, errors} =
+      for %{media: :live} = p <- participants(state), reduce: {%{}, errors} do
+        {desired, errors} ->
+          listener = public(p)
+          subscriptions = fn -> state.module.subscriptions(listener, room) end
+
+          case call_room(subscriptions, &subscriptions?/1, "tracks or track names") do
+            {:ok, wanted} ->
+              {Map.put(desired, p.id, wanted ++ held_ghosts(state, p, wanted)), errors}
+
+            {:error, error} ->
+              {Map.put(desired, p.id, holding(p)), Map.put(errors, {:subscriptions, p.id}, error)}
+          end
+      end
+
+    state = report_policy_errors(state, errors)
 
     actual = %{
       subscriptions: Map.new(state.participants, fn {id, p} -> {id, p.subs} end),
@@ -1076,6 +1165,91 @@ defmodule Octoroom.Room.Server do
   end
 
   defp schedule_retry(state), do: state
+
+  ## The room module's callbacks
+
+  # Calls into the room module (or the function given to `update_meta/3`).
+  # A raise, throw or exit, or a result that isn't `expected`, is a bug in
+  # the app, and acting on it or crashing the room would be worse than
+  # keeping the last good answer: a room that crashed would recover into the
+  # same failure. Returns `{:ok, result}` or `{:error, {reason, formatted}}`,
+  # where `reason` is the exception, `{:throw, value}`, `{:exit, reason}` or
+  # `{:bad_return, value}`, and `formatted` is for the log.
+  defp call_room(fun, valid?, expected) do
+    result = fun.()
+
+    if valid?.(result),
+      do: {:ok, result},
+      else: {:error, {{:bad_return, result}, "returned #{inspect(result)}, expected #{expected}"}}
+  catch
+    kind, reason ->
+      formatted = Exception.format(kind, reason, __STACKTRACE__)
+
+      case kind do
+        :error -> {:error, {Exception.normalize(:error, reason, __STACKTRACE__), formatted}}
+        kind -> {:error, {{kind, reason}, formatted}}
+      end
+  end
+
+  defp worker_specs?(specs), do: is_list(specs) and Enum.all?(specs, &worker_spec?/1)
+
+  defp worker_spec?(%{id: id, module: module, inputs: inputs, outputs: outputs, args: _})
+       when is_binary(id) and is_atom(module) and is_list(inputs) and is_list(outputs),
+       do: Enum.all?(inputs ++ outputs, &is_binary/1)
+
+  defp worker_spec?(_spec), do: false
+
+  defp subscriptions?(wanted) do
+    is_list(wanted) and
+      Enum.all?(wanted, fn
+        %Track{name: name, gain: gain} -> is_binary(name) and is_number(gain)
+        name -> is_binary(name)
+      end)
+  end
+
+  # What `p` holds now, at the gains it has, so the diff leaves it alone.
+  defp holding(p), do: for({name, sub} <- p.subs, do: %{Track.new(name) | gain: sub.gain})
+
+  # Reconcile runs on every room change, so a failing callback is reported
+  # when it starts failing or fails differently, not on every pass.
+  defp report_policy_errors(state, errors) do
+    for {what, {reason, _} = error} <- errors,
+        state.policy_errors[what] != reason,
+        do: policy_failed(state, what, error)
+
+    %{state | policy_errors: Map.new(errors, fn {what, {reason, _}} -> {what, reason} end)}
+  end
+
+  defp policy_failed(state, what, {reason, formatted}) do
+    module = inspect(state.module)
+
+    {callback, participant_id, message} =
+      case what do
+        :mount ->
+          {:mount, nil, "#{module}.mount/1 failed, so the room didn't start"}
+
+        :workers ->
+          {:workers, nil, "#{module}.workers/1 failed, so the room keeps its workers as they are"}
+
+        {:subscriptions, id} ->
+          {:subscriptions, id,
+           "#{module}.subscriptions/2 failed for #{id}, so its subscriptions stay as they are"}
+
+        {:update_meta, id} ->
+          {:update_meta, id,
+           "the function given to update_meta/3 failed for #{id}, so its metadata is unchanged"}
+      end
+
+    Logger.error("Octoroom room #{state.id}: #{message}:\n" <> formatted)
+    Octoroom.broadcast(state.id, {:error, {:policy, callback}, reason})
+
+    :telemetry.execute([:octoroom, :policy, :error], %{}, %{
+      room_id: state.id,
+      callback: callback,
+      participant_id: participant_id,
+      reason: reason
+    })
+  end
 
   ## Workers
 

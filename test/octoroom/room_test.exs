@@ -25,6 +25,48 @@ defmodule Octoroom.RoomTest do
       do: for(p <- others(room, listener), do: mic(p) |> gain(0.5))
   end
 
+  defmodule Idle do
+    use Octoroom.Worker
+
+    @impl true
+    def init(test, _ctx) do
+      send(test, {:idle_started, self()})
+      {:ok, test}
+    end
+
+    @impl true
+    def handle_audio(_input, _pcm, test), do: {:ok, test}
+  end
+
+  # Policies that fail on demand: a listener's `policy` metadata, and the
+  # room's `workers` assign or id prefix.
+  defmodule PolicyRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def mount("raise-" <> _), do: raise("no assigns")
+    def mount("bad-" <> _), do: :ok
+    def mount(_room_id), do: {:ok, %{}}
+
+    @impl true
+    def workers(%{assigns: %{workers: :raise}}), do: raise("no workers today")
+    def workers(%{assigns: %{workers: :bad}}), do: [%{id: "idle"}]
+
+    def workers(%{assigns: %{test: test}}),
+      do: [worker("idle", Octoroom.RoomTest.Idle, args: test)]
+
+    def workers(_room), do: []
+
+    @impl true
+    def subscriptions(%{meta: %{policy: :raise}} = listener, _room), do: [listener.meta.lang]
+    def subscriptions(%{meta: %{policy: :throw}}, _room), do: throw(:nope)
+    def subscriptions(%{meta: %{policy: :bad}}, _room), do: :everyone
+    def subscriptions(listener, room), do: default_subscriptions(listener, room)
+  end
+
   setup do
     {:ok, fake} = FakeCloudflare.start_link(self())
     room_id = "room-#{System.unique_integer([:positive])}"
@@ -203,4 +245,180 @@ defmodule Octoroom.RoomTest do
     Process.sleep(20)
     assert Server.whereis(ctx.room_id) == nil
   end
+
+  describe "bad input" do
+    @describetag :capture_log
+
+    test "malformed client payloads are refused, and the room stays up", ctx do
+      alice = join(ctx, "alice")
+      ref = Process.monitor(alice.server)
+
+      Server.publish(alice.server, alice.id, "offer", "notamap", :p1)
+      Server.publish(alice.server, alice.id, "offer", %{"mic" => 0}, :p2)
+      Server.publish(alice.server, alice.id, nil, %{"mic" => "0"}, :p3)
+
+      for tag <- [:p1, :p2, :p3],
+          do:
+            assert_receive(
+              {:client, "alice", {:octoroom_signal, :reply, ^tag, {:error, :bad_payload}}}
+            )
+
+      # Nothing was started: a well-formed publish still works.
+      alice = publish(ctx, alice)
+
+      Server.publish_tracks(alice.server, alice.id, [%{}], :t1)
+      Server.publish_tracks(alice.server, alice.id, "camera", :t2)
+      Server.unpublish(alice.server, alice.id, %{}, :u)
+      Server.answer(alice.server, alice.id, "op", 42, :a)
+      Server.close_offer(alice.server, alice.id, %{}, "offer", :c)
+
+      for tag <- [:t1, :t2, :u, :a, :c],
+          do:
+            assert_receive(
+              {:client, "alice", {:octoroom_signal, :reply, ^tag, {:error, :bad_payload}}}
+            )
+
+      # `mute` has no reply; it's dropped.
+      Server.mute(alice.server, alice.id, %{}, true)
+
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+      assert [%{media: :live, mic: :live}] = Octoroom.Room.state(ctx.room_id).participants
+    end
+
+    test "a push offer with malformed mids is refused, and a good one still goes through", ctx do
+      alice = join(ctx, "alice") |> then(&publish(ctx, &1))
+      ref = Process.monitor(alice.server)
+      Server.publish_tracks(alice.server, alice.id, ["camera"], :cam)
+      assert_receive {:client, "alice", {:octoroom_signal, :push, %{op_id: op}}}
+
+      Server.push_offer(alice.server, alice.id, op, "camera offer", "notamap", :o1)
+      assert_receive {:client, "alice", {:octoroom_signal, :reply, :o1, {:error, :bad_payload}}}
+
+      Server.push_offer(alice.server, alice.id, op, "camera offer", %{"camera" => "1"}, :o2)
+      assert_receive {:client, "alice", {:octoroom_signal, :reply, :o2, {:ok, %{sdp: _}}}}
+      assert_receive {:client, "alice", {:octoroom_signal, :reply, :cam, {:ok, %{}}}}
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
+    test "subscriptions/2 failing for one listener keeps what it holds, and others reconcile",
+         ctx do
+      Octoroom.subscribe(ctx.room_id)
+      alice = join(ctx, "alice", PolicyRoom) |> then(&publish(ctx, &1))
+
+      bob =
+        join(ctx, "bob", PolicyRoom, %{name: "bob", policy: :raise}) |> then(&publish(ctx, &1))
+
+      ref = Process.monitor(bob.server)
+      bob_id = bob.id
+
+      assert_receive {:octoroom, _, {:error, {:policy, :subscriptions}, %KeyError{key: :lang}}}
+      assert [%{track: track}] = accept_pull(alice)
+      assert track == "#{bob_id}/mic"
+      refute_receive {:client, "bob", {:octoroom_signal, :renegotiate, _}}, 50
+
+      # Reported when it starts failing, not on every reconcile...
+      :ok = Octoroom.Room.refresh(ctx.room_id)
+      refute_receive {:octoroom, _, {:error, _, _}}, 50
+
+      # ...and again when it fails differently.
+      update_policy(ctx, bob, :bad)
+      assert_receive {:octoroom, _, {:error, {:policy, :subscriptions}, {:bad_return, :everyone}}}
+
+      # Fixed: bob hears alice.
+      update_policy(ctx, bob, nil)
+      accept_pull(bob)
+
+      # Broken while holding alice: bob keeps her, and doesn't pull carol.
+      update_policy(ctx, bob, :throw)
+      assert_receive {:octoroom, _, {:error, {:policy, :subscriptions}, {:throw, :nope}}}
+      carol = join(ctx, "carol", PolicyRoom) |> then(&publish(ctx, &1))
+      accept_pull(alice)
+      assert [_, _] = accept_pull(carol)
+
+      refute_receive {:client, "bob", {:octoroom_signal, :renegotiate, _}}, 50
+      refute_received {:client, "bob", {:octoroom_signal, :close, _}}
+
+      assert hears(ctx)["bob"] == ["#{alice.id}/mic"]
+
+      # A track that leaves the directory still closes.
+      Client.stop(alice)
+      accept_close(bob)
+      accept_close(carol)
+      assert hears(ctx)["bob"] == []
+
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
+    test "workers/1 failing keeps the running workers, and listeners still reconcile", ctx do
+      Octoroom.subscribe(ctx.room_id)
+      test = self()
+      room_id = ctx.room_id
+      handler = {__MODULE__, make_ref()}
+
+      :telemetry.attach(
+        handler,
+        [:octoroom, :policy, :error],
+        fn _, _, %{room_id: ^room_id} = meta, _ -> send(test, {:telemetry, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      alice = join(ctx, "alice", PolicyRoom) |> then(&publish(ctx, &1))
+      ref = Process.monitor(alice.server)
+      :ok = Octoroom.Room.assign(ctx.room_id, :test, self())
+      assert_receive {:idle_started, worker}
+
+      :ok = Octoroom.Room.assign(ctx.room_id, :workers, :raise)
+      error = %RuntimeError{message: "no workers today"}
+      assert_receive {:octoroom, _, {:error, {:policy, :workers}, ^error}}
+      assert_receive {:telemetry, %{callback: :workers, participant_id: nil, reason: ^error}}
+
+      bob = join(ctx, "bob", PolicyRoom) |> then(&publish(ctx, &1))
+      accept_pull(alice)
+      accept_pull(bob)
+
+      :ok = Octoroom.Room.assign(ctx.room_id, :workers, :bad)
+      assert_receive {:octoroom, _, {:error, {:policy, :workers}, {:bad_return, [%{id: "idle"}]}}}
+      assert [%{id: "idle", running: true}] = Octoroom.Room.state(ctx.room_id).workers
+      assert Process.alive?(worker)
+
+      # Fixed: the same worker runs on.
+      :ok = Octoroom.Room.assign(ctx.room_id, :workers, nil)
+      assert [%{id: "idle", running: true}] = Octoroom.Room.state(ctx.room_id).workers
+      refute_receive {:idle_started, _}, 50
+      assert Process.alive?(worker)
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
+    test "an update_meta/3 function that fails leaves the metadata alone", ctx do
+      Octoroom.subscribe(ctx.room_id)
+      alice = join(ctx, "alice", PolicyRoom)
+      ref = Process.monitor(alice.server)
+      update = &Octoroom.Room.update_meta(ctx.room_id, alice.id, &1)
+
+      assert {:error, %RuntimeError{message: "oops"}} = update.(fn _ -> raise "oops" end)
+      assert_receive {:octoroom, _, {:error, {:policy, :update_meta}, %RuntimeError{}}}
+      assert {:error, {:throw, :x}} = update.(fn _ -> throw(:x) end)
+      assert {:error, {:bad_return, :nope}} = update.(fn _ -> :nope end)
+      assert [%{meta: %{name: "alice"} = meta}] = Octoroom.Room.state(ctx.room_id).participants
+      refute Map.has_key?(meta, :x)
+
+      assert :ok = update.(&Map.put(&1, :x, 1))
+      assert [%{meta: %{x: 1}}] = Octoroom.Room.state(ctx.room_id).participants
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
+    test "a mount/1 that fails fails the join with a clear reason", ctx do
+      assert {:error, {:mount_failed, %RuntimeError{message: "no assigns"}}} =
+               Octoroom.Room.join(PolicyRoom, "raise-" <> ctx.room_id, %{}, ctx.opts)
+
+      assert {:error, {:mount_failed, {:bad_return, :ok}}} =
+               Octoroom.Room.join(PolicyRoom, "bad-" <> ctx.room_id, %{}, ctx.opts)
+    end
+  end
+
+  # The metadata changes either way; the policy fails in the reconcile after.
+  defp update_policy(ctx, client, policy),
+    do: :ok = Octoroom.Room.update_meta(ctx.room_id, client.id, &Map.put(&1, :policy, policy))
 end

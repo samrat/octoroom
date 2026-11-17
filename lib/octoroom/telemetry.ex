@@ -36,6 +36,13 @@ defmodule Octoroom.Telemetry do
     * `[:octoroom, :failure]`: something will be retried with backoff, or,
       with `given_up: true`, won't be. Measurements `count`; metadata `id`
       (participant id, `:worker` or `:media`), `name`, `reason`, `given_up`.
+    * `[:octoroom, :policy, :error]`: a room module callback raised,
+      threw, exited or returned the wrong shape, and the room kept its last
+      good answer (see `Octoroom.Room`). Emitted when a failure starts or
+      changes, not on every reconcile. Metadata `callback` (`:mount`,
+      `:workers`, `:subscriptions` or `:update_meta`), `participant_id`
+      (the listener, or the participant being updated; nil otherwise),
+      `reason`.
     * `[:octoroom, :janitor, :sweep]`: measurements `deleted_rooms`.
   """
 
@@ -54,6 +61,7 @@ defmodule Octoroom.Telemetry do
       [:octoroom, :worker, :start],
       [:octoroom, :worker, :exit],
       [:octoroom, :failure],
+      [:octoroom, :policy, :error],
       [:octoroom, :janitor, :sweep]
     ]
   end
