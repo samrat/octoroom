@@ -4,12 +4,20 @@ import Config
 # Realtime SFU app. A `.env` file next to mix.exs is read too.
 env_file = Path.expand("../.env", __DIR__)
 
+# KEY=value, KEY="value" or KEY='value', as a shell reads them.
+unquote_value = fn value ->
+  case Regex.run(~r/^(["'])(.*)\1$/, value) do
+    [_, _quote, inner] -> inner
+    nil -> value
+  end
+end
+
 file_env =
   if File.exists?(env_file) do
     for line <- File.read!(env_file) |> String.split("\n"),
         [key, value] <- [String.split(String.trim(line), "=", parts: 2)],
         into: %{},
-        do: {key, String.trim(value, "\"")}
+        do: {key, unquote_value.(String.trim(value))}
   else
     %{}
   end
@@ -24,6 +32,18 @@ config :octoroom,
 
 # SONIOX_API_KEY: for live captions (optional).
 config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
+
+# SONIOX_API_KEY, GOOGLE_API_KEY and INWORLD_API_KEY: for the voice
+# assistant (optional; all three). Its STT, LLM and TTS read them from the
+# environment, so values from `.env` are put there.
+assistant_keys = ~w(SONIOX_API_KEY GOOGLE_API_KEY INWORLD_API_KEY)
+
+for key <- assistant_keys,
+    value = fetch.(key),
+    value not in [nil, ""],
+    do: System.put_env(key, value)
+
+config :call, assistant?: Enum.all?(assistant_keys, &(fetch.(&1) not in [nil, ""]))
 
 # OCTOROOM_STORE: where the room store's snapshot lives, so rooms survive a
 # restart of this app (defaults to the system temp directory).

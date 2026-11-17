@@ -275,6 +275,83 @@ describe("joining", () => {
   })
 })
 
+describe("leaving while joining", () => {
+  test("before the join reply: the join fails at once, and tears down once", async () => {
+    const {room, socket, emitted} = client()
+    const failed = assert.rejects(room.join(), /left while joining/)
+    await room.leave()
+    await failed
+
+    assert.equal(socket.channels[0].left, true)
+    assert.equal(room.state, "idle")
+    assert.deepEqual(emitted("left"), ["left"])
+    assert.deepEqual(browser.devices.userMediaCalls, [])
+  })
+
+  test("at the mic prompt: the devices are turned off when the prompt is answered", async () => {
+    browser.devices.prompting = true
+    const {room, socket, emitted} = client({video: true})
+    const failed = assert.rejects(room.join(), /left while joining/)
+    socket.channels[0].joinPush.reply("ok", joinReply())
+    await settle()
+    assert.equal(browser.devices.userMediaCalls.length, 1)
+
+    await room.leave()
+    await failed
+    browser.devices.allow()
+    await settle()
+
+    const [stream] = browser.devices.streams
+    assert.deepEqual(
+      stream.getTracks().map((t) => t.readyState),
+      ["ended", "ended"],
+    )
+    assert.equal(FakePeerConnection.instances.length, 0)
+    assert.deepEqual(room.localTracks(), {})
+    assert.deepEqual(emitted("left"), ["left"])
+    assert.equal(room.state, "idle")
+  })
+
+  test("while publishing: closes the connection and frees the mic", async () => {
+    const {room, socket, emitted} = client()
+    const failed = assert.rejects(room.join(), /left while joining/)
+    const channel = socket.channels[0]
+    channel.joinPush.reply("ok", joinReply())
+    const publish = await channel.next("publish")
+
+    await room.leave()
+    await failed
+    // The server's answer arrives after the client has gone.
+    publish.reply("ok", {sdp: "cf-answer"})
+    await settle()
+
+    assert.equal(FakePeerConnection.last.closed, true)
+    assert.equal(browser.devices.streams[0].getAudioTracks()[0].readyState, "ended")
+    assert.deepEqual(channel.pushed("connected"), [])
+    assert.deepEqual(emitted("left"), ["left"])
+    assert.deepEqual(emitted("error"), [])
+    assert.equal(room.state, "idle")
+  })
+
+  test("a join started right after isn't torn down by the one that was left", async () => {
+    const {room, socket, emitted} = client()
+    const failed = assert.rejects(room.join(), /left while joining/)
+    room.leave()
+    const joining = room.join()
+    await failed
+
+    const channel = socket.channels[1]
+    channel.joinPush.reply("ok", joinReply())
+    ;(await channel.next("publish")).reply("ok", {sdp: "cf-answer"})
+    ;(await channel.next("connected")).reply("ok", {})
+    await joining
+
+    assert.equal(room.state, "joined")
+    assert.equal(channel.left, false)
+    assert.deepEqual(emitted("left"), ["left"])
+  })
+})
+
 describe("what the server pulls", () => {
   test("answers Cloudflare's offer, then plays the audio and lists the tracks", async () => {
     const ctx = await join()

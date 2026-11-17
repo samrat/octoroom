@@ -1,0 +1,389 @@
+defmodule Octoroom.Agent.WorkerTest do
+  # An agent in a real room server, over Octoroom's fake Cloudflare and fake
+  # peer media, with fake STT, LLM and TTS.
+  use ExUnit.Case, async: true
+
+  import Octoroom.Agent.Pipeline.Spec
+
+  alias Octoroom.Agent.{Backend, Frames, Processors}
+  alias Octoroom.Room.Server
+  alias Octoroom.Test.{Client, FakeCloudflare, FakePeerMedia}
+
+  # 20 ms of room PCM.
+  @frame :binary.copy(<<1, 0>>, 1_920)
+
+  # Stands in for `Processors.STT`: remembers the source of the audio it
+  # hears, and turns `{:fake_stt, source, ...}` messages for that source into
+  # what the real stage pushes.
+  defmodule FakeSTT do
+    use Octoroom.Agent.Processor
+
+    @impl true
+    def init(opts, _ctx), do: {:ok, %{source: nil, test: Keyword.fetch!(opts, :test)}}
+
+    @impl true
+    def handle_frame(%Frames.InputAudio{} = frame, :downstream, state) do
+      if state.source == nil, do: send(state.test, {:heard, frame.source, frame.sample_rate})
+      {[{:push, frame, :downstream}], %{state | source: frame.source}}
+    end
+
+    def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
+
+    @impl true
+    def handle_info({:fake_stt, source, event}, %{source: source} = state),
+      do: {[{:push, frame(event, source), :downstream}], state}
+
+    def handle_info(_message, state), do: {[], state}
+
+    defp frame(:speech_started, source), do: %Frames.VADUserStartedSpeaking{source: source}
+    defp frame(:speech_stopped, source), do: %Frames.VADUserStoppedSpeaking{source: source}
+    defp frame({:final, text}, source), do: %Frames.Transcription{text: text, source: source}
+
+    defp frame({:audio, ms}, source),
+      do: %Frames.UserAudio{audio: :binary.copy(<<0, 0>>, 16 * ms), source: source}
+
+    defp frame({:final, text, decision}, source),
+      do: %Frames.Transcription{text: text, source: source, decision: decision}
+  end
+
+  defmodule AgentRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    # One agent hearing everyone; the participant who brought args starts it.
+    @impl true
+    def workers(%{participants: [_ | _]} = room) do
+      case Enum.find(room.participants, &Map.has_key?(&1.meta, :args)) do
+        nil ->
+          []
+
+        p ->
+          [
+            worker("assistant", Octoroom.Agent.Worker,
+              inputs: Enum.map(room.participants, &mic/1),
+              outputs: ["assistant"],
+              args: p.meta.args
+            )
+          ]
+      end
+    end
+
+    def workers(_room), do: []
+
+    @impl true
+    def subscriptions(_listener, _room), do: [track("assistant")]
+  end
+
+  setup do
+    {:ok, fake} = FakeCloudflare.start_link(self())
+
+    %{
+      fake: fake,
+      room_id: "agent-room-#{System.unique_integer([:positive])}",
+      opts: [
+        cloudflare: FakeCloudflare.config(fake),
+        signal_timeout: 1_000,
+        peer_media: FakePeerMedia
+      ]
+    }
+  end
+
+  # `reply_ms` of 24 kHz audio per sentence the LLM says.
+  defp args(test, reply_ms, extra \\ %{}) do
+    llm = fn opts, emit ->
+      send(test, {:llm, Enum.map(opts[:input], & &1.content)})
+      emit.({:text_delta, "Hello there."})
+      {:ok, %{text: "Hello there.", function_calls: [], continuation: []}}
+    end
+
+    tts = fn _text, on_audio ->
+      send(test, :tts)
+      on_audio.(:binary.copy(<<0, 0>>, div(24_000 * reply_ms, 1_000)))
+      :ok
+    end
+
+    {front, back} =
+      cascaded_split(Backend.Cascaded.new(%{vad: false}))
+
+    # Half-cascaded back ends transcribe each audio turn in the background.
+    {transcribe, extra} = Map.pop(extra, :transcribe)
+
+    back =
+      if transcribe,
+        do:
+          insert_before(
+            back,
+            :context,
+            processor(:transcriber, Processors.Transcriber, transcribe: transcribe)
+          ),
+        else: back
+
+    Map.merge(
+      %{
+        name: "Assistant",
+        instructions: "Be brief.",
+        front_end: replace(front, :stt, processor(:stt, FakeSTT, test: test)),
+        back_end:
+          back
+          |> replace(:llm, processor(:llm, Processors.LLM, request: llm))
+          |> replace(:tts, processor(:tts, Processors.TTS, synthesize: tts))
+      },
+      extra
+    )
+  end
+
+  # Alice joins and publishes her mic. The agent pulls it, and once it has
+  # heard her, it can talk.
+  defp start(ctx, reply_ms \\ 200, extra \\ %{}) do
+    Octoroom.subscribe(ctx.room_id)
+    alice = join(ctx, "alice", %{name: "Alice", args: args(self(), reply_ms, extra)})
+    cf = agent_track(alice.mic)
+    alice = hear(ctx, alice)
+    %{alice: alice, mic: alice.mic, cf_track: cf}
+  end
+
+  defp join(ctx, name, meta) do
+    client = Client.join(name, AgentRoom, ctx.room_id, meta, ctx.opts)
+    Server.publish(client.server, client.id, "offer:#{name}", %{"mic" => "0"}, :pub)
+    assert_receive {:client, ^name, {:octoroom_signal, :reply, :pub, {:ok, %{sdp: sdp}}}}
+    "answer:" <> session = sdp
+    mic = "#{client.id}/mic"
+    FakeCloudflare.mark_live(ctx.fake, session, mic)
+    Server.connected(client.server, client.id)
+    Map.merge(client, %{session: session, mic: mic})
+  end
+
+  # Waits until the agent pulls `client`'s mic and its front end hears it.
+  defp hear(ctx, client) do
+    mic = client.mic
+
+    wait_until(fn ->
+      match?([%{connected: connected}] when is_list(connected), workers(ctx)) and
+        mic in hd(workers(ctx)).connected
+    end)
+
+    FakeCloudflare.egress(ctx.fake, client.session, mic, @frame)
+    assert_receive {:heard, ^mic, 16_000}
+    client
+  end
+
+  defp workers(ctx), do: Octoroom.Room.state(ctx.room_id).workers
+
+  # The agent's output, pushed from its own session (Alice's mic is the
+  # other push).
+  defp agent_track(mic) do
+    assert_receive {:cloudflare, :push_tracks, [_session, _offer, [%{track_name: name}]]}
+    if name == mic, do: agent_track(mic), else: name
+  end
+
+  defp say(ctx, client, event),
+    do: :ok = Octoroom.Worker.send(ctx.room_id, "assistant", {:fake_stt, client.mic, event})
+
+  test "hears a participant, replies on its track, and reports the turn", ctx do
+    %{cf_track: cf, alice: alice} = start(ctx)
+
+    say(ctx, alice, {:final, "Hi!"})
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{role: "user", text: "Hi!", speaker: "Alice"}}}}}
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:latency, %{transcript: t, llm: l, audio: a}}}}}
+
+    assert t >= 0 and l >= t and a >= l
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent,
+                      {:conversation,
+                       %{role: "assistant", text: "Hello there.", status: "completed"}}}}}
+
+    # The reply goes out on the agent's track as 20 ms room frames.
+    assert_receive {:ingest, ^cf, frame}, 1_000
+    assert byte_size(frame) == 3_840
+  end
+
+  test "talking over the agent flushes what it hasn't played yet", ctx do
+    %{cf_track: cf, alice: alice} = start(ctx, 5_000)
+
+    say(ctx, alice, {:final, "Tell me a story."})
+    assert_receive :tts
+    assert_receive {:ingest, ^cf, _}, 1_000
+    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms > 3_000 end)
+
+    say(ctx, alice, :speech_started)
+    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms == 0 end)
+  end
+
+  test "with several people it hears everyone and answers when addressed", ctx do
+    %{alice: alice} = start(ctx)
+    bob = join(ctx, "bob", %{name: "Bob"}) |> then(&hear(ctx, &1))
+
+    # People talking to each other: into the conversation, no reply.
+    say(ctx, alice, {:final, "Bob, did you send the deck?"})
+    say(ctx, bob, {:final, "Yes, this morning."})
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{text: "Yes, this morning.", speaker: "Bob"}}}}}
+
+    refute_receive {:llm, _}, 100
+
+    # Saying its name starts a reply, with everyone's words, labelled.
+    say(ctx, bob, {:final, "Assistant, when is the meeting?"})
+    assert_receive {:llm, input}
+
+    assert Enum.take(input, -3) == [
+             "[Alice] Bob, did you send the deck?",
+             "[Bob] Yes, this morning.",
+             "[Bob] Assistant, when is the meeting?"
+           ]
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}}
+
+    # Bob's follow-up window: 10 s from when the reply's 200 ms of audio ends.
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:follow_up, %{speaker: "Bob", source: source, ms: ms}}}}}
+
+    assert source == bob.mic
+    assert ms > 10_000 and ms <= 10_200
+
+    # Bob can follow up without the name; Alice can't.
+    say(ctx, alice, {:final, "And where?"})
+    refute_receive {:llm, _}, 100
+    say(ctx, bob, {:final, "And where?"})
+    assert_receive {:llm, _}
+    assert_receive {:octoroom, _, {:worker_event, "assistant", {:agent, {:follow_up, nil}}}}
+  end
+
+  test "only the person it's answering can interrupt it", ctx do
+    %{alice: alice} = start(ctx, 5_000)
+    bob = join(ctx, "bob", %{name: "Bob"}) |> then(&hear(ctx, &1))
+
+    say(ctx, bob, {:final, "Assistant, tell me a story."})
+    assert_receive :tts
+    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms > 3_000 end)
+
+    say(ctx, alice, :speech_started)
+    Process.sleep(100)
+    assert Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms > 2_000
+
+    say(ctx, bob, :speech_started)
+    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms == 0 end)
+  end
+
+  test "half-cascaded: the LLM hears a labelled audio turn, and a transcript follows", ctx do
+    transcribe = fn _pcm, _rate -> {:ok, "What time is it?"} end
+    %{alice: alice} = start(ctx, 200, %{transcribe: transcribe})
+
+    say(ctx, alice, {:audio, 1_000})
+    assert_receive {:llm, input}
+
+    assert [%ReqLLM.Message.ContentPart{type: :text, text: "[Alice]"}, %{type: :file}] =
+             List.last(input)
+
+    # The background transcript becomes Alice's line in the conversation.
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent,
+                      {:conversation, %{role: "user", text: "What time is it?", speaker: "Alice"}}}}},
+                   1_000
+  end
+
+  describe "the decision gate" do
+    @decision_args %{gate: :decision, thresholds: %{wait_ms: 300}}
+
+    defp decision(addressee, assistant, answerable),
+      do: %{
+        addressee: addressee,
+        probabilities: %{"assistant" => assistant},
+        answerable: answerable
+      }
+
+    defp event(kind) do
+      assert_receive {:octoroom, _, {:worker_event, "assistant", {:agent, {^kind, value}}}},
+                     1_000
+
+      value
+    end
+
+    test "replies when the model hears it addressed, without its name", ctx do
+      %{alice: alice} = start(ctx, 200, @decision_args)
+      say(ctx, alice, {:final, "What time is it?", decision("assistant", 0.85, 0.9)})
+      assert %{outcome: :reply, why: :addressed, speaker: "Alice"} = event(:decision)
+      assert_receive {:llm, _}
+    end
+
+    test "an open question waits, then gets an answer if nobody else speaks", ctx do
+      %{alice: alice} = start(ctx, 200, @decision_args)
+      say(ctx, alice, {:final, "Does anyone know when it starts?", decision("group", 0.1, 0.9)})
+      assert %{outcome: :wait, why: :open_question} = event(:decision)
+      assert %{speaker: "Alice", ms: 300} = event(:waiting)
+      refute_receive {:llm, _}, 150
+      assert nil == event(:waiting)
+      assert_receive {:llm, input}
+      assert List.last(input) == "[Alice] Does anyone know when it starts?"
+    end
+
+    test "someone else answering ends the wait without a reply", ctx do
+      %{alice: alice} = start(ctx, 200, @decision_args)
+      bob = join(ctx, "bob", %{name: "Bob"}) |> then(&hear(ctx, &1))
+      say(ctx, alice, {:final, "Does anyone know when it starts?", decision("group", 0.1, 0.9)})
+      assert %{ms: 300} = event(:waiting)
+      say(ctx, bob, :speech_started)
+      assert nil == event(:waiting)
+      refute_receive {:llm, _}, 500
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent, {:conversation, %{text: "Does anyone know when it starts?"}}}}}
+    end
+
+    test "talk aimed at a person stays in the conversation, unanswered", ctx do
+      %{alice: alice} = start(ctx, 200, @decision_args)
+      say(ctx, alice, {:final, "Bob, can you share your screen?", decision("person", 0.05, 0.3)})
+      assert %{outcome: :listen} = event(:decision)
+      refute_receive {:llm, _}, 400
+    end
+
+    test "the person it's answering carries on without the name", ctx do
+      %{alice: alice} = start(ctx, 5_000, @decision_args)
+      say(ctx, alice, {:final, "Assistant."})
+      assert %{outcome: :reply, why: :name} = event(:decision)
+      say(ctx, alice, {:final, "What time is it?", decision("group", 0.4, 0.9)})
+      assert %{outcome: :reply, why: :follow_up} = event(:decision)
+    end
+
+    test "with no decision (a failed or slow call) only the name counts", ctx do
+      %{alice: alice} = start(ctx, 200, @decision_args)
+      say(ctx, alice, {:final, "What time is it?"})
+      assert %{outcome: :listen, decision: nil} = event(:decision)
+      say(ctx, alice, {:final, "Assistant, what time is it?"})
+      assert %{outcome: :reply, why: :name} = event(:decision)
+      assert_receive {:llm, _}
+    end
+  end
+
+  test "a backend that can't speak at 24 kHz doesn't start", ctx do
+    assert {:stop, {:unsupported_output_sample_rate, 16_000}} =
+             Octoroom.Agent.Worker.init(
+               %{backend: %{tts: %{output_sample_rate: 16_000}}},
+               %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
+             )
+  end
+
+  defp wait_until(fun, tries \\ 100) do
+    cond do
+      fun.() -> :ok
+      tries == 0 -> flunk("condition never became true")
+      true -> Process.sleep(10) && wait_until(fun, tries - 1)
+    end
+  end
+end

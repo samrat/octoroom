@@ -1,0 +1,305 @@
+defmodule Octoroom.Agent.Processors.Decisions do
+  @moduledoc """
+  Asks a decision model about each turn's audio, and attaches the answers to
+  the turn: who the speaker is talking to, and whether an assistant could
+  usefully answer. The agent's gate uses them to decide whether to reply.
+
+  Each turn's audio goes to the Gemini Decisions API (`ReqLLM.evaluate/4`,
+  model `google:gemini-decision-1`), which answers calibrated questions in
+  one call. The turn (`Transcription` or `UserAudio`) goes on with
+  `decision` set to
+
+      %{addressee: "assistant" | "person" | "group" | "nobody",
+        confidence: 0.81, probabilities: %{...}, answerable: 0.95,
+        latency_ms: 430, audio_ms: 2100}
+
+  or `nil` when the call failed or was too slow.
+
+  Place it in a front end after the turn stage. Behind an STT turn stage it
+  records each turn from `VADUserStartedSpeaking` (with `preroll_ms` before
+  it) and starts the call at the VAD's stop, so it runs while the STT
+  finalizes; the transcript is held for at most `max_wait_ms` for the
+  answers. A pause that turns out not to be the end of the turn cancels the
+  call, and the turn is evaluated again when it ends. Behind `AudioTurns`
+  (half-cascaded), the turn's own `UserAudio` is evaluated when it arrives.
+
+  Options: `:model` (default `"google:gemini-decision-1"`), `:api_key`
+  (default ReqLLM's Google key, `GOOGLE_API_KEY`), `:request_options`,
+  `:questions` (see `default_questions/0`), `:max_wait_ms` (1500),
+  `:preroll_ms` (1000), `:max_audio_ms` (30000), `:min_audio_ms` (300), and
+  `:evaluate`, a `fn wav -> {:ok, answers} | {:error, reason} end` that
+  replaces the API call (for tests). Under a host, it warms the connection
+  with one call on half a second of silence when it starts.
+  """
+
+  use Octoroom.Agent.Processor
+
+  require Logger
+
+  alias Octoroom.Agent.Cascaded.AudioTurn
+  alias Octoroom.Agent.Frames
+  alias ReqLLM.Message.ContentPart
+
+  @sample_rate 16_000
+
+  @default_questions %{
+    "addressee" => %{
+      type: :choice,
+      instructions:
+        "This is one turn from a group voice call that includes an AI assistant. " <>
+          "Who is the speaker talking to?",
+      criteria: %{
+        "assistant" => "The AI assistant in the call.",
+        "person" => "A specific other person in the call.",
+        "group" => "Everyone in the call, or no one in particular.",
+        "nobody" => "Nobody: thinking aloud, a remark, or a statement."
+      }
+    },
+    "answerable" => %{
+      type: :boolean,
+      instructions:
+        "Is this a question or request that an AI assistant could usefully answer right now?"
+    }
+  }
+
+  @doc "The questions asked by default (`addressee` and `answerable`)."
+  def default_questions, do: @default_questions
+
+  @impl true
+  def init(opts, ctx) do
+    questions = Keyword.get(opts, :questions, @default_questions)
+
+    # The first call opens a connection and takes seconds; make it now, on
+    # half a second of silence, so the first real turn doesn't pay for it.
+    if not Keyword.has_key?(opts, :evaluate) and is_pid(Map.get(ctx, :runner)) do
+      evaluate = api_evaluate(questions, opts)
+      Task.start(fn -> evaluate.(AudioTurn.wav(:binary.copy(<<0, 0>>, 8_000), @sample_rate)) end)
+    end
+
+    {:ok,
+     %{
+       evaluate: Keyword.get(opts, :evaluate) || api_evaluate(questions, opts),
+       max_wait_ms: Keyword.get(opts, :max_wait_ms, 1_500),
+       preroll_bytes: bytes(Keyword.get(opts, :preroll_ms, 1_000)),
+       max_audio_bytes: bytes(Keyword.get(opts, :max_audio_ms, 30_000)),
+       min_audio_bytes: bytes(Keyword.get(opts, :min_audio_ms, 300)),
+       preroll: <<>>,
+       # The turn being recorded: %{seq, audio, eval: nil | :running | {:done, decision}}
+       rec: nil,
+       # Turns handed off at `UserStoppedSpeaking`, by seq:
+       # %{turn_id, eval: :running | {:done, decision}, held: nil | frame}
+       turns: %{},
+       seq: 0
+     }}
+  end
+
+  @impl true
+  def handle_frame(%Frames.InputAudio{audio: audio} = frame, :downstream, state),
+    do: {[{:push, frame, :downstream}], record(state, audio)}
+
+  def handle_frame(%Frames.VADUserStartedSpeaking{} = frame, :downstream, state) do
+    {effects, state} = speech_started(state)
+    {[{:push, frame, :downstream} | effects], state}
+  end
+
+  # A candidate end of turn: start evaluating while the turn stage decides.
+  def handle_frame(%Frames.VADUserStoppedSpeaking{} = frame, :downstream, state) do
+    {effects, state} = start_eval(state)
+    {[{:push, frame, :downstream} | effects], state}
+  end
+
+  def handle_frame(%Frames.UserStoppedSpeaking{turn_id: turn_id} = frame, :downstream, state) do
+    {effects, state} = start_eval(state)
+    {[{:push, frame, :downstream} | effects], hand_off(state, turn_id)}
+  end
+
+  # Half-cascaded: the turn arrives as audio, nothing was recorded here.
+  def handle_frame(%Frames.UserAudio{turn_id: turn_id} = frame, :downstream, state) do
+    case find_turn(state, turn_id) do
+      nil -> evaluate_frame(frame, state)
+      found -> hold_or_release(frame, found, state)
+    end
+  end
+
+  def handle_frame(%Frames.Transcription{turn_id: turn_id} = frame, :downstream, state)
+      when not is_nil(turn_id) do
+    case find_turn(state, turn_id) do
+      nil -> {[{:push, frame, :downstream}], state}
+      found -> hold_or_release(frame, found, state)
+    end
+  end
+
+  def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
+
+  @impl true
+  def handle_async({:evaluate, seq}, {:done, {:ok, answers, timing}}, state),
+    do: finish_eval(state, seq, decision(answers, timing))
+
+  def handle_async({:evaluate, seq}, {:done, {:error, reason}}, state) do
+    Logger.warning("DECISIONS evaluation failed: #{inspect(reason)}")
+    finish_eval(state, seq, nil)
+  end
+
+  def handle_async({:evaluate, seq}, {:failed, reason}, state) do
+    Logger.warning("DECISIONS evaluation crashed: #{inspect(reason)}")
+    finish_eval(state, seq, nil)
+  end
+
+  @impl true
+  def handle_timer({:wait, seq}, state) do
+    case state.turns[seq] do
+      %{held: held} when held != nil ->
+        Logger.info("DECISIONS turn=#{held.turn_id} timed out; sent without a decision")
+        {[{:push, held, :downstream}], drop_turn(state, seq)}
+
+      _other ->
+        {[], state}
+    end
+  end
+
+  # -- recording
+
+  defp record(%{rec: nil} = state, audio),
+    do: %{state | preroll: keep_last(state.preroll <> audio, state.preroll_bytes)}
+
+  defp record(%{rec: rec} = state, audio),
+    do: %{state | rec: %{rec | audio: keep_last(rec.audio <> audio, state.max_audio_bytes)}}
+
+  defp speech_started(%{rec: nil} = state) do
+    seq = state.seq + 1
+    {[], %{state | seq: seq, rec: %{seq: seq, audio: state.preroll, eval: nil}, preroll: <<>>}}
+  end
+
+  # Talking again after a pause: what was evaluated is no longer the turn.
+  defp speech_started(%{rec: %{eval: :running} = rec} = state),
+    do: {[{:cancel, {:evaluate, rec.seq}}], %{state | rec: %{rec | eval: nil}}}
+
+  defp speech_started(%{rec: rec} = state), do: {[], %{state | rec: %{rec | eval: nil}}}
+
+  defp start_eval(%{rec: %{eval: nil} = rec} = state)
+       when byte_size(rec.audio) >= state.min_audio_bytes do
+    {[eval_task(rec.seq, rec.audio, state)], %{state | rec: %{rec | eval: :running}}}
+  end
+
+  defp start_eval(state), do: {[], state}
+
+  defp eval_task(seq, pcm, state) do
+    evaluate = state.evaluate
+    wav = AudioTurn.wav(pcm, @sample_rate)
+    audio_ms = AudioTurn.duration_ms(pcm, @sample_rate)
+
+    task = fn _emit ->
+      {micros, result} = :timer.tc(fn -> evaluate.(wav) end)
+
+      case result do
+        {:ok, answers} -> {:ok, answers, %{latency_ms: div(micros, 1_000), audio_ms: audio_ms}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    {:async, {:evaluate, seq}, task}
+  end
+
+  defp hand_off(%{rec: %{eval: eval} = rec} = state, turn_id) when eval != nil do
+    turn = %{turn_id: turn_id, eval: eval, held: nil}
+    %{state | rec: nil, turns: Map.put(state.turns, rec.seq, turn)}
+  end
+
+  # Too short to evaluate.
+  defp hand_off(state, _turn_id), do: %{state | rec: nil}
+
+  # A `UserAudio` turn nobody recorded: evaluate its own audio, holding it.
+  defp evaluate_frame(%Frames.UserAudio{audio: audio} = frame, state)
+       when byte_size(audio) >= state.min_audio_bytes do
+    seq = state.seq + 1
+    turn = %{turn_id: frame.turn_id, eval: :running, held: frame}
+
+    {[eval_task(seq, audio, state), {:timer, {:wait, seq}, state.max_wait_ms}],
+     %{state | seq: seq, turns: Map.put(state.turns, seq, turn)}}
+  end
+
+  defp evaluate_frame(frame, state), do: {[{:push, frame, :downstream}], state}
+
+  defp find_turn(state, turn_id),
+    do: Enum.find(state.turns, fn {_seq, turn} -> turn.turn_id == turn_id end)
+
+  defp hold_or_release(frame, {seq, %{eval: {:done, decision}}}, state),
+    do: {release(frame, decision), drop_turn(state, seq)}
+
+  defp hold_or_release(frame, {seq, %{eval: :running} = turn}, state) do
+    turns = Map.put(state.turns, seq, %{turn | held: frame})
+    {[{:timer, {:wait, seq}, state.max_wait_ms}], %{state | turns: turns}}
+  end
+
+  defp finish_eval(state, seq, decision) do
+    case state.turns[seq] do
+      %{held: held} when held != nil ->
+        {[{:cancel_timer, {:wait, seq}} | release(held, decision)], drop_turn(state, seq)}
+
+      %{} = turn ->
+        {[], %{state | turns: Map.put(state.turns, seq, %{turn | eval: {:done, decision}})}}
+
+      nil ->
+        rec = state.rec
+
+        if rec && rec.seq == seq,
+          do: {[], %{state | rec: %{rec | eval: {:done, decision}}}},
+          else: {[], state}
+    end
+  end
+
+  defp release(frame, nil), do: [{:push, frame, :downstream}]
+
+  defp release(frame, decision) do
+    Logger.info(
+      "DECISIONS turn=#{frame.turn_id} addressee=#{decision.addressee}(#{decision.confidence}) " <>
+        "answerable=#{decision.answerable} latency_ms=#{decision.latency_ms}"
+    )
+
+    [{:push, %{frame | decision: decision}, :downstream}]
+  end
+
+  defp drop_turn(state, seq), do: %{state | turns: Map.delete(state.turns, seq)}
+
+  # -- answers
+
+  @doc false
+  def decision(answers, timing) do
+    addressee = answers["addressee"] || %{}
+    answerable = answers["answerable"] || %{}
+
+    Map.merge(timing, %{
+      addressee: addressee["choice"],
+      confidence: round2(addressee["confidence"]),
+      probabilities: Map.new(addressee["probabilities"] || %{}, fn {k, v} -> {k, round2(v)} end),
+      answerable: round2(answerable["probability"])
+    })
+  end
+
+  defp round2(number) when is_number(number), do: Float.round(number / 1, 2)
+  defp round2(_other), do: nil
+
+  # -- the API call
+
+  defp api_evaluate(questions, opts) do
+    model = Keyword.get(opts, :model, "google:gemini-decision-1")
+    req_opts = Keyword.get(opts, :request_options, [])
+    req_opts = if key = opts[:api_key], do: [{:api_key, key} | req_opts], else: req_opts
+
+    fn wav ->
+      context =
+        ReqLLM.Context.new([
+          ReqLLM.Context.user([ContentPart.file(wav, "turn.wav", "audio/wav")])
+        ])
+
+      with {:ok, response} <- ReqLLM.evaluate(model, context, questions, req_opts) do
+        {:ok, response.object}
+      end
+    end
+  end
+
+  defp keep_last(binary, max) when byte_size(binary) <= max, do: binary
+  defp keep_last(binary, max), do: binary_part(binary, byte_size(binary) - max, max)
+
+  defp bytes(ms), do: div(@sample_rate * 2 * ms, 1_000)
+end
