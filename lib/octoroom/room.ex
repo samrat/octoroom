@@ -10,13 +10,24 @@ defmodule Octoroom.Room do
       end
 
   Only `join/2` is required. `subscriptions/2` defaults to
-  `default_subscriptions/2`: every other participant's mic. Both
+  `default_subscriptions/2`: every other participant's mic, camera and
+  screen share, and every worker output. Both
   `subscriptions/2` and `workers/1` must be pure and fast: they run after
   every room change and read only the `%Octoroom.Room{}` they're given.
 
   The struct holds the room's `id`, its `participants` in join order (each an
   `Octoroom.Participant`), its `workers` (the specs `workers/1` last
   returned) and its `assigns`.
+
+  ## Publishing
+
+  A participant publishes up to one track per source: `"mic"`, `"camera"`,
+  `"screen"` and `"screen_audio"`, named `"<id>/<source>"` in the room
+  (`mic/1`, `camera/1`, `screen/1`, `screen_audio/1`). By default it may
+  publish any of them; a `:publish` key in the metadata `join/2` returns
+  limits it, e.g. `%{name: name, publish: ["mic"]}` for audio only. The room
+  server refuses any other source. What a participant publishes right now
+  is in its `tracks`.
   """
 
   alias Octoroom.{Participant, Room, Track}
@@ -61,7 +72,17 @@ defmodule Octoroom.Room do
       @behaviour Octoroom.Room
 
       import Octoroom.Room,
-        only: [mic: 1, track: 1, gain: 2, others: 2, default_subscriptions: 2, worker: 3]
+        only: [
+          mic: 1,
+          camera: 1,
+          screen: 1,
+          screen_audio: 1,
+          track: 1,
+          gain: 2,
+          others: 2,
+          default_subscriptions: 2,
+          worker: 3
+        ]
 
       @impl true
       def mount(_room_id), do: {:ok, %{}}
@@ -81,38 +102,65 @@ defmodule Octoroom.Room do
   @doc "A participant's mic track."
   def mic(%Participant{id: id}), do: track("#{id}/mic")
 
-  @doc "A track by room-scoped name."
-  def track(name) when is_binary(name), do: %Track{name: name}
+  @doc "A participant's camera track (video)."
+  def camera(%Participant{id: id}), do: track("#{id}/camera")
 
-  @doc "The same track, played at `value` (0.0 to 1.0) in the listener's browser."
-  def gain(%Track{} = track, value) when is_number(value) and value >= 0 and value <= 1,
-    do: %{track | gain: value / 1}
+  @doc "A participant's screen share (video)."
+  def screen(%Participant{id: id}), do: track("#{id}/screen")
+
+  @doc "The audio of a participant's screen share, when the browser shares it."
+  def screen_audio(%Participant{id: id}), do: track("#{id}/screen_audio")
+
+  @doc "A track by room-scoped name."
+  def track(name) when is_binary(name), do: Track.new(name)
+
+  @doc "The same audio track, played at `value` (0.0 to 1.0) in the listener's browser."
+  def gain(%Track{kind: :audio} = track, value)
+      when is_number(value) and value >= 0 and value <= 1,
+      do: %{track | gain: value / 1}
+
+  def gain(%Track{kind: :video, name: name}, _value),
+    do: raise(ArgumentError, "gain/2 applies to audio, and #{name} is video")
 
   @doc "Every participant except `participant`."
   def others(%__MODULE__{participants: ps}, %Participant{id: id}),
     do: Enum.reject(ps, &(&1.id == id))
 
-  @doc "Every other participant's mic, plus every worker output track."
+  @doc """
+  Every other participant's tracks (mic, camera, screen share and its
+  audio), plus every worker output track. Sources nobody publishes are
+  never pulled, so they cost nothing.
+  """
   def default_subscriptions(%Participant{} = listener, %__MODULE__{} = room) do
-    mics = room |> others(listener) |> Enum.map(&mic/1)
+    published =
+      for p <- others(room, listener),
+          source <- Map.keys(Track.sources()) |> Enum.sort(),
+          do: track("#{p.id}/#{source}")
+
     outputs = for w <- room.workers, name <- Map.get(w, :outputs, []), do: track(name)
-    mics ++ outputs
+    published ++ outputs
   end
 
   @doc """
   A worker spec, for `workers/1`:
 
-    * `inputs`: tracks the worker hears (`mic/1`, `track/1` or names).
-      An input is connected once its track is live.
+    * `inputs`: audio tracks the worker hears (`mic/1`, `track/1` or
+      names). An input is connected once its track is live. Workers don't
+      take video yet.
     * `outputs`: names of the tracks the worker plays. Output names share a
       namespace with every other track in the room.
     * `args`: passed to the worker's `init/2`.
   """
   def worker(id, module, opts) when is_binary(id) and is_atom(module) do
+    inputs = opts |> Keyword.get(:inputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
+
+    if video = Enum.find(inputs, &(Track.new(&1).kind == :video)),
+      do: raise(ArgumentError, "worker #{id}: #{video} is video, and workers take audio inputs")
+
     %{
       id: id,
       module: module,
-      inputs: opts |> Keyword.get(:inputs, []) |> Enum.map(&track_name/1) |> Enum.uniq(),
+      inputs: inputs,
       outputs: opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq(),
       args: Keyword.get(opts, :args, %{})
     }
@@ -193,7 +241,9 @@ defmodule Octoroom.Room do
 
   @doc """
   A snapshot of the room: its assigns, and for each participant its
-  metadata, its mic status and the tracks it currently hears.
+  metadata, its connection (`media`), what it publishes (`tracks`: source =>
+  `%{status: :pending | :live | :closing, muted: boolean}`; `mic` is the
+  mic's status, or `:none`) and the tracks it currently hears.
   """
   def state(room_id), do: call(room_id, :state)
 

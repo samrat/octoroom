@@ -23,6 +23,39 @@ function testTone() {
   return {stream: dest.stream, frequency: osc.frequency.value, stop: () => (clearInterval(timer), ctx.close())}
 }
 
+// A moving test pattern, for testing without a camera: the tab's name and a
+// clock on a per-tab colour, so you can tell whose video you're seeing and
+// that it's live.
+function testPattern(label) {
+  const canvas = document.createElement("canvas")
+  canvas.width = 640
+  canvas.height = 360
+  const ctx = canvas.getContext("2d")
+  const hue = Math.floor(Math.random() * 360)
+  const started = performance.now()
+  const draw = () => {
+    const t = (performance.now() - started) / 1000
+    ctx.fillStyle = `hsl(${hue} 55% 30%)`
+    ctx.fillRect(0, 0, 640, 360)
+    ctx.fillStyle = `hsl(${hue} 70% 60%)`
+    ctx.beginPath()
+    ctx.arc(320 + Math.cos(t * 2) * 220, 250, 28, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.fillStyle = "#fff"
+    ctx.font = "bold 44px system-ui, sans-serif"
+    ctx.textAlign = "center"
+    ctx.fillText(label, 320, 130)
+    ctx.font = "28px ui-monospace, monospace"
+    ctx.fillText(new Date().toLocaleTimeString(), 320, 180)
+  }
+  draw()
+  // A timer, not requestAnimationFrame, so it keeps drawing in a background tab.
+  const timer = setInterval(draw, 1000 / 15)
+  const [track] = canvas.captureStream(15).getVideoTracks()
+  track.addEventListener("ended", () => clearInterval(timer))
+  return track
+}
+
 const Call = {
   mounted() {
     window.octoroomCall = this
@@ -33,6 +66,10 @@ const Call = {
     this.$("#join").onclick = () => this.join()
     this.$("#leave").onclick = () => this.leave()
     this.$("#mute").onclick = () => this.toggleMute()
+    this.$("#camera").onclick = () => this.toggleCamera()
+    this.$("#pause").onclick = () => this.togglePause()
+    this.$("#screen").onclick = () => this.toggleScreen()
+    this.previews = new WeakMap() // local track => MediaStream, so previews don't flicker
   },
 
   status(text) {
@@ -43,6 +80,21 @@ const Call = {
     this.$("#join").disabled = inCall
     this.$("#leave").disabled = !inCall
     this.$("#mute").disabled = !inCall
+    this.$("#camera").disabled = !inCall
+    this.$("#screen").disabled = !inCall || !navigator.mediaDevices.getDisplayMedia
+    this.updateVideoButtons()
+  },
+
+  updateVideoButtons() {
+    const local = this.room?.state === "joined" ? this.room.localTracks() : {}
+    this.$("#camera").textContent = local.camera ? "Camera off" : "Camera on"
+    this.$("#pause").disabled = !local.camera
+    this.$("#pause").textContent = local.camera?.muted ? "Resume video" : "Pause video"
+    this.$("#screen").textContent = local.screen ? "Stop sharing" : "Share screen"
+  },
+
+  cameraTrack() {
+    return this.$("#pattern").checked ? testPattern(this.$("#name").value) : null
   },
 
   async join() {
@@ -51,12 +103,23 @@ const Call = {
     try { localStorage.setItem("octoroom-name", name) } catch {}
 
     this.tone = this.$("#tone").checked ? testTone() : null
+    const withCamera = this.$("#join-camera").checked
+    const pattern = withCamera ? this.cameraTrack() : null
+    const audio = {echoCancellation: true, noiseSuppression: true, autoGainControl: true}
+    let stream = this.tone?.stream
+    // A provided stream's video track is published as the camera.
+    if (pattern) {
+      stream = stream || (await navigator.mediaDevices.getUserMedia({audio}).catch(() => null))
+      stream = new MediaStream([...(stream?.getAudioTracks() || []), pattern])
+    }
+    this.pattern = pattern
     const room = new RoomClient({
       socket: this.socket,
       topic: `room:${this.el.dataset.room}`,
       params: {name},
-      stream: this.tone?.stream,
-      audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
+      stream,
+      audio,
+      video: withCamera && !pattern ? {width: 640, height: 360} : false,
     })
     this.room = room
 
@@ -66,8 +129,14 @@ const Call = {
     })
     room.on("connection", (state) => this.status(`Connection to Cloudflare: ${state}`))
     room.on("tracks", (tracks) => {
-      if (room.state === "joined") this.status(`In the call. Playing ${tracks.length} track(s).`)
+      if (room.state === "joined") this.status(`In the call. Receiving ${tracks.length} track(s).`)
+      this.renderVideos()
     })
+    room.on("local", () => {
+      this.renderVideos()
+      this.updateVideoButtons()
+    })
+    room.on("participants", () => this.renderVideos())
     room.on("error", (error) => this.status(`Error: ${error.message}`))
     room.on("reconnecting", () => this.status("Lost the server; reconnecting (audio keeps flowing)…"))
     room.on("reconnected", ({resumed}) =>
@@ -97,6 +166,99 @@ const Call = {
     this.$("#mute").textContent = this.room.muted ? "Unmute" : "Mute"
   },
 
+  async toggleCamera() {
+    if (!this.room) return
+    const button = this.$("#camera")
+    button.disabled = true
+    try {
+      if (this.room.localTracks().camera) {
+        await this.room.stop("camera")
+        this.pattern?.stop()
+        this.pattern = null
+      } else {
+        this.pattern = this.cameraTrack()
+        await this.room.startCamera(this.pattern || {width: 640, height: 360})
+      }
+    } catch (error) {
+      this.status(`Camera: ${error.message}`)
+    } finally {
+      button.disabled = this.room?.state !== "joined"
+      this.updateVideoButtons()
+    }
+  },
+
+  togglePause() {
+    const camera = this.room?.localTracks().camera
+    if (camera) this.room.mute("camera", !camera.muted)
+  },
+
+  async toggleScreen() {
+    if (!this.room) return
+    try {
+      if (this.room.localTracks().screen) {
+        await Promise.all([this.room.stop("screen"), this.room.stop("screen_audio")])
+      } else {
+        await this.room.shareScreen()
+      }
+    } catch (error) {
+      this.status(`Screen share: ${error.message}`)
+    }
+    this.updateVideoButtons()
+  },
+
+  // One tile per video: this tab's own camera and screen, and every video
+  // track the server pulled into this session.
+  renderVideos() {
+    const grid = document.getElementById("videos")
+    if (!grid) return
+    const room = this.room
+    const tiles = new Map()
+
+    if (room && room.state !== "idle") {
+      for (const [source, {track, muted}] of Object.entries(room.localTracks())) {
+        if (source !== "camera" && source !== "screen") continue
+        if (!this.previews.has(track)) this.previews.set(track, new MediaStream([track]))
+        // A real camera is mirrored, like a mirror; a test pattern isn't, so its text reads.
+        const mirror = source === "camera" && track !== this.pattern
+        tiles.set(`local-${source}`, {stream: this.previews.get(track), source, muted, mirror, label: `You · ${source}`})
+      }
+
+      for (const t of room.tracks()) {
+        if (t.kind !== "video") continue
+        const p = room.participants.find((p) => p.id === t.participant_id)
+        const name = p?.meta?.name || t.worker_id || "?"
+        const muted = p?.tracks?.[t.source]?.muted || false
+        tiles.set(`mid-${t.mid}`, {stream: t.stream, source: t.source, muted, label: `${name} · ${t.source}`})
+      }
+    }
+
+    for (const el of [...grid.children]) {
+      if (!tiles.has(el.dataset.key)) {
+        el.querySelector("video").srcObject = null
+        el.remove()
+      }
+    }
+
+    for (const [key, tile] of tiles) {
+      let el = grid.querySelector(`[data-key="${key}"]`)
+      if (!el) {
+        el = document.createElement("div")
+        el.dataset.key = key
+        el.innerHTML = `<video autoplay playsinline muted></video><span class="paused">Video paused</span><span class="label"></span>`
+        grid.appendChild(el)
+      }
+      const video = el.querySelector("video")
+      if (video.srcObject !== tile.stream) {
+        video.srcObject = tile.stream
+        video.play().catch(() => {})
+      }
+      el.className = ["tile", tile.source, tile.muted && "muted", tile.mirror && "mirror"]
+        .filter(Boolean)
+        .join(" ")
+      el.querySelector(".label").textContent = tile.label
+    }
+  },
+
   async updateMeters() {
     if (!this.room || this.room.state !== "joined") return
     const {local, remote} = await this.room.levels()
@@ -113,7 +275,11 @@ const Call = {
     clearInterval(this.meters)
     this.tone?.stop()
     this.tone = null
+    this.pattern?.stop()
+    this.pattern = null
     this.$("#mute").textContent = "Mute"
+    this.updateVideoButtons()
+    this.renderVideos()
     document.querySelectorAll("[id^=level-]").forEach((el) => (el.style.width = "0"))
   },
 

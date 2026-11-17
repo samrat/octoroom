@@ -21,7 +21,9 @@ end
 
 defmodule Call.Room do
   @moduledoc """
-  A group call with a mic check: everyone hears everyone, plus
+  A group call with video and a mic check: everyone hears and sees
+  everyone (cameras and screen shares), except that a participant who turns
+  "receive video" off gets audio only, plus
 
     * a private two-second echo for each participant who turns it on, which
       only they hear;
@@ -36,7 +38,7 @@ defmodule Call.Room do
   def join(%{"name" => name}, _socket) when is_binary(name) do
     case String.trim(name) do
       "" -> {:error, :name_required}
-      name -> {:ok, %{name: String.slice(name, 0, 32), echo: false}}
+      name -> {:ok, %{name: String.slice(name, 0, 32), echo: false, video: true}}
     end
   end
 
@@ -71,7 +73,14 @@ defmodule Call.Room do
 
   @impl true
   def subscriptions(listener, room) do
-    mics = for p <- others(room, listener), do: mic(p)
+    # Video is only pulled for listeners who want it: the server decides,
+    # so an audio-only listener never downloads anyone's camera.
+    sources =
+      if listener.meta.video,
+        do: [&mic/1, &camera/1, &screen/1, &screen_audio/1],
+        else: [&mic/1, &screen_audio/1]
+
+    mics = for p <- others(room, listener), source <- sources, do: source.(p)
     own_echo = if listener.meta.echo, do: [track(echo(listener))], else: []
     metronome = if room.assigns[:metronome], do: [track("metronome")], else: []
     mics ++ own_echo ++ metronome
@@ -111,7 +120,7 @@ defmodule Call.Layouts do
           :root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6e6e73; --bg: #fff; --card: #f5f5f7; --accent: #f38020; --ok: #2f9e44; }
           @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --muted: #98989d; --bg: #111; --card: #1c1c1e; } }
           body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; }
-          main { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+          main { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
           h1 { font-size: 22px; margin: 0 0 4px; }
           .sub { color: var(--muted); margin: 0 0 20px; }
           .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--card); padding: 12px; border-radius: 10px; }
@@ -136,6 +145,16 @@ defmodule Call.Layouts do
           .captions { background: var(--card); border-radius: 10px; padding: 8px 12px; margin-top: 12px; }
           .captions .line { margin: 4px 0; }
           .captions .partial { color: var(--muted); }
+          .hint { color: var(--muted); font-size: 13px; }
+          .videos { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 12px; }
+          .videos:empty { display: none; }
+          .tile { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+          .tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+          .tile.screen video { object-fit: contain; }
+          .tile.mirror video { transform: scaleX(-1); }
+          .tile .label { position: absolute; left: 6px; bottom: 6px; font-size: 12px; color: #fff; background: #0008; padding: 1px 6px; border-radius: 4px; }
+          .tile .paused { position: absolute; inset: 0; display: none; place-items: center; color: #fff; background: #222; font-size: 13px; }
+          .tile.muted .paused { display: grid; }
         </style>
         <script type="importmap">
           {"imports": {
@@ -215,6 +234,11 @@ defmodule Call.CallLive do
     {:noreply, socket}
   end
 
+  def handle_event("toggle_video", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
+    Octoroom.Room.update_meta(socket.assigns.room, me, &%{&1 | video: not &1.video})
+    {:noreply, socket}
+  end
+
   def handle_event("flush_echo", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
     Octoroom.Worker.send(socket.assigns.room, "echo:#{me}", :flush)
     {:noreply, socket}
@@ -246,9 +270,18 @@ defmodule Call.CallLive do
         {:error, :no_room} -> {[], [], %{}, %{}}
       end
 
+    labels = [
+      {"mic", ""},
+      {"camera", "’s camera"},
+      {"screen", "’s screen"},
+      {"screen_audio", "’s screen audio"},
+      {"echo", "’s echo"}
+    ]
+
     names =
-      Map.new(participants, &{"#{&1.id}/mic", &1.meta.name})
-      |> Map.merge(Map.new(participants, &{"#{&1.id}/echo", "#{&1.meta.name}’s echo"}))
+      for(p <- participants, {track, suffix} <- labels, into: %{}) do
+        {"#{p.id}/#{track}", p.meta.name <> suffix}
+      end
       |> Map.put("metronome", "metronome")
 
     stats = Map.new(outputs, fn {name, _} -> {name, Octoroom.Outlet.stats(room, name)} end)
@@ -262,7 +295,8 @@ defmodule Call.CallLive do
       stats: stats,
       assigns: assigns,
       names: names,
-      my_echo: me != nil and me.meta.echo
+      my_echo: me != nil and me.meta.echo,
+      my_video: me == nil or me.meta.video
     )
   end
 
@@ -332,11 +366,26 @@ defmodule Call.CallLive do
       <div id="call" class="controls" phx-hook="Call" phx-update="ignore" data-room={@room}>
         <input id="name" type="text" placeholder="Your name" />
         <label><input id="tone" type="checkbox" /> test tone instead of mic</label>
+        <label><input id="pattern" type="checkbox" /> test pattern instead of camera</label>
+        <label><input id="join-camera" type="checkbox" /> join with camera</label>
         <button id="join">Join call</button>
         <button id="mute" class="secondary" disabled>Mute</button>
+        <button id="camera" class="secondary" disabled>Camera on</button>
+        <button id="pause" class="secondary" disabled>Pause video</button>
+        <button id="screen" class="secondary" disabled>Share screen</button>
         <button id="leave" class="secondary" disabled>Leave</button>
         <div id="status">Not in the call.</div>
       </div>
+
+      <div class="controls workers">
+        <strong>Video</strong>
+        <button phx-click="toggle_video" disabled={@me == nil}>
+          {if @my_video, do: "Receive video: on", else: "Receive video: off"}
+        </button>
+        <span class="hint">Off: the server stops pulling cameras and screens into your session.</span>
+      </div>
+
+      <div id="videos" class="videos" phx-update="ignore"></div>
 
       <div class="controls workers">
         <strong>Mic check</strong>
@@ -374,13 +423,21 @@ defmodule Call.CallLive do
       <table :if={@participants != []}>
         <thead>
           <tr>
-            <th>Participant</th><th>Mic</th><th>Level</th><th>Hears</th>
+            <th>Participant</th><th>Publishes</th><th>Level</th><th>Hears</th>
           </tr>
         </thead>
         <tbody>
           <tr :for={p <- @participants} id={"p-#{p.id}"}>
             <td>{p.meta.name}<span :if={p.id == @me} class="you">you</span></td>
-            <td><span class={["pill", p.mic == :live && "live"]}>{p.mic}</span></td>
+            <td>
+              <span :if={p.tracks == %{}} class="pill">{p.mic}</span>
+              <span
+                :for={{source, t} <- Enum.sort(p.tracks)}
+                class={["pill", t.status == :live && not t.muted && "live"]}
+              >
+                {source}{if t.muted, do: " (muted)"}{if t.status != :live, do: " (#{t.status})"}
+              </span>
+            </td>
             <td>
               <span id={"meter-#{p.id}"} class="meter" phx-update="ignore"><span id={"level-#{p.id}"}></span></span>
             </td>

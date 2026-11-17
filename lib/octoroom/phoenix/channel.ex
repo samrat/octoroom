@@ -14,9 +14,10 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     room `"support:1234"`. The channel never calls Cloudflare: it relays SDP
     between the browser and the room server, which owns every session.
 
-    Client → server: `publish`, `connected`, `answer`, `close_offer`.
-    Server → client: `renegotiate`, `close`, `tracks`, `gain`, `room_event`,
-    `resume_token`, `republish`.
+    Client → server: `publish`, `publish_tracks`, `push_offer`, `unpublish`,
+    `mute`, `connected`, `answer`, `close_offer`.
+    Server → client: `renegotiate`, `close`, `push`, `tracks`, `gain`,
+    `room_event`, `resume_token`, `republish`.
 
     ## Resuming
 
@@ -121,6 +122,31 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       {:noreply, socket}
     end
 
+    def __handle_in__("publish_tracks", %{"sources" => sources}, socket) when is_list(sources) do
+      %{server: server, participant_id: id} = socket.assigns.octoroom
+      Server.publish_tracks(server, id, sources, socket_ref(socket))
+      {:noreply, socket}
+    end
+
+    def __handle_in__("push_offer", %{"sdp" => sdp, "op_id" => op_id, "mids" => mids}, socket) do
+      %{server: server, participant_id: id} = socket.assigns.octoroom
+      Server.push_offer(server, id, op_id, sdp, mids, socket_ref(socket))
+      {:noreply, socket}
+    end
+
+    def __handle_in__("unpublish", %{"source" => source}, socket) when is_binary(source) do
+      %{server: server, participant_id: id} = socket.assigns.octoroom
+      Server.unpublish(server, id, source, socket_ref(socket))
+      {:noreply, socket}
+    end
+
+    def __handle_in__("mute", %{"source" => source, "muted" => muted}, socket)
+        when is_binary(source) and is_boolean(muted) do
+      %{server: server, participant_id: id} = socket.assigns.octoroom
+      Server.mute(server, id, source, muted)
+      {:reply, :ok, socket}
+    end
+
     def __handle_in__("connected", _payload, socket) do
       %{server: server, participant_id: id} = socket.assigns.octoroom
       Server.connected(server, id)
@@ -164,7 +190,7 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     def __handle_info__({:octoroom_signal, kind, payload}, socket)
-        when kind in [:renegotiate, :close, :tracks, :gain, :republish] do
+        when kind in [:renegotiate, :close, :push, :tracks, :gain, :republish] do
       push(socket, Atom.to_string(kind), payload)
       {:noreply, socket}
     end

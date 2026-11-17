@@ -12,8 +12,10 @@ defmodule Octoroom do
   `{:octoroom, room_id, event}` messages, where `event` is one of:
 
     * `{:joined, participant}` and `{:left, participant}`
-    * `{:updated, participant}`: its metadata changed
-    * `{:published, participant}`: its mic is live at Cloudflare
+    * `{:updated, participant}`: its metadata changed, or a source it
+      publishes was muted, unmuted or unpublished (see its `tracks`)
+    * `{:published, participant}`: a source it publishes (mic, camera,
+      screen) is live at Cloudflare
     * `{:subscriptions, participant_id, track_names}`: what it now hears
   """
   def subscribe(room_id), do: Registry.register(@events, room_id, nil)

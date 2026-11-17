@@ -108,7 +108,15 @@ defmodule Octoroom.Test.FakeCloudflare do
     op(fake, :push_tracks, [session, offer, tracks], fn s ->
       s =
         Enum.reduce(tracks, s, fn t, s ->
-          put_in(s.sessions[session].tracks[t.mid], %{name: t.track_name, remote: nil})
+          s = put_in(s.sessions[session].tracks[t.mid], %{name: t.track_name, remote: nil})
+          # Pulls take mids after every pushed one.
+          used =
+            case Integer.parse(t.mid) do
+              {n, ""} -> n
+              _ -> 0
+            end
+
+          update_in(s.sessions[session].mid, &max(&1, used))
         end)
 
       {{:ok, %{sdp: "answer:#{session}"}}, s}

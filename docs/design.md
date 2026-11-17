@@ -1,6 +1,7 @@
 # Octoroom design
 
-Status: **milestones 1–5 implemented** (2026-11-17). Workers run over
+Status: **milestones 1–5 implemented** (2026-11-17), plus browser video
+(steps 1–2 of [Video](#video); see [Implementation notes (video)](#implementation-notes-video)). Workers run over
 WebRTC (milestone 4, see [Transport decision](#transport-decision-2026-11-17)
 and [Implementation notes (milestone 4)](#implementation-notes-milestone-4)),
 checked against real Cloudflare. Milestone 3 and robustness (milestone 5)
@@ -60,24 +61,10 @@ Cloudflare. The server only needs outbound UDP, which most hosts allow.
   dependency on any voice-agent library. AI participants come from
   integrations; see [AI integrations](#ai-integrations).
 - Running or self-hosting an SFU. Cloudflare is the only media plane.
-- Video in v1. Rooms carry audio only; [Video](#video) describes the plan
-  and what v1 must avoid to keep it cheap to add.
+- Video beyond browsers in v1. Browsers publish cameras and screen shares;
+  simulcast and video for workers are later steps of [Video](#video).
 - Native mobile SDKs in v1. The browser client comes first.
 - Broadcast to thousands of passive listeners. HLS or MoQ fit that better.
-
-## Independence from Subvocal
-
-Octoroom starts in the Subvocal repository and will move to its own. Rules
-until then:
-
-- No dependency on Subvocal, in either direction, at the code level. Octoroom
-  must compile and test on its own (`cd octoroom && mix test`).
-- Code taken from Subvocal's Cloudflare SFU transport is **copied and
-  renamed**, not shared. The pieces worth porting are listed in
-  [Prior work](#prior-work).
-- Names, env vars and config keys use the `octoroom` / `OCTOROOM_` prefix.
-- Subvocal agents join rooms through an adapter that lives in Subvocal (or in
-  a small `octoroom_subvocal` package). Octoroom never mentions Subvocal.
 
 ## Developer experience
 
@@ -105,12 +92,12 @@ over UDP and fails with a clear error if it can't (see
 
 ### The room callbacks
 
-| Callback | Required | Default | Answers |
-| --- | --- | --- | --- |
-| `join(params, socket)` | yes | | May this client join, and with what metadata? |
-| `mount(room_id)` | no | `{:ok, %{}}` | Runs once when the room process starts. Returns the room's assigns. |
-| `workers(room)` | no | `[]` | Which server-side participants should be running now? |
-| `subscriptions(listener, room)` | no | `default_subscriptions(listener, room)` | What should this listener hear now? |
+| Callback                        | Required | Default                                 | Answers                                                             |
+| ------------------------------- | -------- | --------------------------------------- | ------------------------------------------------------------------- |
+| `join(params, socket)`          | yes      |                                         | May this client join, and with what metadata?                       |
+| `mount(room_id)`                | no       | `{:ok, %{}}`                            | Runs once when the room process starts. Returns the room's assigns. |
+| `workers(room)`                 | no       | `[]`                                    | Which server-side participants should be running now?               |
+| `subscriptions(listener, room)` | no       | `default_subscriptions(listener, room)` | What should this listener hear now?                                 |
 
 `default_subscriptions/2` returns every other participant's mic plus every
 worker output track. That's "everyone hears everyone", the equivalent of
@@ -125,13 +112,14 @@ into metadata or assigns first.
 
 Helpers imported by `use Octoroom.Room`:
 
-| Helper | Returns |
-| --- | --- |
-| `mic(participant)` | That participant's mic track. |
-| `track(name)` | A track by room-scoped name, e.g. a worker output `"alice/ja"`. |
-| `gain(track, 0.0..1.0)` | The same track, played at that volume. Applied in the listener's browser. |
-| `others(room, participant)` | Every participant except that one. |
-| `worker(id, module, opts)` | A worker spec with `inputs:`, `outputs:` and `args:`. |
+| Helper                      | Returns                                                                   |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `mic(participant)`          | That participant's mic track.                                             |
+| `camera(p)`, `screen(p)`, `screen_audio(p)` | That participant's camera, screen share and screen audio (published when it turns them on). |
+| `track(name)`               | A track by room-scoped name, e.g. a worker output `"alice/ja"`.           |
+| `gain(track, 0.0..1.0)`     | The same audio track, played at that volume. Applied in the listener's browser. Raises for video. |
+| `others(room, participant)` | Every participant except that one.                                        |
+| `worker(id, module, opts)`  | A worker spec with `inputs:`, `outputs:` and `args:`.                     |
 
 ### Example 1: a group call
 
@@ -159,7 +147,7 @@ more callback; its output track is picked up by the default subscriptions:
 ### Example 2: live interpretation
 
 Each participant picks a language. Each speaker gets one interpreter per
-*other* language in the room, and listeners hear the interpretation in their
+_other_ language in the room, and listeners hear the interpretation in their
 own language with the original voice quietly underneath.
 
 ```elixir
@@ -360,13 +348,17 @@ end
 ```
 
 ```js
-import {RoomClient} from "octoroom"
+import { RoomClient } from "octoroom";
 
-const room = new RoomClient({socket, topic: `room:${id}`, params: {lang: "ja"}})
-room.on("participants", (list) => render(list))
-await room.join()          // asks for the mic, publishes it, plays what the policy subscribes
-room.setMuted(true)
-await room.leave()
+const room = new RoomClient({
+  socket,
+  topic: `room:${id}`,
+  params: { lang: "ja" },
+});
+room.on("participants", (list) => render(list));
+await room.join(); // asks for the mic, publishes it, plays what the policy subscribes
+room.setMuted(true);
+await room.leave();
 ```
 
 For LiveView, `Octoroom.subscribe(room_id)` sends the subscribing process
@@ -375,14 +367,14 @@ For LiveView, `Octoroom.subscribe(room_id)` sends the subscribing process
 
 ## Concepts
 
-| Term | Meaning |
-| --- | --- |
-| **Room** | A named set of participants and workers, run by one `Octoroom.Room.Server` process. Created on first join and stopped when its last client leaves (configurable). |
-| **Participant** | A connected client. Has an id, the metadata from `join/2`, and the tracks it publishes (`mic` in v1). |
-| **Worker** | A server-side participant: a supervised process that receives PCM from input tracks and sends PCM to output tracks. |
-| **Track** | A room-scoped name such as `"alice/mic"` or `"alice/ja"`. Octoroom maps it to Cloudflare's `(sessionId, trackName)`. |
-| **Policy** | The room module's `workers/1` and `subscriptions/2` (or their defaults): pure functions of room state that give the desired state. |
-| **Reconciler** | Diffs desired against actual state and produces Cloudflare operations. Pure; the room server executes its output. |
+| Term            | Meaning                                                                                                                                                           |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Room**        | A named set of participants and workers, run by one `Octoroom.Room.Server` process. Created on first join and stopped when its last client leaves (configurable). |
+| **Participant** | A connected client. Has an id, the metadata from `join/2`, and the tracks it publishes (`mic` in v1).                                                             |
+| **Worker**      | A server-side participant: a supervised process that receives PCM from input tracks and sends PCM to output tracks.                                               |
+| **Track**       | A room-scoped name such as `"alice/mic"` or `"alice/ja"`. Octoroom maps it to Cloudflare's `(sessionId, trackName)`.                                              |
+| **Policy**      | The room module's `workers/1` and `subscriptions/2` (or their defaults): pure functions of room state that give the desired state.                                |
+| **Reconciler**  | Diffs desired against actual state and produces Cloudflare operations. Pure; the room server executes its output.                                                 |
 
 ## Mapping onto Cloudflare
 
@@ -400,7 +392,7 @@ model as follows.
   `ex_webrtc` peer connection to Cloudflare. The worker's inputs are pulled
   into that session (`location: "remote"`), the same call a browser
   subscription uses, and its outputs are pushed from it (`location:
-  "local"`). The room server decides what to push, pull and close; the
+"local"`). The room server decides what to push, pull and close; the
   peer makes its own session's Cloudflare calls and does the SDP
   in-process, so changing a worker's inputs costs one HTTP call and a local
   renegotiation, with no client round trip.
@@ -559,7 +551,7 @@ id comes back changed:
 
 - **Inputs changed:** inlets are added or removed (pulls into the worker's
   session opened or closed), and the worker gets `handle_info({:octoroom, :inputs, names},
-  state)`. It isn't restarted, so a recorder or a group agent can follow
+state)`. It isn't restarted, so a recorder or a group agent can follow
   people joining and leaving.
 - **Outputs changed:** outlets are added or removed. No restart.
 - **Module or args changed:** the worker is restarted. Outlets whose names
@@ -570,22 +562,27 @@ id comes back changed:
 The client holds one `RTCPeerConnection` to Cloudflare. The server tells it
 what each transceiver is.
 
-| Direction | Message | Payload |
-| --- | --- | --- |
-| join reply | | `{participant_id, ice_servers, participants, resume_token}` (no `resume_token` until milestone 4) |
+| Direction       | Message                  | Payload                                                                                                      |
+| --------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| join reply      |                          | `{participant_id, ice_servers, participants, resume_token}` (no `resume_token` until milestone 4)            |
 | client → server | join with `resume_token` | `{resume_token, mids: {mid => track}}` after a reconnect (see [Restarts and deploys](#restarts-and-deploys)) |
-| server → client | `resume_token` | a refreshed token after a metadata change |
-| server → client | `resync` | `{tracks: [{mid, track, participant_id, gain}]}` when the client's view disagreed with Cloudflare's |
-| client → server | `publish` | `{sdp: offer, mids: {mic: "0"}}` |
-| server → client | reply | `{sdp: answer}` |
-| client → server | `connected` | `{}` once the peer connection is up, so the mic is flowing and can be pulled |
-| server → client | `renegotiate` | `{sdp: offer, op_id}` (Cloudflare's offer after a pull or close) |
-| client → server | `answer` | `{sdp, op_id}` |
-| server → client | `close` | `{mids, op_id}`: stop these transceivers |
-| client → server | `close_offer` | `{sdp, op_id}`, the offer made after stopping them; the reply is `{sdp: answer}` |
-| server → client | `tracks` | `{added: [{mid, track, participant_id, gain}], removed: [mid]}` |
-| server → client | `gain` | `{mid, gain}` |
-| server → client | `room_event` | joins, leaves, speaking, worker events |
+| server → client | `resume_token`           | a refreshed token after a metadata change                                                                    |
+| server → client | `resync`                 | `{tracks: [{mid, track, participant_id, gain}]}` when the client's view disagreed with Cloudflare's          |
+| client → server | `publish`                | `{sdp: offer, mids: {mic: "0", camera: "1"}}`: creates the session |
+| server → client | reply                    | `{sdp: answer}`                                                                                              |
+| client → server | `connected`              | `{}` once the peer connection is up (and again after each `push`), so what it published is flowing and can be pulled |
+| client → server | `publish_tracks`         | `{sources: ["camera"]}` once the session exists; replied to once Cloudflare has the tracks |
+| server → client | `push`                   | `{op_id, sources}`: this session's turn to add those transceivers |
+| client → server | `push_offer`             | `{op_id, sdp, mids}`; the reply is `{sdp: answer}` |
+| client → server | `unpublish`              | `{source}`: every pull of it closes, then the server sends `close` for its mid |
+| client → server | `mute`                   | `{source, muted}`; others see `participant.tracks[source].muted` |
+| server → client | `renegotiate`            | `{sdp: offer, op_id}` (Cloudflare's offer after a pull or close)                                             |
+| client → server | `answer`                 | `{sdp, op_id}`                                                                                               |
+| server → client | `close`                  | `{mids, op_id}`: stop these transceivers                                                                     |
+| client → server | `close_offer`            | `{sdp, op_id}`, the offer made after stopping them; the reply is `{sdp: answer}`                             |
+| server → client | `tracks`                 | `{added: [{mid, track, kind, source, participant_id, gain}], removed: [mid]}` |
+| server → client | `gain`                   | `{mid, gain}`                                                                                                |
+| server → client | `room_event`             | joins, leaves, speaking, worker events                                                                       |
 
 `op_id` ties an answer to the operation that asked for it, so a late answer
 after a reconnect is rejected instead of applied to the wrong state. The
@@ -667,8 +664,9 @@ UDP) would plug in there without the worker or the room server changing.
 
 ## Video
 
-Not in v1. This section records the plan so v1 doesn't make video harder
-to add. Video falls into three parts, from cheapest to most expensive:
+Steps 1 and 2 of [Order](#order) are built (see
+[Implementation notes (video)](#implementation-notes-video)); the rest is
+the plan. Video falls into three parts, from cheapest to most expensive:
 browser-to-browser video, bandwidth control in bigger rooms, and workers
 that see or produce video.
 
@@ -708,7 +706,7 @@ tracks: %{"mic" => :live, "camera" => :pending, "screen" => :none}
   sends black frames, so the track stays pullable), not
   `replaceTrack(null)`, which stops packets and would stall new pulls (see
   `empty_track_error` in [Cloudflare constraints](#cloudflare-constraints-the-reconciler-has-to-respect)).
-  *To verify:* does a pull stay healthy when its track goes quiet after it
+  _To verify:_ does a pull stay healthy when its track goes quiet after it
   went live?
 
 Room API additions: `camera(p)` and `screen(p)` next to `mic(p)`.
@@ -764,11 +762,11 @@ end
 Most AI uses of video don't need a decoded stream. Several have cheaper
 options:
 
-| Need | Without decoding video on the server |
-| --- | --- |
+| Need                                           | Without decoding video on the server                                                                                                                                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A vision agent looks at a participant's camera | That participant's browser grabs a frame, about once a second or when the participant starts speaking, and uploads a JPEG over the channel. The worker receives it in `handle_info/2`. Vision models want snapshots, not streams. |
-| Recording | Each browser records its own tracks with `MediaRecorder` and uploads chunks. Quality depends on the client, and a crash or early leave loses the end of that participant's recording. |
-| An avatar agent | The browser draws the avatar. The worker `emit`s mouth-shape timings or animation events alongside its audio, and no video track exists. |
+| Recording                                      | Each browser records its own tracks with `MediaRecorder` and uploads chunks. Quality depends on the client, and a crash or early leave loses the end of that participant's recording.                                             |
+| An avatar agent                                | The browser draws the avatar. The worker `emit`s mouth-shape timings or animation events alongside its audio, and no video track exists.                                                                                          |
 
 The upload options have one cost: the client decides what it sends, which
 breaks [server-authoritative routing](#security) for that input. That's fine
@@ -854,17 +852,17 @@ From LiveKit's docs and the `livekit/sip` source:
     but it subscribes on each `OnTrackPublished`), decodes each one, puts
     it through an optional jitter buffer per track and into one mixer, and
     encodes the mix to G.711 or G.722 for the phone.
-  It has no routing of its own: the caller hears the whole room.
+    It has no routing of its own: the caller hears the whole room.
 - **SIP participants** have `kind = SIP` and attributes such as
   `sip.callStatus` (`dialing`, `ringing`, `automation`, `active`, `hangup`),
   `sip.phoneNumber` and `sip.trunkID`.
 - **DTMF** tones from the caller become `SipDTMF` data packets in the room;
   packets sent back are played to the phone as RFC 4733 events.
 - **Inbound trunks and dispatch rules** decide which room a call joins:
-  - *individual:* a new room per caller;
-  - *direct:* one fixed room, with an optional PIN;
-  - *callee:* a room named after the dialed number.
-  Rules can also set attributes and metadata and dispatch agents.
+  - _individual:_ a new room per caller;
+  - _direct:_ one fixed room, with an optional PIN;
+  - _callee:_ a room named after the dialed number.
+    Rules can also set attributes and metadata and dispatch agents.
 - **Outbound calls** use `CreateSIPParticipant`. **Transfers:** cold
   transfer via SIP REFER, and warm transfer with an agent's help.
   SIP REGISTER, SIPREC and video aren't supported.
@@ -902,8 +900,8 @@ to do with Cloudflare. The bridge's room side is an ordinary worker peer.
     into the bridge's peer instead of a browser's;
   - **output:** `"<id>/mic"`, a track pushed from the bridge's peer and fed
     by the caller's audio.
-  Routing stays server-authoritative, unlike LiveKit's SIP bridge, where
-  the caller hears everything.
+    Routing stays server-authoritative, unlike LiveKit's SIP bridge, where
+    the caller hears everything.
 - **Routing a call to a room.** The phone service's webhook goes to
   `Octoroom.Phone.Plug`. It checks the provider's signature, then asks the
   app's router where the call goes. This is the counterpart of `join/2` and
@@ -934,6 +932,7 @@ to do with Cloudflare. The bridge's room side is an ordinary worker peer.
 
   The plug answers with the provider's markup (TwiML `<Connect><Stream>`
   for Twilio), pointing at a stream URL with a signed, single-use token.
+
 - **Mixing.** The bridge mixes its inputs into one stream at the phone's
   rate: 8 kHz μ-law for Twilio, 16 kHz linear PCM where the provider allows.
   Each inlet already runs a jitter buffer and holds its input to real time
@@ -964,7 +963,7 @@ to do with Cloudflare. The bridge's room side is an ordinary worker peer.
   Twilio first. Wire formats differ: Twilio sends JSON with base64 μ-law at
   8 kHz, while Vonage sends binary 16 kHz linear PCM.
 - **Privacy.** Phone numbers are personal data. Unlike LiveKit's
-  *individual* dispatch rule, which puts the caller's number in the room
+  _individual_ dispatch rule, which puts the caller's number in the room
   name, Octoroom never puts numbers in room ids, track names or logs.
 
 Costs:
@@ -1008,17 +1007,17 @@ Either one keeps `kind: :phone`, the router and the policy unchanged.
 
 ## Failure and cleanup
 
-| Event | Handling |
-| --- | --- |
-| Client disconnects | The channel's `terminate` (or the room server's monitor) removes the participant. The reconciler closes its subscriptions and stops workers whose inputs are gone. Cloudflare closes the browser session on its own when ICE fails. |
-| Worker crashes | The room server restarts it with backoff. Its peer, inlets, outlets and tracks survive, so nothing at Cloudflare changes. |
-| Worker peer connection fails | The peer is restarted with a new session. Its output tracks go back to `:pending`; listeners' pulls of the old tracks are closed and re-pulled once the new ones are live. |
-| Cloudflare call fails | Retried with backoff and capped. After the cap, the operation is dropped, `{:error, ...}` is emitted to the room, and the reconciler tries again on the next trigger. |
-| Pull of a pending track times out | Shouldn't happen, because pulls wait for `:live`. If it does, the track goes back to `:pending`. |
-| Room server crashes | The room supervisor is `rest_for_one`, so workers and outlets restart with it. The new room server recovers the room as after a deploy (see [Restarts and deploys](#restarts-and-deploys)). |
-| Node restarts or deploys | See [Restarts and deploys](#restarts-and-deploys). |
-| Worker peer doesn't connect | After 10 s (or when ICE fails) it logs that workers need outbound UDP to Cloudflare and stops; the room retries with backoff and gives up after five tries, broadcasting `{:error, {:peer, worker_id}, reason}`. |
-| Leaked sessions | None to clean up. A worker's session ends when its peer connection closes, including when the node dies (Cloudflare reports it disconnected within a minute). `Octoroom.Janitor` only deletes room records no resume token can reach any more. |
+| Event                             | Handling                                                                                                                                                                                                                                       |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Client disconnects                | The channel's `terminate` (or the room server's monitor) removes the participant. The reconciler closes its subscriptions and stops workers whose inputs are gone. Cloudflare closes the browser session on its own when ICE fails.            |
+| Worker crashes                    | The room server restarts it with backoff. Its peer, inlets, outlets and tracks survive, so nothing at Cloudflare changes.                                                                                                                      |
+| Worker peer connection fails      | The peer is restarted with a new session. Its output tracks go back to `:pending`; listeners' pulls of the old tracks are closed and re-pulled once the new ones are live.                                                                     |
+| Cloudflare call fails             | Retried with backoff and capped. After the cap, the operation is dropped, `{:error, ...}` is emitted to the room, and the reconciler tries again on the next trigger.                                                                          |
+| Pull of a pending track times out | Shouldn't happen, because pulls wait for `:live`. If it does, the track goes back to `:pending`.                                                                                                                                               |
+| Room server crashes               | The room supervisor is `rest_for_one`, so workers and outlets restart with it. The new room server recovers the room as after a deploy (see [Restarts and deploys](#restarts-and-deploys)).                                                    |
+| Node restarts or deploys          | See [Restarts and deploys](#restarts-and-deploys).                                                                                                                                                                                             |
+| Worker peer doesn't connect       | After 10 s (or when ICE fails) it logs that workers need outbound UDP to Cloudflare and stops; the room retries with backoff and gives up after five tries, broadcasting `{:error, {:peer, worker_id}, reason}`.                               |
+| Leaked sessions                   | None to clean up. A worker's session ends when its peer connection closes, including when the node dies (Cloudflare reports it disconnected within a minute). `Octoroom.Janitor` only deletes room records no resume token can reach any more. |
 
 ## Restarts and deploys
 
@@ -1028,15 +1027,15 @@ browsers, and Octoroom rebuilds the rest from there.
 
 ### What survives
 
-| Piece | Lives in | When the node goes away |
-| --- | --- | --- |
-| Browser ⇄ Cloudflare media (people hearing each other) | Cloudflare | **Keeps working.** The server isn't in that path. |
-| Each browser's Cloudflare session and the tracks pulled into it | Cloudflare | Keeps working, as long as the peer connection stays up. |
-| Phoenix channel (signaling) | The node | Drops. The Phoenix JS client reconnects on its own, with backoff. |
-| Room server state: participants, track directory, operation queues | The node's memory | Lost, then rebuilt (below). |
-| Worker processes and their in-memory state | The node | Lost. Workers are restarted. |
-| Worker peer connections and their Cloudflare sessions | The node and Cloudflare | Drop. The sessions turn disconnected within a minute, so worker output tracks are dead to listeners. Nothing is left to close. |
-| Room assigns | `Octoroom.Store` | Survive. |
+| Piece                                                              | Lives in                | When the node goes away                                                                                                        |
+| ------------------------------------------------------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Browser ⇄ Cloudflare media (people hearing each other)             | Cloudflare              | **Keeps working.** The server isn't in that path.                                                                              |
+| Each browser's Cloudflare session and the tracks pulled into it    | Cloudflare              | Keeps working, as long as the peer connection stays up.                                                                        |
+| Phoenix channel (signaling)                                        | The node                | Drops. The Phoenix JS client reconnects on its own, with backoff.                                                              |
+| Room server state: participants, track directory, operation queues | The node's memory       | Lost, then rebuilt (below).                                                                                                    |
+| Worker processes and their in-memory state                         | The node                | Lost. Workers are restarted.                                                                                                   |
+| Worker peer connections and their Cloudflare sessions              | The node and Cloudflare | Drop. The sessions turn disconnected within a minute, so worker output tracks are dead to listeners. Nothing is left to close. |
+| Room assigns                                                       | `Octoroom.Store`        | Survive.                                                                                                                       |
 
 ### Recovery
 
@@ -1141,15 +1140,15 @@ v1 is single-node. Things that change for a cluster:
 
 ## Dependencies
 
-| Dep | Why | Optional |
-| --- | --- | --- |
-| `req` | Cloudflare API | no |
-| `ex_webrtc` | Worker peer connections. Its DTLS and SRTP use NIFs. | no |
-| `membrane_opus_plugin` | Only its Opus NIFs (`Membrane.Opus.{Encoder,Decoder}.Native`), for inlets and outlets. It downloads a precompiled libopus. | no |
-| `plug`, `websock_adapter` | The phone provider's webhook and stream endpoint | yes |
-| `jason` | JSON | no |
-| `phoenix`, `phoenix_pubsub` | `Octoroom.Phoenix.Channel`, room events | yes. Without them, the core still runs and events go through `Registry`. |
-| `telemetry` | Metrics for Cloudflare calls, reconcile ops and outlet underruns | no |
+| Dep                         | Why                                                                                                                        | Optional                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `req`                       | Cloudflare API                                                                                                             | no                                                                       |
+| `ex_webrtc`                 | Worker peer connections. Its DTLS and SRTP use NIFs.                                                                       | no                                                                       |
+| `membrane_opus_plugin`      | Only its Opus NIFs (`Membrane.Opus.{Encoder,Decoder}.Native`), for inlets and outlets. It downloads a precompiled libopus. | no                                                                       |
+| `plug`, `websock_adapter`   | The phone provider's webhook and stream endpoint                                                                           | yes                                                                      |
+| `jason`                     | JSON                                                                                                                       | no                                                                       |
+| `phoenix`, `phoenix_pubsub` | `Octoroom.Phoenix.Channel`, room events                                                                                    | yes. Without them, the core still runs and events go through `Registry`. |
+| `telemetry`                 | Metrics for Cloudflare calls, reconcile ops and outlet underruns                                                           | no                                                                       |
 
 The browser client is an ES module in `priv/static/octoroom.mjs`, published to
 npm later as `octoroom`.
@@ -1159,14 +1158,14 @@ npm later as `octoroom`.
 Code to port from Subvocal (`lib/subvocal/transport/cloudflare_sfu/`),
 renamed, with its tests:
 
-| Subvocal module | Becomes | Notes |
-| --- | --- | --- |
-| `CloudflareSFU.API` | `Octoroom.Cloudflare.HTTP` | Error mapping for top-level and per-track errors. |
-| `CloudflareSFU.Packet` | `Octoroom.Cloudflare.Packet` | Hand-rolled protobuf for three fields. |
-| `CloudflareSFU.AdapterSocket`, `.Plug` | `Octoroom.Adapter.Socket`, `Octoroom.Plug` | Ingest sockets need `timeout: :infinity`. |
-| `CloudflareSFU.Audio` | `Octoroom.Audio` | Generalize to any rate and channel count a worker asks for. |
-| `CloudflareSFU` (signaling) | Room server and reconciler | The single-peer logic becomes multi-peer; the ingest "wait for first frames" handshake becomes track status. |
-| `subvocal.mjs` `connectCloudflare` | `octoroom.mjs` | Full-SDP gathering with no trickle, plus timeouts. |
+| Subvocal module                        | Becomes                                    | Notes                                                                                                        |
+| -------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `CloudflareSFU.API`                    | `Octoroom.Cloudflare.HTTP`                 | Error mapping for top-level and per-track errors.                                                            |
+| `CloudflareSFU.Packet`                 | `Octoroom.Cloudflare.Packet`               | Hand-rolled protobuf for three fields.                                                                       |
+| `CloudflareSFU.AdapterSocket`, `.Plug` | `Octoroom.Adapter.Socket`, `Octoroom.Plug` | Ingest sockets need `timeout: :infinity`.                                                                    |
+| `CloudflareSFU.Audio`                  | `Octoroom.Audio`                           | Generalize to any rate and channel count a worker asks for.                                                  |
+| `CloudflareSFU` (signaling)            | Room server and reconciler                 | The single-peer logic becomes multi-peer; the ingest "wait for first frames" handshake becomes track status. |
+| `subvocal.mjs` `connectCloudflare`     | `octoroom.mjs`                             | Full-SDP gathering with no trickle, plus timeouts.                                                           |
 
 `Octoroom.Cloudflare.Packet`, `Octoroom.Adapter.Socket` and `Octoroom.Plug`
 were ported for milestones 1–3 and go away in milestone 4. For the peer,
@@ -1221,7 +1220,7 @@ Milestone 3 (workers):
 - **Inlets are processes**, one per (worker, live input), under the room's
   media supervisor next to the outlets. An inlet owns its egress adapter's
   socket and forwards frames to the worker by registered name, so a
-  restarted worker picks up the same streams: egress adapters are *not*
+  restarted worker picks up the same streams: egress adapters are _not_
   recreated when a worker crashes (the draft said they would be).
 - **The room server restarts crashed workers**, not a supervisor's restart
   strategy. Workers are temporary children of the room's workers
@@ -1277,15 +1276,15 @@ Milestone 3 (workers):
 `examples/call` on a Mac, reached through a `cloudflared` quick tunnel, with
 the built-in browser joining with the test tone. One run:
 
-| Check | Result |
-| --- | --- |
-| Echo goes live, only its owner hears it | Yes: pulled into the owner's session once its first frame was sent. |
-| Echo delay | 2.45–2.58 s, from beep onsets on the mic against the echo (2 s + ~500 ms). Muting left exactly two echo beeps in flight. |
-| Flush | No echo for 2.8 s after flushing, as expected when the 2 s held is dropped. |
-| Pacing | Metronome: 1,499 frames in 30.0 s, then 10,314 frames over ~3.4 min with the queue flat at 80 ms. Underruns: 27 in the first 20 s, then one more every couple of minutes. |
-| Recorder | Valid 16 kHz mono WAV, 220.5 s; kept writing through every other change. |
-| Worker crash | Killed the echo worker: restarted after the 0.5 s backoff, same mids in the browser, 0 renegotiations, output stayed live (underruns +5 during the gap). |
-| Cleanup | Open adapter WebSockets through the tunnel: 4 → 2 after Echo off → 0 after leaving, and still 0 after 20 s. Cloudflare dialed each adapter once and never redialed. |
+| Check                                   | Result                                                                                                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Echo goes live, only its owner hears it | Yes: pulled into the owner's session once its first frame was sent.                                                                                                       |
+| Echo delay                              | 2.45–2.58 s, from beep onsets on the mic against the echo (2 s + ~500 ms). Muting left exactly two echo beeps in flight.                                                  |
+| Flush                                   | No echo for 2.8 s after flushing, as expected when the 2 s held is dropped.                                                                                               |
+| Pacing                                  | Metronome: 1,499 frames in 30.0 s, then 10,314 frames over ~3.4 min with the queue flat at 80 ms. Underruns: 27 in the first 20 s, then one more every couple of minutes. |
+| Recorder                                | Valid 16 kHz mono WAV, 220.5 s; kept writing through every other change.                                                                                                  |
+| Worker crash                            | Killed the echo worker: restarted after the 0.5 s backoff, same mids in the browser, 0 renegotiations, output stayed live (underruns +5 during the gap).                  |
+| Cleanup                                 | Open adapter WebSockets through the tunnel: 4 → 2 after Echo off → 0 after leaving, and still 0 after 20 s. Cloudflare dialed each adapter once and never redialed.       |
 
 Findings:
 
@@ -1321,13 +1320,13 @@ with `examples/call` run as a named node (so its room state could be read
 over RPC), two built-in-browser tabs sending the test tone, and a
 `cloudflared` quick tunnel for the adapters.
 
-| Question | Answer |
-| --- | --- |
-| Does `GET /sessions/:id` return enough to adopt a session? | **Yes.** Each track has `location` (`local` for a push, `remote` for a pull), `trackName`, `mid` and `status` (`active`/`inactive`); a pull also has the source `sessionId`. That's everything the room server keeps per subscription. |
+| Question                                                   | Answer                                                                                                                                                                                                                                                                                                            |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Does `GET /sessions/:id` return enough to adopt a session? | **Yes.** Each track has `location` (`local` for a push, `remote` for a pull), `trackName`, `mid` and `status` (`active`/`inactive`); a pull also has the source `sessionId`. That's everything the room server keeps per subscription.                                                                            |
 | How long does a browser session survive with no API calls? | **As long as its peer connection.** After the node was stopped, a session was still `active` 11 minutes later with no API calls, and the browser kept sending audio the whole time. Another participant's two browsers kept hearing each other until one of them left. A pull whose source left turns `inactive`. |
-| What happens to a session whose peer connection closed? | `GET` answers `session_error`, "Session appears to be disconnected", within a minute. Recovery can treat that as "this participant is gone". |
-| When an adapter's WebSocket drops, does Cloudflare redial? | **Briefly.** After `kill -9` of the node, Cloudflare redialed both adapters (an echo's ingest and egress) every 1–3 s for ~14 s, then stopped. The ingest adapter's session answered `session_error` (disconnected) at once, so its output track is dead to listeners. |
-| Can we tell whether a dead adapter is still billed? | **No.** `POST /adapters/websocket/close` answers 200 with the ids echoed back for adapters already dropped *and* for an id that never existed. |
+| What happens to a session whose peer connection closed?    | `GET` answers `session_error`, "Session appears to be disconnected", within a minute. Recovery can treat that as "this participant is gone".                                                                                                                                                                      |
+| When an adapter's WebSocket drops, does Cloudflare redial? | **Briefly.** After `kill -9` of the node, Cloudflare redialed both adapters (an echo's ingest and egress) every 1–3 s for ~14 s, then stopped. The ingest adapter's session answered `session_error` (disconnected) at once, so its output track is dead to listeners.                                            |
+| Can we tell whether a dead adapter is still billed?        | **No.** `POST /adapters/websocket/close` answers 200 with the ids echoed back for adapters already dropped _and_ for an id that never existed.                                                                                                                                                                    |
 
 Consequences for recovery (milestone 5):
 
@@ -1394,7 +1393,7 @@ connection per worker (2026-11-17). What was built, and what differs from
   `Octoroom.Cloudflare.Packet`, the adapter calls in `Octoroom.Cloudflare`,
   `public_ws_url`, adapter records in the store, and the `plug` and
   `websock_adapter` dependencies. Telemetry's `[:octoroom, :adapter,
-  :create]` became `[:octoroom, :peer, :connect]`.
+:create]` became `[:octoroom, :peer, :connect]`.
 - **Tests** use `Octoroom.Test.FakePeerMedia`: placeholder SDP, and PCM
   moved through `FakeCloudflare`, which delivers a frame pushed on a track
   to every session that pulled it.
@@ -1405,13 +1404,13 @@ connection per worker (2026-11-17). What was built, and what differs from
 one built-in-browser tab sending the test tone, checked the same way as
 milestone 3:
 
-| Check | Result |
-| --- | --- |
-| Echo delay | 2.339–2.351 s from beep onsets on the mic against the echo (9 beeps), against 2.45–2.58 s on adapters: ~110–240 ms less, as the spike's ~170 ms predicted. The round trip on top of the 2 s held is now ~340 ms. |
-| Pacing (5 min, machine idle) | Over 300.67 s of wall time the metronome sent 15,034 frames (300.68 s), queue flat at 1,040–1,060 ms, no new underruns; the recording grew 300.68 s. |
-| Worker crash | Crash my echo: restarted, 0 renegotiations in the browser, output stayed live (underruns +5 during the gap). |
-| Cleanup | Echo off: the browser closed its pull of the echo (one close), the echo's peer stopped, and its session reported disconnected. Stopping a peer now closes its connection, and a stopped node's worker sessions reported disconnected within ~6 s; before peers trapped exits, a killed one took ~40 s. |
-| Server restart | Stopped and restarted the node mid-call: the page resumed on the same peer connection; the echo and metronome came back on new sessions and were re-pulled (three offer/answer exchanges, all for worker outputs); the metronome assign survived. |
+| Check                        | Result                                                                                                                                                                                                                                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Echo delay                   | 2.339–2.351 s from beep onsets on the mic against the echo (9 beeps), against 2.45–2.58 s on adapters: ~110–240 ms less, as the spike's ~170 ms predicted. The round trip on top of the 2 s held is now ~340 ms.                                                                                       |
+| Pacing (5 min, machine idle) | Over 300.67 s of wall time the metronome sent 15,034 frames (300.68 s), queue flat at 1,040–1,060 ms, no new underruns; the recording grew 300.68 s.                                                                                                                                                   |
+| Worker crash                 | Crash my echo: restarted, 0 renegotiations in the browser, output stayed live (underruns +5 during the gap).                                                                                                                                                                                           |
+| Cleanup                      | Echo off: the browser closed its pull of the echo (one close), the echo's peer stopped, and its session reported disconnected. Stopping a peer now closes its connection, and a stopped node's worker sessions reported disconnected within ~6 s; before peers trapped exits, a killed one took ~40 s. |
+| Server restart               | Stopped and restarted the node mid-call: the page resumed on the same peer connection; the echo and metronome came back on new sessions and were re-pulled (three offer/answer exchanges, all for worker outputs); the metronome assign survived.                                                      |
 
 Findings:
 
@@ -1489,15 +1488,15 @@ Restarting the node mid-call against real Cloudflare (2026-11-17), two
 built-in-browser tabs in `examples/call` (one playing recorded speech as its
 mic, one the test tone) with an echo, the metronome and captions on:
 
-| Check | `kill -9`, 9 s down | `SIGTERM` (deploy) |
-| --- | --- | --- |
-| People keep hearing each other | Yes: both directions' inbound bytes grew steadily through the outage, no gap | Yes, through 28 s without a server (15 s of Phoenix draining sockets) |
-| Clients resume the same session | Yes, 14.3 s and 15.8 s after the kill (about 5 s after the node was back); no new peer connection | Yes; no new peer connection |
-| Renegotiations | Only for worker outputs: one close and one pull each | Same |
-| Workers come back | Echo, metronome and captioner restarted; their tracks live and re-pulled within 3 s of the resume | Same |
-| Assigns survive | Yes (`metronome`, `captions`) | Yes |
-| Nothing leaks | Previous runs' adapter records closed and gone; store holds only the current run | Every adapter closed before exit; the store kept only the room record |
-| Everyone leaves | Store empty: room record deleted, adapters closed | |
+| Check                           | `kill -9`, 9 s down                                                                               | `SIGTERM` (deploy)                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| People keep hearing each other  | Yes: both directions' inbound bytes grew steadily through the outage, no gap                      | Yes, through 28 s without a server (15 s of Phoenix draining sockets) |
+| Clients resume the same session | Yes, 14.3 s and 15.8 s after the kill (about 5 s after the node was back); no new peer connection | Yes; no new peer connection                                           |
+| Renegotiations                  | Only for worker outputs: one close and one pull each                                              | Same                                                                  |
+| Workers come back               | Echo, metronome and captioner restarted; their tracks live and re-pulled within 3 s of the resume | Same                                                                  |
+| Assigns survive                 | Yes (`metronome`, `captions`)                                                                     | Yes                                                                   |
+| Nothing leaks                   | Previous runs' adapter records closed and gone; store holds only the current run                  | Every adapter closed before exit; the store kept only the room record |
+| Everyone leaves                 | Store empty: room record deleted, adapters closed                                                 |                                                                       |
 
 Findings:
 
@@ -1509,6 +1508,73 @@ Findings:
 - **Cloudflare redials a dead adapter for ~14 s**, as the spike found: a
   node back within that window sees the previous run's egress adapters dial
   `Octoroom.Plug`, which refuses them, and recovery closes them.
+
+### Implementation notes (video)
+
+Steps 1 and 2 of [Video](#video), built 2026-11-17. Checked with the fake
+Cloudflare (`test/octoroom/video_test.exs`), against an in-page fake SFU (a
+second peer connection playing the room server's side), and against real
+Cloudflare (below).
+
+- **Publications.** A participant's single `mic` field is now `media` (its
+  session: `:none`, `:publishing`, `:adopting`, `:pending`, `:live`) plus
+  `tracks`: source => `%{status: :pending | :live | :closing, mid, muted}`.
+  The directory, adoption after a restart and ghosts all read `tracks`, and
+  every published track is named `"<id>/<source>"` at Cloudflare too, so
+  adoption finds all of a participant's sources by name. `Octoroom.Participant`
+  gains `tracks` (live sources, with `kind` and `muted`), so policies and the
+  client see what each participant publishes. `Room.state/1` keeps `mic`
+  (the mic's status) and adds `media` and `tracks`.
+- **Publishing later is server-paced.** A client can't send its own offer
+  for a new camera whenever it likes: the server may be waiting on that
+  client's answer to a pull, and each would wait on the other. So
+  `publish_tracks` only asks; the request joins the session's queue, and on
+  its turn the server sends `push` and the client offers, as `close` already
+  worked. The first `publish` (which creates the session) still carries its
+  offer, and may hold several sources.
+- **Unpublish closes pulls first.** The track leaves the directory at once,
+  so the reconciler closes everyone's pulls of it; the publisher's own close
+  waits until no participant pulls it. Whether Cloudflare minds a local
+  track closing under active pulls is unverified, so we don't ask it. The
+  client stops sending (`replaceTrack(null)`) and stops the camera right
+  away, so the camera light goes off before the bookkeeping is done.
+- **Permissions.** `join/2` metadata may carry `publish: [sources]`; without
+  it every source is allowed. Unknown sources are refused.
+- **Mute** is a flag on the publication (`{:updated, participant}`), with no
+  reconcile and no renegotiation. A restarted room adopts tracks unmuted, and
+  the client sends its mute flags again when it resumes.
+- **Client.** Remote video gets no element: `tracks()` carries a `stream`
+  for the app's own `<video>`. Audio (mic, screen audio, worker outputs)
+  still plays in hidden `<audio>` elements, and `gain/2` raises for video.
+  `default_subscriptions/2` now includes every source of every other
+  participant; sources nobody publishes are never in the directory, so they
+  cost nothing.
+
+#### Video against real Cloudflare (2026-11-17)
+
+Two tabs of `examples/call` in one Chromium, with test patterns (640×360 at
+15 fps):
+
+- Joining with mic and camera in one publish: each tab decodes the other's
+  camera at 640 px within a few seconds.
+- **Pause** (`track.enabled = false`): the subscriber kept decoding black
+  frames (74 in 5 s), its pull stayed healthy, and video came back at once
+  on resume. This answers the *To verify* under [Publications](#publications).
+- **Camera off, then on again mid-call:** the subscriber's pull closed, then
+  the new push was pulled and decoded at ~15 fps, with no
+  `empty_track_error` or retry in the log.
+- **Screen share** (a 1280×720 canvas through `publish({screen: track})`)
+  arrived at 1280 px. `getDisplayMedia` itself wasn't exercised.
+- **Receive video off/on** (a `subscriptions/2` change): the listener went
+  down to the mic alone, and back to camera and screen.
+- **Restart:** the peer connections that failed after a node kill in this
+  run were my test's fault, not Octoroom's: `lsof -ti tcp:4300 | xargs kill`
+  also killed the browser's network service, which carries WebRTC's UDP.
+  Restart checks must kill the BEAM by its pid (or
+  `lsof -ti tcp:4300 -sTCP:LISTEN`); killed that way, media keeps flowing.
+  A restart with video publications wasn't repeated.
+- Still open: how many video pulls one browser session handles before
+  simulcast (step 3) is needed.
 
 ## Milestones
 
@@ -1546,6 +1612,7 @@ Findings:
      stays live: listeners hear a gap, and browsers don't renegotiate;
    - after the toggle or a leave, Cloudflare shows the worker's adapters
      closed, so nothing keeps running or billing.
+
 4. **WebRTC worker transport** (done 2026-11-17; see
    [Implementation notes (milestone 4)](#implementation-notes-milestone-4)).
    `Octoroom.Peer` with a session per worker,

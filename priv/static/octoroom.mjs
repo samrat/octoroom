@@ -4,15 +4,30 @@
 //
 //   const room = new RoomClient({socket, topic: `room:${id}`, params: {name}})
 //   room.on("participants", (list) => render(list))
+//   room.on("tracks", (tracks) => render(tracks))   // video: element.srcObject = track.stream
 //   await room.join()   // asks for the mic, publishes it, plays what the server subscribes
 //   room.setMuted(true)
+//   await room.startCamera()          // or new RoomClient({..., video: true})
+//   await room.shareScreen()
+//   room.mute("camera", true)         // sends black frames; nothing renegotiates
+//   await room.stop("camera")
 //   await room.leave()
 //
-// One RTCPeerConnection to Cloudflare carries the mic (sendonly) and every
-// track the server pulls into this session. The server decides what this
-// client hears: it sends Cloudflare's offers (`renegotiate`), asks for
-// transceivers to be closed (`close`), and then says which mid is which
-// track (`tracks`). Signaling is serialized: one exchange at a time.
+// One RTCPeerConnection to Cloudflare carries what this client publishes
+// (sendonly: mic, camera, screen, screen_audio) and every track the server
+// pulls into this session. The server decides what this client hears: it
+// sends Cloudflare's offers (`renegotiate`), asks for transceivers to be
+// closed (`close`), and then says which mid is which track (`tracks`).
+// Publishing more later goes through the server's queue too: the server
+// asks for an offer (`push`) when it's this session's turn. Signaling is
+// serialized: one exchange at a time.
+//
+// Remote audio plays by itself. Remote video is for the app to show: each
+// entry of `tracks()` (and of the "tracks" event) has `kind` ("audio" or
+// "video"), `source` ("mic", "camera", "screen", "screen_audio", or null
+// for a worker's output), `participant_id` and a `stream` to put in a
+// <video>'s srcObject. Whether a participant's camera is muted is in
+// `participants`: `participant.tracks.camera.muted`.
 //
 // Reconnecting: the server hands out a resume token (refreshed with
 // `resume_token`). When the Phoenix socket reconnects, the channel rejoins
@@ -32,19 +47,24 @@ export class RoomClient {
    * @param {import("phoenix").Socket} options.socket a connected Phoenix socket
    * @param {string} options.topic e.g. "room:lobby"
    * @param {object} [options.params] passed to the room's join/2
-   * @param {MediaStream} [options.stream] publish this instead of asking for the mic
-   * @param {MediaTrackConstraints} [options.audio] getUserMedia audio constraints
+   * @param {MediaStream} [options.stream] publish this instead of asking for the mic; its
+   *   video track, if it has one, is published as the camera
+   * @param {MediaTrackConstraints|boolean} [options.audio] getUserMedia audio constraints
+   * @param {MediaTrackConstraints|boolean} [options.video] also publish the camera on join
    */
-  constructor({socket, topic, params = {}, stream = null, audio = true}) {
+  constructor({socket, topic, params = {}, stream = null, audio = true, video = false}) {
     this.socket = socket
     this.topic = topic
     this.params = params
     this.providedStream = stream
     this.audioConstraints = audio
+    this.videoConstraints = video
     this.listeners = {}
     this.participants = []
     this.participantId = null
-    this.remote = new Map() // mid => {mid, track, participant_id, gain, element}
+    this.remote = new Map() // mid => {mid, track, kind, source, participant_id, gain, stream, element}
+    // What this client publishes: source => {track, owned, muted, transceiver, ready}.
+    this.local = new Map()
     this.queue = Promise.resolve()
     this.state = "idle"
     this.resumeToken = null
@@ -82,6 +102,7 @@ export class RoomClient {
       this.channel = channel
       channel.on("renegotiate", (p) => this.serially(() => this.onRenegotiate(p)))
       channel.on("close", (p) => this.serially(() => this.onClose(p)))
+      channel.on("push", (p) => this.serially(() => this.onPush(p)))
       channel.on("tracks", (p) => this.serially(() => this.onTracks(p)))
       channel.on("gain", ({mid, gain}) => this.setGain(mid, gain))
       channel.on("room_event", (event) => this.onRoomEvent(event))
@@ -101,8 +122,7 @@ export class RoomClient {
       })
       this.onJoinReply(reply)
 
-      this.stream =
-        this.providedStream || (await navigator.mediaDevices.getUserMedia({audio: this.audioConstraints}))
+      await this.openLocalMedia()
 
       await this.connectMedia()
       // Closing the tab looks like a dropped connection, which the server
@@ -125,15 +145,40 @@ export class RoomClient {
     this.emit("participants", this.participants)
   }
 
+  // The mic (and the camera, with `video`) from the provided stream or
+  // getUserMedia, asking for both at once so the browser prompts once.
+  async openLocalMedia() {
+    let stream = this.providedStream
+    let owned = false
+    if (!stream) {
+      const video = this.videoConstraints || false
+      stream = await navigator.mediaDevices.getUserMedia({audio: this.audioConstraints, video})
+      owned = true
+    }
+    this.stream = stream
+    const [audio] = stream.getAudioTracks()
+    const [video] = stream.getVideoTracks()
+    if (audio) this.local.set("mic", {track: audio, owned, muted: false})
+    if (video) this.local.set("camera", {track: video, owned, muted: false})
+    if (this.local.size === 0) throw new Error("nothing to publish: no audio or video track")
+    this.emit("local", this.localTracks())
+  }
+
   onRejoined(reply) {
     this.onJoinReply(reply)
     this.emit("reconnected", {resumed: reply.resumed})
+    // A restarted server adopts the session but not the mute flags.
+    if (reply.resumed) {
+      for (const [source, entry] of this.local) {
+        if (entry.muted) this.push("mute", {source, muted: true}).catch(() => {})
+      }
+    }
     // Nothing to resume (the token expired, or the session was never
     // published): start over as a new participant.
     if (!reply.resumed && this.state === "joined") this.serially(() => this.restartMedia())
   }
 
-  // A peer connection to Cloudflare with the mic published on it.
+  // A peer connection to Cloudflare with every local source published on it.
   async connectMedia() {
     const pc = new RTCPeerConnection({iceServers: this.iceServers, bundlePolicy: "max-bundle"})
     this.pc = pc
@@ -143,21 +188,25 @@ export class RoomClient {
       if (pc.connectionState === "failed") this.emit("error", new Error("connection failed"))
     }
 
-    const [track] = this.stream.getAudioTracks()
-    const mic = pc.addTransceiver(track, {direction: "sendonly", streams: [this.stream]})
+    const entries = [...this.local]
+    for (const [, entry] of entries) entry.transceiver = addSender(pc, entry.track)
     await pc.setLocalDescription(await pc.createOffer())
     // Cloudflare takes no trickle ICE: send the offer with its candidates.
     await iceGathered(pc, ICE_GATHERING_TIMEOUT_MS)
 
-    const {sdp} = await this.push("publish", {sdp: pc.localDescription.sdp, mids: {mic: mic.mid}})
+    const mids = Object.fromEntries(entries.map(([source, entry]) => [source, entry.transceiver.mid]))
+    const {sdp} = await this.push("publish", {sdp: pc.localDescription.sdp, mids})
     await pc.setRemoteDescription({type: "answer", sdp})
     await peerConnected(pc, CONNECT_TIMEOUT_MS)
     await this.push("connected", {})
+    for (const [source, entry] of entries) {
+      if (entry.muted) this.push("mute", {source, muted: true}).catch(() => {})
+    }
   }
 
   // The server lost this client's session: publish again on a new one.
   async restartMedia() {
-    if (!this.stream) return
+    if (this.local.size === 0) return
     this.clearRemote()
     this.pc?.close()
     this.pc = null
@@ -165,10 +214,7 @@ export class RoomClient {
   }
 
   clearRemote() {
-    for (const info of this.remote.values()) {
-      info.element.srcObject = null
-      info.element.remove()
-    }
+    for (const info of this.remote.values()) removeElement(info.element)
     this.remote.clear()
     this.emit("tracks", [])
   }
@@ -178,12 +224,109 @@ export class RoomClient {
     this.teardown("left")
   }
 
+  /** Mutes or unmutes the mic. */
   setMuted(muted) {
     this.muted = muted
-    this.stream?.getAudioTracks().forEach((t) => (t.enabled = !muted))
+    if (this.local.has("mic")) this.mute("mic", muted)
+    else this.stream?.getAudioTracks().forEach((t) => (t.enabled = !muted))
   }
 
-  /** Remote tracks this client is playing: [{mid, track, participant_id, gain}]. */
+  /**
+   * Mutes or unmutes a published source. The track keeps its transceiver
+   * and keeps sending (silence, or black frames), so nothing renegotiates;
+   * other participants see `tracks[source].muted`.
+   */
+  mute(source, muted) {
+    const entry = this.local.get(source)
+    if (!entry) return
+    entry.muted = muted
+    entry.track.enabled = !muted
+    if (source === "mic") this.muted = muted
+    if (this.state === "joined") this.push("mute", {source, muted}).catch(() => {})
+    this.emit("local", this.localTracks())
+  }
+
+  /** Turns the camera on: a track you give, or one from getUserMedia with these constraints. */
+  async startCamera(trackOrConstraints = true) {
+    if (trackOrConstraints instanceof MediaStreamTrack) return this.publish({camera: trackOrConstraints})
+    const stream = await navigator.mediaDevices.getUserMedia({video: trackOrConstraints})
+    return this.publish({camera: stream.getVideoTracks()[0]}, {owned: true})
+  }
+
+  /**
+   * Shares a screen, window or tab (the browser asks which). Its audio, when
+   * the browser offers it, is published as `screen_audio`. Stopping from the
+   * browser's own "Stop sharing" button unpublishes both.
+   */
+  async shareScreen(options = {video: true, audio: true}) {
+    const stream = await navigator.mediaDevices.getDisplayMedia(options)
+    const [video] = stream.getVideoTracks()
+    const [audio] = stream.getAudioTracks()
+    const tracks = audio ? {screen: video, screen_audio: audio} : {screen: video}
+    video.addEventListener("ended", () => {
+      this.stop("screen").catch(() => {})
+      if (audio) this.stop("screen_audio").catch(() => {})
+    })
+    return this.publish(tracks, {owned: true})
+  }
+
+  /**
+   * Publishes tracks by source, e.g. `{camera: track}`, after joining. With
+   * `owned`, the tracks are stopped when unpublished.
+   */
+  async publish(tracks, {owned = false} = {}) {
+    if (this.state !== "joined") throw new Error(`can't publish while ${this.state}`)
+    const sources = Object.keys(tracks)
+    const taken = sources.find((source) => this.local.has(source))
+    if (taken) throw new Error(`${taken} is already published`)
+
+    const request = this.push("publish_tracks", {sources})
+    for (const source of sources) {
+      this.local.set(source, {track: tracks[source], owned, muted: false, ready: request})
+    }
+    this.emit("local", this.localTracks())
+
+    try {
+      await request
+    } catch (error) {
+      // The session is being published again from scratch, these included.
+      if (error.message === "republishing") return
+      for (const source of sources) {
+        const entry = this.local.get(source)
+        if (entry?.ready !== request) continue
+        this.local.delete(source)
+        if (owned) entry.track.stop()
+      }
+      this.emit("local", this.localTracks())
+      throw error
+    }
+  }
+
+  /** Stops publishing a source: everyone's pulls of it close, then its transceiver does. */
+  async stop(source) {
+    const entry = this.local.get(source)
+    if (!entry) return
+    await entry.ready?.catch(() => {})
+    if (this.local.get(source) !== entry) return
+    // Stop sending now (and turn the camera light off); the server closes
+    // the transceiver once nobody pulls the track any more.
+    entry.transceiver?.sender.replaceTrack(null).catch(() => {})
+    if (entry.owned) entry.track.stop()
+    this.local.delete(source)
+    this.emit("local", this.localTracks())
+    if (this.state === "joined") await this.push("unpublish", {source}).catch(() => {})
+  }
+
+  /** What this client publishes: {source: {track, muted}}. */
+  localTracks() {
+    return Object.fromEntries([...this.local].map(([source, {track, muted}]) => [source, {track, muted}]))
+  }
+
+  /**
+   * Remote tracks this client receives: [{mid, track, kind, source,
+   * participant_id, worker_id, gain, stream}]. Audio plays by itself; put a
+   * video's `stream` in a <video>'s srcObject.
+   */
   tracks() {
     return [...this.remote.values()].map(({element, ...info}) => info)
   }
@@ -199,8 +342,8 @@ export class RoomClient {
     stats.forEach((s) => {
       if (s.type === "inbound-rtp" && s.kind === "audio") {
         const info = this.remote.get(s.mid)
-        if (info) result.remote[info.participant_id] = s.audioLevel ?? 0
-      } else if (s.type === "media-source" && s.kind === "audio") {
+        if (info?.source === "mic") result.remote[info.participant_id] = s.audioLevel ?? 0
+      } else if (s.type === "media-source" && s.kind === "audio" && s.trackIdentifier === this.local.get("mic")?.track.id) {
         result.local = s.audioLevel ?? 0
       }
     })
@@ -219,6 +362,35 @@ export class RoomClient {
     await pc.setRemoteDescription({type: "offer", sdp})
     await pc.setLocalDescription(await pc.createAnswer())
     await this.push("answer", {op_id, sdp: pc.localDescription.sdp})
+  }
+
+  // The server's turn for this client to publish more: add the sources'
+  // transceivers and offer them.
+  async onPush({op_id, sources}) {
+    const pc = this.pc
+    const added = []
+    for (const source of sources) {
+      const entry = this.local.get(source)
+      // Stopped while queued: publish nothing and let the server unpublish it.
+      const track = entry?.track.readyState === "live" ? entry.track : null
+      const kind = source === "mic" || source === "screen_audio" ? "audio" : "video"
+      const transceiver = track ? addSender(pc, track) : pc.addTransceiver(kind, {direction: "sendonly"})
+      if (entry) entry.transceiver = transceiver
+      added.push([source, transceiver])
+    }
+
+    try {
+      await pc.setLocalDescription(await pc.createOffer())
+      const mids = Object.fromEntries(added.map(([source, t]) => [source, t.mid]))
+      const {sdp} = await this.push("push_offer", {op_id, sdp: pc.localDescription.sdp, mids})
+      await pc.setRemoteDescription({type: "answer", sdp})
+    } catch (error) {
+      if (pc.signalingState === "have-local-offer") await pc.setLocalDescription({type: "rollback"})
+      for (const [, t] of added) t.stop()
+      throw error
+    }
+    // The server pulls them for others once they flow.
+    await this.push("connected", {})
   }
 
   async onClose({op_id, mids}) {
@@ -243,8 +415,7 @@ export class RoomClient {
     for (const mid of removed) {
       const info = this.remote.get(mid)
       if (info) {
-        info.element.srcObject = null
-        info.element.remove()
+        removeElement(info.element)
         this.remote.delete(mid)
       }
     }
@@ -252,15 +423,20 @@ export class RoomClient {
     for (const info of added) {
       const transceiver = this.pc.getTransceivers().find((t) => t.mid === info.mid)
       if (!transceiver) continue
-      const element = document.createElement("audio")
-      element.autoplay = true
-      element.dataset.octoroomMid = info.mid
-      element.srcObject = new MediaStream([transceiver.receiver.track])
-      element.volume = info.gain
-      element.style.display = "none"
-      document.body.appendChild(element)
-      element.play().catch(() => {})
-      this.remote.set(info.mid, {...info, element})
+      const stream = new MediaStream([transceiver.receiver.track])
+      let element = null
+      // Audio plays in a hidden element; video is for the app to show.
+      if (info.kind !== "video") {
+        element = document.createElement("audio")
+        element.autoplay = true
+        element.dataset.octoroomMid = info.mid
+        element.srcObject = stream
+        element.volume = info.gain
+        element.style.display = "none"
+        document.body.appendChild(element)
+        element.play().catch(() => {})
+      }
+      this.remote.set(info.mid, {...info, stream, element})
     }
 
     this.emit("tracks", this.tracks())
@@ -270,7 +446,7 @@ export class RoomClient {
     const info = this.remote.get(mid)
     if (!info) return
     info.gain = gain
-    info.element.volume = gain
+    if (info.element) info.element.volume = gain
     this.emit("tracks", this.tracks())
   }
 
@@ -302,7 +478,9 @@ export class RoomClient {
     this.clearRemote()
     this.pc?.close()
     this.pc = null
-    if (!this.providedStream) this.stream?.getTracks().forEach((t) => t.stop())
+    for (const entry of this.local.values()) if (entry.owned) entry.track.stop()
+    this.local.clear()
+    this.emit("local", {})
     this.stream = null
     const channel = this.channel
     this.channel = null
@@ -317,6 +495,16 @@ export class RoomClient {
     if (reason === "closed") this.emit("error", new Error("removed from the room"))
     this.setState("idle")
   }
+}
+
+function addSender(pc, track) {
+  return pc.addTransceiver(track, {direction: "sendonly", streams: [new MediaStream([track])]})
+}
+
+function removeElement(element) {
+  if (!element) return
+  element.srcObject = null
+  element.remove()
 }
 
 function iceGathered(pc, timeoutMs) {

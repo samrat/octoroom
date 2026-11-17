@@ -164,7 +164,7 @@ defmodule Octoroom.Reconciler do
 
   @doc "A policy result entry as a track: a name means full gain."
   def normalize(%Track{} = track), do: track
-  def normalize(name) when is_binary(name), do: %Track{name: name}
+  def normalize(name) when is_binary(name), do: Track.new(name)
 
   defp rank({:close_subscription, _, _}), do: 0
   defp rank({:open_subscription, _, _, _}), do: 1

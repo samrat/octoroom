@@ -28,6 +28,18 @@ defmodule Octoroom.Room.Server do
   # when its worker has no media left; its session ends with its peer
   # connection, so nothing at Cloudflare needs closing.
   #
+  # Publishing: a participant's first `publish` creates its session and
+  # pushes the sources in its offer (usually the mic, maybe the camera).
+  # Sources published later (a camera turned on, a screen share) and
+  # unpublished go through the same per-session queue as pulls and closes:
+  #
+  # Push:    `publish_tracks` -> `:push` to the browser -> the browser adds
+  #          transceivers and sends an offer -> Cloudflare `tracks/new`
+  #          (local) -> answer to the browser -> `connected` once it flows.
+  # Unpush:  `unpublish` -> the track leaves the directory, so pulls of it
+  #          close -> once none are left, `:close` of its mid to the
+  #          browser, as for a pull.
+  #
   # Messages to a participant's process (its channel) are
   # `{:octoroom_signal, kind, payload}`; replies to its requests are
   # `{:octoroom_signal, :reply, tag, result}`.
@@ -36,10 +48,9 @@ defmodule Octoroom.Room.Server do
 
   require Logger
 
-  alias Octoroom.{Cloudflare, Inlet, Outlet, Participant, Peer, Reconciler, Room, Store}
+  alias Octoroom.{Cloudflare, Inlet, Outlet, Participant, Peer, Reconciler, Room, Store, Track}
   alias Octoroom.Worker
 
-  @mic "mic"
   @max_failures 5
   @signal_timeout 15_000
   # How long a participant whose connection dropped is kept, and how long a
@@ -82,11 +93,34 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  @doc "Publishes the participant's mic from its offer. Replies `%{sdp: answer}`."
+  @doc """
+  Creates the participant's session and publishes the sources in its offer
+  (`mids`: source => mid, e.g. `%{"mic" => "0"}`). Replies `%{sdp: answer}`.
+  """
   def publish(server, participant_id, sdp, mids, tag),
     do: GenServer.cast(server, {:publish, participant_id, sdp, mids, tag})
 
-  @doc "The participant's connection to Cloudflare is up, so its mic is flowing."
+  @doc """
+  Publishes more sources on the participant's session. Queued: the
+  participant gets `:push` when it's their turn and answers with
+  `push_offer/6`. Replies `%{}` once Cloudflare has the tracks.
+  """
+  def publish_tracks(server, participant_id, sources, tag),
+    do: GenServer.cast(server, {:publish_tracks, participant_id, sources, tag})
+
+  @doc "The participant's offer for a `:push`, with the new transceivers' mids. Replies `%{sdp: answer}`."
+  def push_offer(server, participant_id, op_id, sdp, mids, tag),
+    do: GenServer.cast(server, {:push_offer, participant_id, op_id, sdp, mids, tag})
+
+  @doc "Stops publishing a source: closes every pull of it, then its own track. Replies `%{}` when done."
+  def unpublish(server, participant_id, source, tag),
+    do: GenServer.cast(server, {:unpublish, participant_id, source, tag})
+
+  @doc "Marks a published source muted or not. Nothing renegotiates."
+  def mute(server, participant_id, source, muted),
+    do: GenServer.cast(server, {:mute, participant_id, source, muted})
+
+  @doc "The participant's connection to Cloudflare is up, so what it published is flowing."
   def connected(server, participant_id),
     do: GenServer.cast(server, {:connected, participant_id})
 
@@ -215,7 +249,7 @@ defmodule Octoroom.Room.Server do
       # The room restarted (or this participant was dropped): adopt its
       # Cloudflare session as it is.
       nil ->
-        p = %{new_participant(id, meta, pid) | session_id: session_id, mic: :adopting}
+        p = %{new_participant(id, meta, pid) | session_id: session_id, media: :adopting}
         state = add_participant(state, p)
         cf = state.cloudflare
         run(state, id, :adopt, fn -> Cloudflare.session_state(cf, session_id) end)
@@ -255,7 +289,9 @@ defmodule Octoroom.Room.Server do
           %{
             id: p.id,
             meta: p.meta,
-            mic: p.mic,
+            media: p.media,
+            mic: mic_status(p),
+            tracks: Map.new(p.tracks, fn {src, t} -> {src, Map.take(t, [:status, :muted])} end),
             hears: for({name, %{status: :open}} <- p.subs, do: name) |> Enum.sort(),
             subscriptions:
               Map.new(p.subs, fn {name, s} -> {name, Map.take(s, [:status, :gain])} end)
@@ -291,19 +327,29 @@ defmodule Octoroom.Room.Server do
   @impl true
   def handle_cast({:publish, id, sdp, mids, tag}, state) do
     with_participant(state, id, fn
-      %{mic: :none} = p ->
-        mid = mids["mic"] || mids[:mic]
-        cf = state.cloudflare
+      %{media: :none} = p ->
+        mids = Map.new(mids, fn {source, mid} -> {to_string(source), mid} end)
 
-        run(state, id, :publish, fn ->
-          with {:ok, session} <- Cloudflare.new_session(cf),
-               {:ok, %{sdp: answer}} <-
-                 Cloudflare.push_tracks(cf, session, sdp, [%{mid: mid, track_name: mic_name(id)}]) do
-            {:ok, session, answer}
-          end
-        end)
+        case check_sources(p, Map.keys(mids)) do
+          :ok ->
+            cf = state.cloudflare
 
-        put_p(state, %{p | mic: :publishing, publish_tag: tag})
+            tracks =
+              for {source, mid} <- mids, do: %{mid: mid, track_name: track_name(id, source)}
+
+            run(state, id, :publish, fn ->
+              with {:ok, session} <- Cloudflare.new_session(cf),
+                   {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
+                {:ok, session, answer}
+              end
+            end)
+
+            put_p(state, %{p | media: :publishing, publish_tag: tag, publishing: mids})
+
+          {:error, reason} ->
+            reply(p, tag, {:error, reason})
+            state
+        end
 
       p ->
         reply(p, tag, {:error, :already_published})
@@ -311,19 +357,118 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
+  def handle_cast({:publish_tracks, id, sources, tag}, state) do
+    with_participant(state, id, fn p ->
+      sources = Enum.map(sources, &to_string/1)
+
+      queued =
+        for {:push, srcs, _} <- p.requests, src <- srcs, do: src
+
+      result =
+        cond do
+          p.media != :live ->
+            {:error, :not_connected}
+
+          Enum.any?(sources, &(Map.has_key?(p.tracks, &1) or &1 in queued)) ->
+            {:error, :already_published}
+
+          true ->
+            check_sources(p, sources)
+        end
+
+      case result do
+        :ok ->
+          state
+          |> put_p(%{p | requests: p.requests ++ [{:push, Enum.uniq(sources), tag}]})
+          |> reconcile()
+
+        {:error, reason} ->
+          reply(p, tag, {:error, reason})
+          state
+      end
+    end)
+  end
+
+  def handle_cast({:push_offer, id, op_id, sdp, mids, tag}, state) do
+    with_op(state, id, op_id, :awaiting_push_offer, tag, fn p, op ->
+      cancel(op.timer)
+      mids = Map.new(mids, fn {source, mid} -> {to_string(source), mid} end)
+
+      if Enum.sort(Map.keys(mids)) == Enum.sort(op.sources) do
+        cf = state.cloudflare
+        tracks = for {source, mid} <- mids, do: %{mid: mid, track_name: track_name(id, source)}
+
+        run(state, id, {:pushed, op_id}, fn ->
+          Cloudflare.push_tracks(cf, p.session_id, sdp, tracks)
+        end)
+
+        put_p(state, %{p | op: %{op | stage: :pushing, tag: tag, timer: nil, mids: mids}})
+      else
+        reply(p, tag, {:error, :wrong_sources})
+        reply(p, op.request_tag, {:error, :wrong_sources})
+        state |> put_p(%{p | op: nil}) |> reconcile()
+      end
+    end)
+  end
+
+  def handle_cast({:unpublish, id, source, tag}, state) do
+    with_participant(state, id, fn p ->
+      source = to_string(source)
+
+      case p.tracks[source] do
+        %{status: status} = t when status in [:pending, :live] ->
+          # Out of the directory: pulls of it close, then its own track does.
+          p = %{
+            p
+            | tracks: Map.put(p.tracks, source, %{t | status: :closing}),
+              requests: p.requests ++ [{:unpush, source, tag}]
+          }
+
+          state = put_p(state, p)
+          if status == :live, do: event(state, {:updated, public(p)})
+          reconcile(state)
+
+        _ ->
+          reply(p, tag, {:error, :not_published})
+          state
+      end
+    end)
+  end
+
+  def handle_cast({:mute, id, source, muted}, state) do
+    with_participant(state, id, fn p ->
+      source = to_string(source)
+
+      case p.tracks[source] do
+        %{muted: was} = t when was != muted and is_boolean(muted) ->
+          p = put_in(p.tracks[source], %{t | muted: muted})
+          state = put_p(state, p)
+          if t.status == :live, do: event(state, {:updated, public(p)})
+          state
+
+        _ ->
+          state
+      end
+    end)
+  end
+
   def handle_cast({:connected, id}, state) do
-    with_participant(state, id, fn
-      %{mic: :pending} = p ->
-        p = %{p | mic: :live}
+    with_participant(state, id, fn p ->
+      pending = for {source, %{status: :pending}} <- p.tracks, do: source
+
+      if p.media == :pending or pending != [] do
+        media = if p.media == :pending, do: :live, else: p.media
+        tracks = Enum.reduce(pending, p.tracks, &put_in(&2[&1].status, :live))
+        p = %{p | media: media, tracks: tracks}
         state = put_p(state, p)
-        # Earlier pulls of this track may have failed while it was empty.
-        name = mic_name(id)
-        failures = Map.reject(state.failures, fn {{_, n}, _} -> n == name end)
+        # Earlier pulls of these tracks may have failed while they were empty.
+        names = MapSet.new(pending, &track_name(id, &1))
+        failures = Map.reject(state.failures, fn {{_, n}, _} -> MapSet.member?(names, n) end)
         event(state, {:published, public(p)})
         reconcile(%{state | failures: failures})
-
-      _ ->
+      else
         state
+      end
     end)
   end
 
@@ -489,19 +634,38 @@ defmodule Octoroom.Room.Server do
 
   defp handle_result(state, p, :publish, {:ok, session, answer}) do
     reply(p, p.publish_tag, {:ok, %{sdp: answer}})
-    p = %{p | session_id: session, mic: :pending, publish_tag: nil}
+
+    tracks =
+      Map.new(p.publishing, fn {source, mid} ->
+        {source, %{status: :pending, mid: mid, muted: false}}
+      end)
+
+    p = %{
+      p
+      | session_id: session,
+        media: :pending,
+        publish_tag: nil,
+        publishing: %{},
+        tracks: tracks
+    }
+
     signal(p, :resume, resume_data(p))
     {:noreply, put_p(state, p)}
   end
 
-  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:ok, %{tracks: tracks}}) do
-    mic = mic_name(p.id)
+  defp handle_result(state, %{media: :adopting} = p, :adopt, {:ok, %{tracks: tracks}}) do
+    published =
+      for %{location: :local, mid: mid} = t <- tracks,
+          {id, source} <- [Track.parse(t.track_name)],
+          id == p.id,
+          into: %{},
+          do: {source, %{status: :live, mid: mid, muted: false}}
 
-    case Enum.find(tracks, &(&1.location == :local and &1.track_name == mic)) do
-      nil ->
-        republish(state, p, :no_mic)
+    case published do
+      empty when empty == %{} ->
+        republish(state, p, :nothing_published)
 
-      _local ->
+      _ ->
         remote = for %{location: :remote, mid: mid} = t <- tracks, mid != nil, do: t
 
         subs =
@@ -510,7 +674,7 @@ defmodule Octoroom.Room.Server do
             {name, %{status: :open, gain: 1.0, mid: t.mid, stale: stale}}
           end)
 
-        # Pulls of mics whose owners haven't resumed yet are held during the
+        # Pulls of tracks whose owners haven't resumed yet are held during the
         # grace period, so nobody hears a gap while everyone comes back.
         ghosts =
           if state.recovering do
@@ -525,8 +689,9 @@ defmodule Octoroom.Room.Server do
             state.ghosts
           end
 
-        p = %{p | mic: :live, subs: subs}
-        state = %{state | ghosts: Map.delete(ghosts, mic)}
+        p = %{p | media: :live, tracks: published, subs: subs}
+        own = for {source, _} <- published, do: track_name(p.id, source)
+        state = %{state | ghosts: Map.drop(ghosts, own)}
         state = put_p(state, p)
 
         signal(p, :tracks, %{
@@ -541,16 +706,38 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:error, :disconnected}),
+  defp handle_result(state, %{media: :adopting} = p, :adopt, {:error, :disconnected}),
     do: republish(state, p, :disconnected)
 
-  defp handle_result(state, %{mic: :adopting} = p, :adopt, {:error, reason}),
+  defp handle_result(state, %{media: :adopting} = p, :adopt, {:error, reason}),
     do: kick(state, p, {:resume_failed, reason})
 
   defp handle_result(state, p, :publish, {:error, reason}) do
     Logger.warning("Octoroom publish failed for #{p.id}: #{inspect(reason)}")
     reply(p, p.publish_tag, {:error, reason})
-    {:noreply, put_p(state, %{p | mic: :none, publish_tag: nil})}
+    {:noreply, put_p(state, %{p | media: :none, publish_tag: nil, publishing: %{}})}
+  end
+
+  defp handle_result(state, %{op: %{id: op_id} = op} = p, {:pushed, op_id}, result) do
+    case result do
+      {:ok, %{sdp: answer}} ->
+        reply(p, op.tag, {:ok, %{sdp: answer}})
+        reply(p, op.request_tag, {:ok, %{}})
+
+        tracks =
+          Enum.reduce(op.mids, p.tracks, fn {source, mid}, tracks ->
+            Map.put(tracks, source, %{status: :pending, mid: mid, muted: false})
+          end)
+
+        # Live once the browser says it's flowing (`connected`).
+        {:noreply, state |> put_p(%{p | tracks: tracks, op: nil}) |> reconcile()}
+
+      {:error, reason} ->
+        Logger.warning("Octoroom push for #{p.id} failed: #{inspect(reason)}")
+        reply(p, op.tag, {:error, reason})
+        reply(p, op.request_tag, {:error, reason})
+        {:noreply, state |> put_p(%{p | op: nil}) |> reconcile()}
+    end
   end
 
   defp handle_result(state, %{op: %{id: op_id} = op} = p, {:pulled, op_id}, result) do
@@ -625,14 +812,17 @@ defmodule Octoroom.Room.Server do
     case result do
       {:ok, %{sdp: answer}} ->
         reply(p, op.tag, {:ok, %{sdp: answer}})
-        signal(p, :tracks, %{added: [], removed: op.mids})
-        p = %{p | subs: Map.drop(p.subs, op.names), op: nil}
+        reply(p, op.request_tag, {:ok, %{}})
+        if op.names != [], do: signal(p, :tracks, %{added: [], removed: op.mids})
+        tracks = Map.drop(p.tracks, op.local)
+        p = %{p | subs: Map.drop(p.subs, op.names), tracks: tracks, op: nil}
         state = put_p(state, p)
-        subscriptions_event(state, p)
+        if op.names != [], do: subscriptions_event(state, p)
         {:noreply, reconcile(state)}
 
       {:error, reason} ->
         reply(p, op.tag, {:error, reason})
+        reply(p, op.request_tag, {:error, reason})
         kick(state, p, {:close_failed, reason})
     end
   end
@@ -666,7 +856,7 @@ defmodule Octoroom.Room.Server do
     room = room(state)
 
     desired =
-      for %{mic: :live} = p <- participants(state), into: %{} do
+      for %{media: :live} = p <- participants(state), into: %{} do
         wanted = state.module.subscriptions(public(p), room)
         {p.id, wanted ++ held_ghosts(state, p, wanted)}
       end
@@ -676,13 +866,14 @@ defmodule Octoroom.Room.Server do
       tracks: directory(state)
     }
 
-    ops = Reconciler.diff(desired, actual)
+    ops = Reconciler.diff(desired, actual) |> Enum.group_by(&elem(&1, 1))
+    requesting = for {id, %{requests: [_ | _]}} <- state.participants, do: id
 
     state =
-      ops
-      |> Enum.group_by(&elem(&1, 1))
-      |> Enum.reduce(state, fn {id, ops}, state ->
-        apply_ops(state, state.participants[id], ops)
+      (Map.keys(ops) ++ requesting)
+      |> Enum.uniq()
+      |> Enum.reduce(state, fn id, state ->
+        apply_ops(state, state.participants[id], Map.get(ops, id, []))
       end)
 
     schedule_retry(state)
@@ -707,11 +898,61 @@ defmodule Octoroom.Room.Server do
           may_retry?(state, p.id, name),
           do: {name, opts}
 
+    request = ready_request(state, p)
+
     cond do
       p.op != nil -> put_p(state, p)
+      request != nil -> start_request(state, p, request)
       closes != [] -> start_close(state, p, closes)
       opens != [] -> start_pull(state, p, opens)
       true -> put_p(state, p)
+    end
+  end
+
+  # The participant's oldest publish or unpublish, once it can start. An
+  # unpublish waits for everyone's pulls of the track to close first.
+  defp ready_request(_state, %{media: media}) when media != :live, do: nil
+  defp ready_request(_state, %{requests: []}), do: nil
+
+  defp ready_request(state, %{requests: [{:unpush, source, _} = request | _]} = p) do
+    name = track_name(p.id, source)
+    pulled = Enum.any?(state.participants, fn {_, other} -> Map.has_key?(other.subs, name) end)
+    if not pulled, do: request
+  end
+
+  defp ready_request(_state, %{requests: [request | _]}), do: request
+
+  defp start_request(state, p, {:push, sources, tag} = request) do
+    op_id = new_id()
+    timer = timeout(state, p.id, op_id)
+    signal_request = {:push, %{op_id: op_id, sources: sources}}
+    signal(p, elem(signal_request, 0), elem(signal_request, 1))
+
+    op = %{
+      id: op_id,
+      kind: :push,
+      stage: :awaiting_push_offer,
+      sources: sources,
+      mids: %{},
+      tag: nil,
+      request_tag: tag,
+      timer: timer,
+      request: signal_request
+    }
+
+    put_p(state, %{p | requests: List.delete(p.requests, request), op: op})
+  end
+
+  defp start_request(state, p, {:unpush, source, tag} = request) do
+    p = %{p | requests: List.delete(p.requests, request)}
+
+    case p.tracks[source] do
+      %{mid: mid} ->
+        start_close(state, p, [], local: [source], mids: [mid], request_tag: tag)
+
+      nil ->
+        reply(p, tag, {:ok, %{}})
+        put_p(state, p)
     end
   end
 
@@ -747,9 +988,10 @@ defmodule Octoroom.Room.Server do
     put_p(state, %{p | subs: subs, op: op})
   end
 
-  defp start_close(state, p, names) do
+  # Closes pulls (`names`) or, with `local:`, the participant's own tracks.
+  defp start_close(state, p, names, opts \\ []) do
     op_id = new_id()
-    mids = Enum.map(names, &p.subs[&1].mid)
+    mids = Keyword.get_lazy(opts, :mids, fn -> Enum.map(names, &p.subs[&1].mid) end)
     subs = Enum.reduce(names, p.subs, fn name, subs -> put_in(subs[name].status, :closing) end)
     timer = timeout(state, p.id, op_id)
     request = {:close, %{op_id: op_id, mids: mids}}
@@ -760,8 +1002,10 @@ defmodule Octoroom.Room.Server do
       kind: :close,
       stage: :awaiting_offer,
       names: names,
+      local: Keyword.get(opts, :local, []),
       mids: mids,
       tag: nil,
+      request_tag: Keyword.get(opts, :request_tag),
       timer: timer,
       request: request
     }
@@ -1176,7 +1420,9 @@ defmodule Octoroom.Room.Server do
         if p.monitor, do: Process.demonitor(p.monitor, [:flush])
         cancel(p.disconnected)
         if p.op, do: cancel(p.op.timer)
+        if p.op, do: reply(p, Map.get(p.op, :request_tag), {:error, reason})
         if p.publish_tag, do: reply(p, p.publish_tag, {:error, reason})
+        for {_, _, tag} <- p.requests, do: reply(p, tag, {:error, reason})
 
         state = %{
           state
@@ -1214,8 +1460,16 @@ defmodule Octoroom.Room.Server do
       pid: pid,
       monitor: Process.monitor(pid),
       session_id: nil,
-      mic: :none,
+      # Its session: :none, :publishing (creating it), :adopting (after a
+      # restart), :pending (published, not yet connected) or :live.
+      media: :none,
+      # Source => %{status: :pending | :live | :closing, mid, muted}.
+      tracks: %{},
+      # The sources of a first publish in flight: source => mid.
+      publishing: %{},
       publish_tag: nil,
+      # Publishes and unpublishes waiting for the session's queue.
+      requests: [],
       subs: %{},
       op: nil,
       # The grace timer while its connection is down.
@@ -1265,7 +1519,7 @@ defmodule Octoroom.Room.Server do
 
     case p.op do
       %{request: {kind, payload}, stage: stage} = op
-      when stage in [:awaiting_answer, :awaiting_offer] ->
+      when stage in [:awaiting_answer, :awaiting_offer, :awaiting_push_offer] ->
         cancel(op.timer)
         signal(p, kind, payload)
         put_p(state, %{p | op: %{op | timer: timeout(state, p.id, op.id)}})
@@ -1275,11 +1529,24 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  # Its Cloudflare session is gone (or never had the mic): it publishes again
+  # Its Cloudflare session is gone (or published nothing): it publishes again
   # as if it had just joined.
   defp republish(state, p, reason) do
     Logger.info("Octoroom #{p.id} has to publish again: #{inspect(reason)}")
-    p = %{p | mic: :none, session_id: nil, subs: %{}, op: nil}
+    # The client publishes everything again, so queued requests are moot.
+    if p.op, do: reply(p, Map.get(p.op, :request_tag), {:error, :republishing})
+    for {_, _, tag} <- p.requests, do: reply(p, tag, {:error, :republishing})
+
+    p = %{
+      p
+      | media: :none,
+        session_id: nil,
+        tracks: %{},
+        requests: [],
+        subs: %{},
+        op: nil
+    }
+
     signal(p, :republish, %{reason: reason})
     signal(p, :resume, resume_data(p))
     {:noreply, state |> put_p(p) |> reconcile()}
@@ -1289,9 +1556,13 @@ defmodule Octoroom.Room.Server do
     for name <- Enum.sort(names) do
       sub = p.subs[name]
 
+      track = Track.new(name)
+
       %{
         mid: sub.mid,
         track: name,
+        kind: track.kind,
+        source: with({_, source} <- Track.parse(name), do: source),
         participant_id:
           owner(state, name) || (Map.has_key?(state.ghosts, name) && owner_id(name)) || nil,
         worker_id: get_in(state.outlets, [name, :worker_id]),
@@ -1300,7 +1571,36 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  defp public(p), do: %Participant{id: p.id, meta: p.meta}
+  defp public(p) do
+    tracks =
+      for {source, %{status: :live, muted: muted}} <- p.tracks, into: %{} do
+        {source, %{kind: Track.kind(source), muted: muted}}
+      end
+
+    %Participant{id: p.id, meta: p.meta, tracks: tracks}
+  end
+
+  defp mic_status(p) do
+    case p.tracks["mic"] do
+      %{status: status} -> status
+      nil when p.media in [:publishing, :adopting] -> p.media
+      nil -> :none
+    end
+  end
+
+  # Sources `p` may publish: known ones, limited by its metadata's
+  # `:publish` list when there is one.
+  defp check_sources(_p, []), do: {:error, :no_sources}
+
+  defp check_sources(p, sources) do
+    allowed = Map.get(p.meta, :publish) || Map.get(p.meta, "publish")
+
+    cond do
+      Enum.any?(sources, &(Track.kind(&1) == nil)) -> {:error, :unknown_source}
+      allowed != nil and Enum.any?(sources, &(&1 not in allowed)) -> {:error, :not_allowed}
+      true -> :ok
+    end
+  end
 
   defp room(state) do
     %Room{
@@ -1314,9 +1614,11 @@ defmodule Octoroom.Room.Server do
   # Track name => :pending | :live.
   defp directory(state) do
     mics =
-      for {id, %{mic: mic}} <- state.participants, mic in [:pending, :live], into: %{} do
-        {mic_name(id), mic}
-      end
+      for {id, p} <- state.participants,
+          {source, %{status: status}} <- p.tracks,
+          status in [:pending, :live],
+          into: %{},
+          do: {track_name(id, source), status}
 
     outputs =
       for {name, %{status: status}} <- state.outlets, status in [:pending, :live], into: %{} do
@@ -1330,10 +1632,12 @@ defmodule Octoroom.Room.Server do
   # Track name => where it lives at Cloudflare.
   defp sessions(state) do
     mics =
-      for {id, %{mic: mic, session_id: s}} <- state.participants,
-          mic in [:pending, :live],
+      for {id, %{session_id: s} = p} <- state.participants,
+          {source, %{status: status}} <- p.tracks,
+          status in [:pending, :live],
           into: %{} do
-        {mic_name(id), %{session_id: s, track_name: mic_name(id)}}
+        name = track_name(id, source)
+        {name, %{session_id: s, track_name: name}}
       end
 
     outputs =
@@ -1346,11 +1650,11 @@ defmodule Octoroom.Room.Server do
     state.ghosts |> Map.merge(outputs) |> Map.merge(mics)
   end
 
-  # The mic's room-scoped name is also its track name at Cloudflare, so a
-  # pull read back from Cloudflare says whose mic it is.
-  defp mic_name(id), do: "#{id}/#{@mic}"
+  # A published track's room-scoped name is also its track name at
+  # Cloudflare, so a pull read back from Cloudflare says whose track it is.
+  defp track_name(id, source), do: "#{id}/#{source}"
 
-  # The participant whose mic `name` is, or nil for a worker's output.
+  # The participant whose track `name` is, or nil for a worker's output.
   defp owner(state, name) do
     case owner_id(name) do
       nil -> nil
@@ -1359,14 +1663,14 @@ defmodule Octoroom.Room.Server do
   end
 
   defp owner_id(name) do
-    case String.split(name, "/") do
-      [id, @mic] -> id
-      _ -> nil
+    case Track.parse(name) do
+      {id, _source} -> id
+      nil -> nil
     end
   end
 
   # A pulled track's room name from its Cloudflare track name, and whether
-  # it's stale. Mics are named the same at Cloudflare. A worker output's
+  # it's stale. Participants' tracks are named the same at Cloudflare. A worker output's
   # session (its peer's) dies with the run that created it, so its pulls
   # are always stale after a restart.
   defp adopted_name("out-" <> encoded) do
@@ -1386,14 +1690,14 @@ defmodule Octoroom.Room.Server do
   defp held_ghosts(state, p, wanted) do
     named =
       MapSet.new(wanted, fn
-        %Octoroom.Track{name: n} -> n
+        %Track{name: n} -> n
         n when is_binary(n) -> n
       end)
 
     for {name, %{status: :open, gain: gain}} <- p.subs,
         Map.has_key?(state.ghosts, name),
         not MapSet.member?(named, name),
-        do: %Octoroom.Track{name: name, gain: gain}
+        do: %{Track.new(name) | gain: gain}
   end
 
   defp put_p(state, p), do: put_in(state.participants[p.id], p)

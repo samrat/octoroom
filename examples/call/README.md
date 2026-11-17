@@ -1,13 +1,29 @@
 # Octoroom call demo
 
-A group call with a mic check, in one LiveView page. Browsers send and
-receive audio through Cloudflare Realtime SFU; the LiveView renders what the
-room server knows: who is in the room, whose mic is live, who hears whom,
-and which workers run.
+A group video call with a mic check, in one LiveView page. Browsers send and
+receive audio and video through Cloudflare Realtime SFU; the LiveView renders
+what the room server knows: who is in the room, what each person publishes,
+who receives what, and which workers run.
 
-The room is `Call.Room` in [lib/call.ex](lib/call.ex). Everyone hears
-everyone, and three workers from [lib/workers.ex](lib/workers.ex) show what
-milestone 3 adds:
+The room is `Call.Room` in [lib/call.ex](lib/call.ex). Everyone hears and
+sees everyone:
+
+- **Camera on/off** publishes and unpublishes your camera. Turning it on
+  after joining is a new publish on the same peer connection; off closes
+  everyone's pulls of it, then its transceiver. Tick **join with camera** to
+  publish it with the mic.
+- **Pause video** mutes the camera: it keeps its transceiver and sends black
+  frames, nothing renegotiates, and others see "Video paused".
+- **Share screen** publishes a screen, window or tab, with its audio when the
+  browser offers it. The browser's own "Stop sharing" unpublishes it.
+- **Receive video: off** is a policy change, not a client setting:
+  `subscriptions/2` leaves cameras and screens out for you, so the server
+  closes those pulls and your browser stops downloading them.
+- The **Publishes** column shows each person's sources and whether they're
+  muted.
+
+Three workers from [lib/workers.ex](lib/workers.ex) show what milestone 3
+adds:
 
 - **Echo on:** a private `Call.DelayEcho` plays you back two seconds late.
   Only you hear it. **Flush my echo** drops the two seconds it holds;
@@ -43,7 +59,8 @@ mix run --no-halt
 Open <http://localhost:4300> in two tabs or browsers, and join in both.
 `/r/<name>` opens another room. Tick **test tone instead of mic** to send a
 beep at a per-tab pitch instead of your microphone (useful in one browser,
-where two mics would feed back).
+where two mics would feed back), and **test pattern instead of camera** to
+send a moving pattern with your name and a clock instead of your camera.
 
 ### Workers connect out over UDP
 
@@ -53,6 +70,13 @@ outbound UDP. `ex_webrtc` needs the system's libsrtp to build
 (`brew install srtp` on macOS, `libsrtp2-dev` on Debian/Ubuntu).
 
 ### What to check
+
+- **Video:** two tabs with test patterns: each shows the other's pattern
+  with a ticking clock. Pause, resume, camera off and on again, and screen
+  sharing should each show up in the other tab within a second, and Pause
+  should not renegotiate (no new pull in the Hears column).
+- **Receive video off:** the other person's camera disappears from your
+  Hears column and your grid; on again brings it back.
 
 - **Echo delay:** clap with your echo on; you should hear it about 2.35 s
   later (2 s plus ~350 ms for the round trip through Cloudflare and back).
