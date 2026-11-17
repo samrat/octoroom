@@ -19,12 +19,14 @@ defmodule Octoroom.Room.Server do
   #
   # Workers: the room server starts, stops and restarts workers (under the
   # room's workers supervisor) to match `workers/1`, and owns their media.
-  # Each output track has an outlet (an ingest adapter's socket owner) and
-  # each (worker, live input) an inlet (an egress adapter's socket owner),
-  # both under the room's media supervisor. Adapters are created in batches
-  # once the owning process is registered, and closed when it stops. An
-  # output track is `:pending` once its adapter exists and `:live` once its
-  # outlet has sent a frame.
+  # Each worker with media has a peer (`Octoroom.Peer`: its own Cloudflare
+  # session and peer connection), each output track an outlet and each
+  # (worker, live input) an inlet, all under the room's media supervisor.
+  # The room server tells a worker's peer what to push, pull and close, and
+  # hears back as `{:peer_result, ...}`. An output track is `:pending` once
+  # it's pushed and `:live` once its outlet has sent a packet. A peer stops
+  # when its worker has no media left; its session ends with its peer
+  # connection, so nothing at Cloudflare needs closing.
   #
   # Messages to a participant's process (its channel) are
   # `{:octoroom_signal, kind, payload}`; replies to its requests are
@@ -34,7 +36,7 @@ defmodule Octoroom.Room.Server do
 
   require Logger
 
-  alias Octoroom.{Adapter, Cloudflare, Inlet, Outlet, Participant, Reconciler, Room, Store}
+  alias Octoroom.{Cloudflare, Inlet, Outlet, Participant, Peer, Reconciler, Room, Store}
   alias Octoroom.Worker
 
   @mic "mic"
@@ -56,7 +58,8 @@ defmodule Octoroom.Room.Server do
   ## API (called by a participant's process)
 
   # Each start of a room server is a new run. The run id is the registry
-  # value, so `run/1` answers without calling the server (the janitor asks).
+  # value, so `run/1` answers without calling the server (the janitor asks
+  # whether a room is running).
   def start_link(opts) do
     room_id = Keyword.fetch!(opts, :room_id)
     run = new_id()
@@ -106,7 +109,7 @@ defmodule Octoroom.Room.Server do
     run = Keyword.fetch!(opts, :run)
     store = Keyword.get_lazy(opts, :store, &Store.config/0)
     cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
-    # So `terminate/2` closes the room's adapters when the room shuts down.
+    # So `terminate/2` runs when the room shuts down.
     Process.flag(:trap_exit, true)
 
     # A record left behind means the previous run didn't stop cleanly (a
@@ -125,7 +128,6 @@ defmodule Octoroom.Room.Server do
 
     now = Store.now()
     Store.put(store, :rooms, room_id, %{run: run, assigns: assigns, updated_at: now})
-    if previous, do: close_previous_runs(store, cf, room_id, run)
     grace_ms = Keyword.get(opts, :grace_ms, @grace_ms)
     heartbeat_ms = Keyword.get(opts, :heartbeat_ms, @heartbeat_ms)
     Process.send_after(self(), :heartbeat, heartbeat_ms)
@@ -156,16 +158,15 @@ defmodule Octoroom.Room.Server do
        signal_timeout: Keyword.get(opts, :signal_timeout, @signal_timeout),
        # Failures back off retry_base_ms * 2^n: 0.5 s, 1 s, 2 s, ...
        retry_base_ms: Keyword.get(opts, :retry_base_ms, 250),
-       public_ws_url:
-         Keyword.get_lazy(opts, :public_ws_url, fn ->
-           Application.get_env(:octoroom, :public_ws_url)
-         end),
+       # The peer connection under workers' peers (`Octoroom.Peer.Media`).
+       peer_media: Keyword.get(opts, :peer_media, Octoroom.Peer.WebRTC),
        participants: %{},
        worker_specs: [],
        workers: %{},
+       # worker id => its peer
+       peers: %{},
        outlets: %{},
        inlets: %{},
-       warned_url: false,
        order: [],
        failures: %{},
        retry: nil
@@ -269,7 +270,7 @@ defmodule Octoroom.Room.Server do
           |> Map.merge(%{
             running: running != nil,
             connected:
-              for({{id, input}, %{adapter_id: a}} <- state.inlets, id == spec.id, a, do: input)
+              for({{id, input}, %{status: :connected}} <- state.inlets, id == spec.id, do: input)
               |> Enum.sort(),
             # Input frames dropped to hold each input to real time.
             dropped:
@@ -419,8 +420,12 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  def handle_info({:adapters, requested, result}, state),
-    do: {:noreply, state |> adapters_created(requested, result) |> reconcile()}
+  def handle_info({:peer_result, worker_id, pid, result}, state) do
+    case state.peers[worker_id] do
+      %{pid: ^pid} -> {:noreply, state |> peer_result(worker_id, result) |> reconcile()}
+      _ -> {:noreply, state}
+    end
+  end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case monitored(state, ref) do
@@ -441,17 +446,22 @@ defmodule Octoroom.Room.Server do
       {:worker, id} ->
         {:noreply, state |> worker_down(id, reason) |> reconcile()}
 
+      # Started again by the reconciler, with backoff.
       {:outlet, name} ->
         Logger.warning("Octoroom outlet #{name} stopped: #{inspect(reason)}")
         {outlet, outlets} = Map.pop(state.outlets, name)
-        close_adapters(state, [{outlet.ws_id, outlet.adapter_id}])
-        {:noreply, reconcile(%{state | outlets: outlets})}
+        close_at_peer(state, outlet.worker_id, {:output, name})
+        state = fail(%{state | outlets: outlets}, :media, [{{:outlet, name}, reason}])
+        {:noreply, reconcile(state)}
 
-      {:inlet, key} ->
+      {:inlet, {worker_id, input} = key} ->
         Logger.warning("Octoroom inlet #{inspect(key)} stopped: #{inspect(reason)}")
-        {inlet, inlets} = Map.pop(state.inlets, key)
-        close_adapters(state, [{inlet.ws_id, inlet.adapter_id}])
-        {:noreply, reconcile(%{state | inlets: inlets})}
+        close_at_peer(state, worker_id, {:input, input})
+        state = %{state | inlets: Map.delete(state.inlets, key)}
+        {:noreply, reconcile(fail(state, :media, [{{:inlet, key}, reason}]))}
+
+      {:peer, worker_id} ->
+        {:noreply, state |> peer_down(worker_id, reason) |> reconcile()}
 
       nil ->
         {:noreply, state}
@@ -464,24 +474,10 @@ defmodule Octoroom.Room.Server do
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  # Workers' peers stop with the room's media supervisor; their Cloudflare
+  # sessions end with their peer connections.
   @impl true
   def terminate(reason, state) do
-    adapters =
-      for {_, %{adapter_id: id} = media} <-
-            Map.to_list(state.outlets) ++ Map.to_list(state.inlets),
-          id != nil,
-          do: {media.ws_id, id}
-
-    # Synchronously: when the node is shutting down, a task would be killed
-    # before Cloudflare hears about it. (The next run, or the janitor,
-    # closes anything left.)
-    if adapters != [] do
-      case Cloudflare.close_adapters(state.cloudflare, Enum.map(adapters, &elem(&1, 1))) do
-        :ok -> for {ws_id, _} <- adapters, do: Store.delete(state.store, :adapters, ws_id)
-        error -> Logger.warning("Octoroom couldn't close adapters: #{inspect(error)}")
-      end
-    end
-
     :telemetry.execute([:octoroom, :room, :stop], %{}, %{room_id: state.id, reason: reason})
 
     # The last participant left: nothing to recover. Otherwise (a crash, a
@@ -778,8 +774,8 @@ defmodule Octoroom.Room.Server do
   # Each failure backs off (0.5 s, 1 s, 2 s, ...) and is given up after
   # @max_failures. Keys are `{participant_id, track}` for pulls (cleared
   # when the track is published again), `{:worker, id}` for workers that
-  # failed to start or crashed, and `{:media, {:outlet | :inlet, key}}` for
-  # adapters Cloudflare refused.
+  # failed to start or crashed, and `{:media, {:outlet | :inlet | :peer, key}}`
+  # for media that failed (a pull Cloudflare refused, a peer that stopped).
   defp fail(state, id, failed) do
     now = System.monotonic_time(:millisecond)
 
@@ -847,115 +843,216 @@ defmodule Octoroom.Room.Server do
       tracks: directory(state)
     }
 
-    {state, requests} =
+    # Tracks to close at their peers, sent once it's known which peers stay:
+    # a peer that stops ends its whole session.
+    state =
       state.worker_specs
       |> Reconciler.diff_workers(actual)
-      |> Enum.reduce({state, []}, fn op, {state, requests} ->
-        apply_worker_op(op, state, requests)
-      end)
+      |> Enum.reduce(Map.put(state, :closes, []), &apply_worker_op/2)
 
-    create_adapters(state, Enum.reverse(requests))
+    {closes, state} = Map.pop(stop_idle_peers(state), :closes)
+    for {worker_id, ref} <- Enum.reverse(closes), do: close_at_peer(state, worker_id, ref)
+    state
   end
 
-  defp apply_worker_op({:stop_inlet, key}, state, requests) do
+  defp apply_worker_op({:stop_inlet, {worker_id, input} = key}, state) do
     {inlet, inlets} = Map.pop(state.inlets, key)
     stop_child(state, :media, inlet)
-    close_adapters(state, [{inlet.ws_id, inlet.adapter_id}])
-    {%{state | inlets: inlets}, requests}
+    %{state | inlets: inlets, closes: [{worker_id, {:input, input}} | state.closes]}
   end
 
-  defp apply_worker_op({:stop_outlet, name}, state, requests) do
+  defp apply_worker_op({:stop_outlet, name}, state) do
     {outlet, outlets} = Map.pop(state.outlets, name)
     stop_child(state, :media, outlet)
-    close_adapters(state, [{outlet.ws_id, outlet.adapter_id}])
-    {%{state | outlets: outlets}, requests}
+    %{state | outlets: outlets, closes: [{outlet.worker_id, {:output, name}} | state.closes]}
   end
 
-  defp apply_worker_op({:stop_worker, id}, state, requests),
-    do: {stop_worker(state, id), requests}
+  defp apply_worker_op({:stop_worker, id}, state), do: stop_worker(state, id)
+  defp apply_worker_op({:start_worker, spec}, state), do: start_worker(state, spec)
 
-  defp apply_worker_op({:start_worker, spec}, state, requests),
-    do: {start_worker(state, spec), requests}
+  defp apply_worker_op({:restart_worker, spec}, state),
+    do: state |> stop_worker(spec.id) |> start_worker(spec)
 
-  defp apply_worker_op({:restart_worker, spec}, state, requests),
-    do: {state |> stop_worker(spec.id) |> start_worker(spec), requests}
-
-  defp apply_worker_op({:update_worker, spec}, state, requests) do
+  defp apply_worker_op({:update_worker, spec}, state) do
     w = state.workers[spec.id]
     send(w.pid, {:octoroom_io, spec.inputs, spec.outputs})
-    {put_in(state.workers[spec.id].spec, spec), requests}
+    put_in(state.workers[spec.id].spec, spec)
   end
 
-  defp apply_worker_op({:start_outlet, name, worker_id}, state, requests) do
-    with {:ok, url} <- public_ws_url(state),
-         true <- may_retry?(state, :media, {:outlet, name}) do
-      ws_id = Adapter.new_id()
-      opts = %{room_id: state.id, name: name, server: self(), ws_id: ws_id}
+  defp apply_worker_op({:start_outlet, name, worker_id}, state) do
+    with true <- may_retry?(state, :media, {:outlet, name}),
+         {:ok, peer, state} <- ensure_peer(state, worker_id) do
+      opts = %{room_id: state.id, name: name, server: self()}
 
       case start_child(state, :media, {Outlet, opts}) do
         {:ok, pid} ->
+          # Track names are unique per Cloudflare session, and a worker's
+          # outputs have distinct names.
+          cf_track = "out-" <> Base.url_encode64(name, padding: false)
+          Peer.push(peer, name, cf_track, pid)
+
           outlet = %{
             pid: pid,
             monitor: Process.monitor(pid),
-            ws_id: ws_id,
             worker_id: worker_id,
-            # Track names are unique per Cloudflare session; each ingest
-            # adapter gets its own session, so any safe name will do.
-            cf_track: "out-" <> Base.url_encode64(name, padding: false),
-            adapter_id: nil,
+            cf_track: cf_track,
             session_id: nil,
             status: :creating,
             live_seen: false
           }
 
-          request = %{
-            location: "local",
-            trackName: outlet.cf_track,
-            endpoint: Adapter.url(url, :ingest, ws_id),
-            inputCodec: "pcm"
-          }
-
-          {put_in(state.outlets[name], outlet), [{{:outlet, name, ws_id}, request} | requests]}
+          put_in(state.outlets[name], outlet)
 
         {:error, reason} ->
-          {fail(state, :media, [{{:outlet, name}, reason}]), requests}
+          fail(state, :media, [{{:outlet, name}, reason}])
       end
     else
-      {:error, state} -> {state, requests}
-      false -> {state, requests}
+      false -> state
+      {:error, state} -> state
     end
   end
 
-  defp apply_worker_op({:start_inlet, {worker_id, input} = key}, state, requests) do
+  defp apply_worker_op({:start_inlet, {worker_id, input} = key}, state) do
     source = sessions(state)[input]
 
     with true <- Map.has_key?(state.workers, worker_id) and source != nil,
-         {:ok, url} <- public_ws_url(state),
-         true <- may_retry?(state, :media, {:inlet, key}) do
-      ws_id = Adapter.new_id()
-      opts = %{room_id: state.id, worker_id: worker_id, input: input, ws_id: ws_id}
+         true <- may_retry?(state, :media, {:inlet, key}),
+         {:ok, peer, state} <- ensure_peer(state, worker_id) do
+      opts = %{room_id: state.id, worker_id: worker_id, input: input}
 
       case start_child(state, :media, {Inlet, opts}) do
         {:ok, pid} ->
-          inlet = %{pid: pid, monitor: Process.monitor(pid), ws_id: ws_id, adapter_id: nil}
-
-          request = %{
-            location: "remote",
-            sessionId: source.session_id,
-            trackName: source.track_name,
-            endpoint: Adapter.url(url, :egress, ws_id),
-            outputCodec: "pcm"
-          }
-
-          {put_in(state.inlets[key], inlet), [{{:inlet, key, ws_id}, request} | requests]}
+          Peer.pull(peer, input, source, pid)
+          inlet = %{pid: pid, monitor: Process.monitor(pid), status: :pulling}
+          put_in(state.inlets[key], inlet)
 
         {:error, reason} ->
-          {fail(state, :media, [{{:inlet, key}, reason}]), requests}
+          fail(state, :media, [{{:inlet, key}, reason}])
       end
     else
-      {:error, state} -> {state, requests}
-      false -> {state, requests}
+      false -> state
+      {:error, state} -> state
     end
+  end
+
+  defp ensure_peer(state, worker_id) do
+    case state.peers[worker_id] do
+      %{pid: pid} ->
+        {:ok, pid, state}
+
+      nil ->
+        opts = %{
+          room_id: state.id,
+          worker_id: worker_id,
+          server: self(),
+          cloudflare: state.cloudflare,
+          media: state.peer_media
+        }
+
+        with true <- may_retry?(state, :media, {:peer, worker_id}),
+             {:ok, pid} <- start_child(state, :media, {Peer, opts}) do
+          peer = %{pid: pid, monitor: Process.monitor(pid)}
+          {:ok, pid, put_in(state.peers[worker_id], peer)}
+        else
+          false -> {:error, state}
+          {:error, reason} -> {:error, fail(state, :media, [{{:peer, worker_id}, reason}])}
+        end
+    end
+  end
+
+  # A worker with no inlets or outlets left doesn't need its peer. Stopping
+  # it closes its peer connection, which ends its Cloudflare session.
+  defp stop_idle_peers(state) do
+    busy =
+      MapSet.new(
+        Enum.map(state.outlets, fn {_, o} -> o.worker_id end) ++
+          Enum.map(state.inlets, fn {{worker_id, _}, _} -> worker_id end)
+      )
+
+    {idle, peers} = Map.split_with(state.peers, fn {id, _} -> not MapSet.member?(busy, id) end)
+    for {_, peer} <- idle, do: stop_child(state, :media, peer)
+    %{state | peers: peers}
+  end
+
+  defp close_at_peer(state, worker_id, ref) do
+    case state.peers[worker_id] do
+      %{pid: pid} -> Peer.close(pid, ref)
+      nil -> :ok
+    end
+  end
+
+  # A peer that connects has shown its worker's media works: earlier
+  # failures stop counting toward giving up.
+  defp peer_result(state, worker_id, :connected),
+    do: %{state | failures: Map.delete(state.failures, {:media, {:peer, worker_id}})}
+
+  defp peer_result(state, worker_id, {:pushed, name, session_id}) do
+    case state.outlets[name] do
+      %{worker_id: ^worker_id, status: :creating} = o ->
+        status = if o.live_seen, do: :live, else: :pending
+        if status == :live, do: Octoroom.broadcast(state.id, {:output_live, name})
+        failures = Map.delete(state.failures, {:media, {:outlet, name}})
+        o = %{o | session_id: session_id, status: status}
+        %{state | failures: failures, outlets: Map.put(state.outlets, name, o)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp peer_result(state, worker_id, {:pulled, input}) do
+    key = {worker_id, input}
+
+    case state.inlets[key] do
+      %{} = i ->
+        failures = Map.delete(state.failures, {:media, {:inlet, key}})
+
+        %{
+          state
+          | failures: failures,
+            inlets: Map.put(state.inlets, key, %{i | status: :connected})
+        }
+
+      nil ->
+        state
+    end
+  end
+
+  # Pulls of a track with no packets yet fail (`empty_track_error`); the
+  # inlet goes, and the reconciler starts it again after a backoff.
+  defp peer_result(state, worker_id, {:pull_failed, input, reason}) do
+    key = {worker_id, input}
+
+    case Map.pop(state.inlets, key) do
+      {nil, _} ->
+        state
+
+      {inlet, inlets} ->
+        stop_child(state, :media, inlet)
+        fail(%{state | inlets: inlets}, :media, [{{:inlet, key}, reason}])
+    end
+  end
+
+  # A peer that stopped takes its worker's media with it: the outlets and
+  # inlets go, listeners' pulls of its outputs close, and the reconciler
+  # starts it all again (with backoff, if it failed).
+  defp peer_down(state, worker_id, reason) do
+    Logger.warning("Octoroom peer of worker #{worker_id} stopped: #{inspect(reason)}")
+    {_, peers} = Map.pop(state.peers, worker_id)
+
+    {gone_outlets, outlets} =
+      Map.split_with(state.outlets, fn {_, o} -> o.worker_id == worker_id end)
+
+    {gone_inlets, inlets} = Map.split_with(state.inlets, fn {{id, _}, _} -> id == worker_id end)
+
+    for {_, media} <- Map.to_list(gone_outlets) ++ Map.to_list(gone_inlets),
+        do: stop_child(state, :media, media)
+
+    state = %{state | peers: peers, outlets: outlets, inlets: inlets}
+
+    if reason in [:normal, :shutdown],
+      do: state,
+      else: fail(state, :media, [{{:peer, worker_id}, reason}])
   end
 
   defp start_worker(state, spec) do
@@ -1029,178 +1126,6 @@ defmodule Octoroom.Room.Server do
     fail(%{state | workers: workers, failures: failures}, :worker, [{id, reason}])
   end
 
-  defp create_adapters(state, []), do: state
-
-  defp create_adapters(state, requests) do
-    cf = state.cloudflare
-    keys = Enum.map(requests, &elem(&1, 0))
-    tracks = Enum.map(requests, &elem(&1, 1))
-    server = self()
-
-    # Recorded before Cloudflare is asked, so a crash between the two leaves
-    # a record the janitor can resolve.
-    for {_kind, _key, ws_id} <- keys do
-      Store.put(state.store, :adapters, ws_id, %{
-        room_id: state.id,
-        run: state.run,
-        adapter_id: nil,
-        created_at: Store.now()
-      })
-    end
-
-    Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
-      result =
-        try do
-          Cloudflare.new_adapters(cf, tracks)
-        rescue
-          error -> {:error, {:exception, Exception.message(error)}}
-        end
-
-      send(server, {:adapters, keys, result})
-    end)
-
-    state
-  end
-
-  # Results come back in request order. An adapter whose owner stopped in
-  # the meantime is closed at once.
-  defp adapters_created(state, keys, {:ok, created}) when length(keys) == length(created) do
-    :telemetry.execute([:octoroom, :adapter, :create], %{count: length(created)}, %{
-      room_id: state.id
-    })
-
-    for {{_kind, _key, ws_id}, adapter} <- Enum.zip(keys, created) do
-      Store.put(state.store, :adapters, ws_id, %{
-        room_id: state.id,
-        run: state.run,
-        adapter_id: adapter.adapter_id,
-        created_at: Store.now()
-      })
-    end
-
-    Enum.zip(keys, created)
-    |> Enum.reduce(state, fn
-      {{:outlet, name, ws_id}, adapter}, state ->
-        case state.outlets[name] do
-          %{ws_id: ^ws_id} = o ->
-            status = if o.live_seen, do: :live, else: :pending
-            if status == :live, do: Octoroom.broadcast(state.id, {:output_live, name})
-
-            o = %{
-              o
-              | adapter_id: adapter.adapter_id,
-                session_id: adapter.session_id,
-                status: status
-            }
-
-            put_in(state.outlets[name], o)
-
-          _ ->
-            close_adapters(state, [{ws_id, adapter.adapter_id}])
-            state
-        end
-
-      {{:inlet, key, ws_id}, adapter}, state ->
-        case state.inlets[key] do
-          %{ws_id: ^ws_id} = i ->
-            put_in(state.inlets[key], %{i | adapter_id: adapter.adapter_id})
-
-          _ ->
-            close_adapters(state, [{ws_id, adapter.adapter_id}])
-            state
-        end
-    end)
-  end
-
-  defp adapters_created(state, keys, result) do
-    reason =
-      case result do
-        {:error, reason} -> reason
-        other -> {:unexpected_adapters_result, other}
-      end
-
-    Logger.warning("Octoroom couldn't create adapters: #{inspect(reason)}")
-    for {_kind, _key, ws_id} <- keys, do: Store.delete(state.store, :adapters, ws_id)
-
-    Enum.reduce(keys, state, fn
-      {:outlet, name, ws_id}, state ->
-        case state.outlets[name] do
-          %{ws_id: ^ws_id} = o ->
-            stop_child(state, :media, o)
-            state = %{state | outlets: Map.delete(state.outlets, name)}
-            fail(state, :media, [{{:outlet, name}, reason}])
-
-          _ ->
-            state
-        end
-
-      {:inlet, key, ws_id}, state ->
-        case state.inlets[key] do
-          %{ws_id: ^ws_id} = i ->
-            stop_child(state, :media, i)
-            state = %{state | inlets: Map.delete(state.inlets, key)}
-            fail(state, :media, [{{:inlet, key}, reason}])
-
-          _ ->
-            state
-        end
-    end)
-  end
-
-  # `adapters` are `{ws_id, adapter_id}`. Records are deleted once Cloudflare
-  # confirms; if it doesn't, the janitor tries again later.
-  defp close_adapters(state, adapters) do
-    case Enum.reject(adapters, fn {_, id} -> is_nil(id) end) do
-      [] ->
-        :ok
-
-      adapters ->
-        cf = state.cloudflare
-        store = state.store
-        ids = Enum.map(adapters, &elem(&1, 1))
-
-        Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
-          case Cloudflare.close_adapters(cf, ids) do
-            :ok ->
-              for {ws_id, _} <- adapters, do: Store.delete(store, :adapters, ws_id)
-
-            error ->
-              Logger.warning(
-                "Octoroom couldn't close adapters #{inspect(ids)}: #{inspect(error)}"
-              )
-          end
-        end)
-
-        :ok
-    end
-  end
-
-  # Adapters of this room's earlier runs died with their sockets. Closing
-  # them is idempotent, and the only way to be sure they aren't billed.
-  defp close_previous_runs(store, cf, room_id, run) do
-    stale =
-      for {ws_id, %{room_id: ^room_id, run: r, adapter_id: id}} <- Store.all(store, :adapters),
-          r != run,
-          do: {ws_id, id}
-
-    Task.Supervisor.start_child(Octoroom.TaskSupervisor, fn ->
-      result =
-        case for({_, id} <- stale, id != nil, do: id) do
-          [] -> :ok
-          ids -> Cloudflare.close_adapters(cf, ids)
-        end
-
-      case result do
-        :ok ->
-          for {ws_id, _} <- stale, do: Store.delete(store, :adapters, ws_id)
-
-        error ->
-          # The records stay: the janitor tries again.
-          Logger.warning("Octoroom couldn't close #{room_id}'s old adapters: #{inspect(error)}")
-      end
-    end)
-  end
-
   defp put_room_record(state) do
     Store.put(state.store, :rooms, state.id, %{
       run: state.run,
@@ -1208,19 +1133,6 @@ defmodule Octoroom.Room.Server do
       updated_at: Store.now()
     })
   end
-
-  defp public_ws_url(%{public_ws_url: url} = state) when url in [nil, ""] do
-    unless state.warned_url do
-      Logger.error(
-        "Octoroom room #{state.id} has workers with inputs or outputs, but `config :octoroom, " <>
-          "public_ws_url:` isn't set, so Cloudflare can't reach them"
-      )
-    end
-
-    {:error, %{state | warned_url: true}}
-  end
-
-  defp public_ws_url(%{public_ws_url: url}), do: {:ok, url}
 
   defp start_child(state, sup, spec) do
     DynamicSupervisor.start_child(sup_name(state, sup), spec)
@@ -1250,7 +1162,7 @@ defmodule Octoroom.Room.Server do
     end
 
     find.(state.participants, :participant) || find.(state.workers, :worker) ||
-      find.(state.outlets, :outlet) || find.(state.inlets, :inlet)
+      find.(state.outlets, :outlet) || find.(state.inlets, :inlet) || find.(state.peers, :peer)
   end
 
   ## Participants
@@ -1455,8 +1367,8 @@ defmodule Octoroom.Room.Server do
 
   # A pulled track's room name from its Cloudflare track name, and whether
   # it's stale. Mics are named the same at Cloudflare. A worker output's
-  # ingest session dies with the run that created it, so its pulls are
-  # always stale after a restart.
+  # session (its peer's) dies with the run that created it, so its pulls
+  # are always stale after a restart.
   defp adopted_name("out-" <> encoded) do
     case Base.url_decode64(encoded, padding: false) do
       {:ok, name} -> {name, true}

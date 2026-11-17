@@ -3,13 +3,12 @@ defmodule Octoroom.Room.Supervisor do
 
   # One room's processes, in `rest_for_one` order:
   #
-  #   1. DynamicSupervisor: inlets and outlets (adapter socket owners)
+  #   1. DynamicSupervisor: workers' media (peers, inlets and outlets)
   #   2. DynamicSupervisor: the developer's workers
   #   3. Octoroom.Room.Server: state, policy, reconciler, Cloudflare calls
   #
-  # The room server is last so that it stops first on shutdown: its
-  # `terminate/2` closes the room's adapters at Cloudflare while their
-  # owners still exist, instead of watching them die one by one.
+  # The room server is last so that it stops first on shutdown, instead of
+  # watching the room's media die one by one and reacting to each.
   #
   # The room server is `significant`: when it stops (its last participant
   # left, it crashed, or either supervisor before it did), the whole room

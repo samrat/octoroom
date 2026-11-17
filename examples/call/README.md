@@ -45,42 +45,24 @@ Open <http://localhost:4300> in two tabs or browsers, and join in both.
 beep at a per-tab pitch instead of your microphone (useful in one browser,
 where two mics would feed back).
 
-### Workers need a public URL
+### Workers connect out over UDP
 
-Cloudflare reaches workers by dialing WebSockets on this server
-(`Octoroom.Plug` at `/octoroom`), so it needs a public `wss://` URL. Without
-one the call works and workers run, but nobody hears them. For a try-out,
-a Cloudflare quick tunnel will do:
-
-```sh
-cloudflared tunnel --config /dev/null --protocol http2 --url http://localhost:4300
-```
-
-`--config /dev/null` matters if you have `~/.cloudflared/config.yml` for a
-named tunnel: otherwise cloudflared applies that file's ingress rules to the
-quick tunnel, and every request (Cloudflare's adapter dials included) gets
-its catch-all 404. `--protocol http2` avoids QUIC, which some networks block.
-
-Then start the app with the tunnel's host:
-
-```sh
-OCTOROOM_PUBLIC_WS_URL=wss://<random>.trycloudflare.com/octoroom mix run --no-halt
-```
-
-The tunnel makes the whole app public, including the page that creates
-Cloudflare sessions on your account; stop it when you're done.
+Each worker reaches Cloudflare through its own WebRTC peer connection,
+which this server opens: no public URL, tunnel or open port is needed, only
+outbound UDP. `ex_webrtc` needs the system's libsrtp to build
+(`brew install srtp` on macOS, `libsrtp2-dev` on Debian/Ubuntu).
 
 ### What to check
 
-- **Echo delay:** clap with your echo on; you should hear it about 2.5 s
-  later (2 s plus ~500 ms for the round trip through two adapters).
+- **Echo delay:** clap with your echo on; you should hear it about 2.35 s
+  later (2 s plus ~350 ms for the round trip through Cloudflare and back).
 - **Pacing:** with the metronome on for 5 minutes, Queued stays flat and
   Underruns stops climbing; recording for 5 minutes gives WAVs about
   5 minutes long.
 - **Restart:** Crash my echo, then speak: the echo comes back after about
   half a second, and the browser doesn't renegotiate.
-- **Cleanup:** after Echo off or leaving, the worker's adapters are closed
-  (the server logs any close that fails).
+- **Cleanup:** after Echo off or leaving, the worker's peer stops; its
+  Cloudflare session ends with its peer connection.
 - **Server restart:** with people in the call, stop the server (Ctrl-C
   twice, or `kill -9` for a crash) and start it again. Audio between people
   keeps flowing while it's down; the page says it's reconnecting, then

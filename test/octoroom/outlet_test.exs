@@ -7,13 +7,15 @@ defmodule Octoroom.OutletTest do
 
   setup do
     room_id = "outlet-#{System.unique_integer([:positive])}"
-    ws_id = Octoroom.Adapter.new_id()
-    {:ok, pid} = Outlet.start_link(%{room_id: room_id, name: "out", server: self(), ws_id: ws_id})
-    %{room_id: room_id, outlet: pid, ws_id: ws_id}
+    {:ok, pid} = Outlet.start_link(%{room_id: room_id, name: "out", server: self()})
+    %{room_id: room_id, outlet: pid}
   end
 
-  # The test plays Cloudflare's socket: it receives `{:octoroom_pcm, frame}`.
-  defp connect(ctx), do: send(ctx.outlet, {:octoroom_adapter_socket, :ingest, self()})
+  # The test is the sink: it receives `{:octoroom_pcm, frame}`.
+  defp connect(ctx) do
+    test = self()
+    send(ctx.outlet, {:octoroom_sink, {:pcm, &send(test, {:octoroom_pcm, &1})}})
+  end
 
   defp frames(n, byte \\ 1), do: :binary.copy(<<byte>>, n * @frame)
 
@@ -23,10 +25,6 @@ defmodule Octoroom.OutletTest do
     after
       timeout -> []
     end
-  end
-
-  test "registers its adapter id while it runs", ctx do
-    assert Octoroom.Adapter.lookup(:ingest, ctx.ws_id) == ctx.outlet
   end
 
   test "paces queued audio to one frame per 20 ms and reports live once", ctx do
@@ -68,7 +66,7 @@ defmodule Octoroom.OutletTest do
     assert %{queued_ms: 0} = Outlet.stats(ctx.room_id, "out")
   end
 
-  test "drops audio that comes due before Cloudflare dials in", ctx do
+  test "drops audio that comes due before it has a sink", ctx do
     Outlet.play(ctx.room_id, "out", frames(3))
     Process.sleep(80)
     assert %{dropped: 3, sent: 0, live: false} = Outlet.stats(ctx.room_id, "out")
@@ -78,5 +76,44 @@ defmodule Octoroom.OutletTest do
     Outlet.play(ctx.room_id, "out", frames(1))
     assert_receive {:octoroom_pcm, _}
     assert_receive {:outlet_live, "out", _}
+  end
+
+  # The test stands in for the peer connection: `PeerConnection.send_rtp/3`
+  # is a cast.
+  defp rtp(timeout) do
+    receive do
+      {:"$gen_cast", {:send_rtp, "track", packet, []}} -> [packet | rtp(timeout)]
+    after
+      timeout -> []
+    end
+  end
+
+  test "sends Opus over RTP, with the clock moving on across a pause", ctx do
+    send(ctx.outlet, {:octoroom_sink, {:rtp, self(), "track"}})
+
+    tone =
+      for n <- 0..959, into: <<>> do
+        s = round(8000 * :math.sin(n / 10))
+        <<s::little-signed-16, s::little-signed-16>>
+      end
+
+    Outlet.play(ctx.room_id, "out", :binary.copy(tone, 3))
+    [a, b, c] = rtp(100)
+
+    assert a.marker and not b.marker and not c.marker
+    assert b.sequence_number == rem(a.sequence_number + 1, 65_536)
+    assert b.timestamp == rem(a.timestamp + 960, 4_294_967_296)
+
+    decoder = Membrane.Opus.Decoder.Native.create(48_000, 2)
+    assert byte_size(Membrane.Opus.Decoder.Native.decode_packet(decoder, a.payload)) == @frame
+
+    # After 200 ms of nothing, the next talkspurt starts ~200 ms later on the
+    # RTP clock (48 samples per ms), marked.
+    Process.sleep(200)
+    Outlet.play(ctx.room_id, "out", tone)
+    [d] = rtp(60)
+    assert d.marker
+    assert d.sequence_number == rem(c.sequence_number + 1, 65_536)
+    assert rem(d.timestamp - c.timestamp + 4_294_967_296, 4_294_967_296) >= 200 * 48
   end
 end

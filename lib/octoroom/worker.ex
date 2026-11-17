@@ -25,7 +25,7 @@ defmodule Octoroom.Worker do
   A room starts workers from its `workers/1` callback (see
   `Octoroom.Room.worker/3`). `audio:` picks the PCM format the worker sees,
   s16le at a `rate` dividing 48 kHz and 1 or 2 `channels` (default 48 kHz
-  stereo, the adapter's own format).
+  stereo, the room's own format).
 
   Callbacks return `{:ok, state}` or `{:ok, state, actions}`, where actions
   is a keyword list of:

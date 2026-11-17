@@ -1,21 +1,20 @@
 defmodule Octoroom.Store do
   @moduledoc """
   Where Octoroom keeps what must outlive a room server or a node restart:
-  room records and adapter records. A small key-value behaviour, so it can
-  sit on ETS, Postgres or Redis.
+  room records. A small key-value behaviour, so it can sit on ETS, Postgres
+  or Redis.
 
-  Two tables:
+  One table:
 
     * `:rooms`: room id => `%{run: run_id, assigns: map, updated_at: unix_ms}`.
       Written when a room server starts and when its assigns change, deleted
       when the room stops because its last participant left. A record left
       behind means the room didn't stop cleanly, so the next room server with
-      that id recovers it.
-    * `:adapters`: a key made before the adapter exists =>
-      `%{room_id, run, adapter_id, created_at}`. Written before Cloudflare
-      is asked to create the adapter (with `adapter_id: nil`), updated with
-      Cloudflare's id, deleted once the adapter is closed. `Octoroom.Janitor`
-      closes adapters whose room or run is gone.
+      that id recovers it. `Octoroom.Janitor` deletes records whose room
+      hasn't come back within a resume token's max age.
+
+  Workers' Cloudflare sessions need no records: each ends with its peer
+  connection.
 
   The store holds no participant state: participants come back through
   their resume tokens.
@@ -25,7 +24,7 @@ defmodule Octoroom.Store do
   """
 
   @type store :: {module, keyword}
-  @type table :: :rooms | :adapters
+  @type table :: atom
 
   @doc "Child spec for the store's process, if it has one."
   @callback child_spec(keyword) :: Supervisor.child_spec() | nil

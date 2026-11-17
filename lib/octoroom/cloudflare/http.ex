@@ -7,8 +7,8 @@ defmodule Octoroom.Cloudflare.HTTP do
   Calls Cloudflare didn't carry out are retried, up to `:attempts` in all
   (default 3) with `:backoff_ms` (default 200) doubling in between: 429,
   502, 503 and 504 for every call, and transport errors (the request may not
-  have arrived) only for calls that are safe to repeat, `GET`s and closing
-  adapters. Pulling or pushing twice would add tracks twice.
+  have arrived) only for `GET`s, which are safe to repeat. Pulling or
+  pushing twice would add tracks twice.
   """
 
   @behaviour Octoroom.Cloudflare
@@ -94,55 +94,6 @@ defmodule Octoroom.Cloudflare.HTTP do
   end
 
   @impl true
-  # Cloudflare takes at most 4 adapters per request (closing says so:
-  # "Expecting at most 4 track in the request", observed 2026-11-17), so
-  # larger batches are split. If a later chunk fails, the adapters already
-  # created are closed, so the caller's all-or-nothing view holds.
-  @adapter_batch 4
-
-  def new_adapters(config, tracks) do
-    tracks
-    |> Enum.chunk_every(@adapter_batch)
-    |> Enum.reduce_while({:ok, []}, fn chunk, {:ok, created} ->
-      case new_adapter_chunk(config, chunk) do
-        {:ok, more} ->
-          {:cont, {:ok, created ++ more}}
-
-        error ->
-          close_adapters(config, Enum.map(created, & &1.adapter_id))
-          {:halt, error}
-      end
-    end)
-  end
-
-  defp new_adapter_chunk(config, tracks) do
-    with {:ok, resp} <- request(config, :post, "/adapters/websocket/new", %{tracks: tracks}),
-         :ok <- no_track_errors(resp) do
-      {:ok,
-       for(
-         t <- resp["tracks"] || [],
-         do: %{adapter_id: t["adapterId"], session_id: t["sessionId"]}
-       )}
-    end
-  end
-
-  @impl true
-  def close_adapters(_config, []), do: :ok
-
-  def close_adapters(config, ids) do
-    ids
-    |> Enum.chunk_every(@adapter_batch)
-    |> Enum.reduce_while(:ok, fn chunk, :ok ->
-      body = %{tracks: Enum.map(chunk, &%{adapterId: &1})}
-
-      case request(config, :post, "/adapters/websocket/close", body) do
-        {:ok, _} -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  @impl true
   def session_state(config, session) do
     case request(config, :get, "/sessions/#{session}", nil) do
       {:ok, %{"tracks" => tracks}} ->
@@ -213,8 +164,8 @@ defmodule Octoroom.Cloudflare.HTTP do
        do: true
 
   # The request may not have arrived: only safe to repeat when idempotent.
-  defp retry?(method, path, {:error, {:cloudflare, _, %{__exception__: true}}}),
-    do: method == :get or path == "/adapters/websocket/close"
+  defp retry?(method, _path, {:error, {:cloudflare, _, %{__exception__: true}}}),
+    do: method == :get
 
   defp retry?(_method, _path, _result), do: false
 

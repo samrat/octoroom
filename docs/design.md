@@ -1,14 +1,12 @@
 # Octoroom design
 
-Status: **milestones 1–3 implemented** (2026-11-17). Milestone 3 was
-checked against real Cloudflare; see [the results](#milestone-3-against-real-cloudflare-2026-11-17).
-The spike before milestone 4 is done; see [Recovery spike](#recovery-spike-2026-11-17).
-**Robustness (milestone 5) is implemented ahead of milestone 4**, on the
-adapter transport, and checked by restarting the node mid-call against real
-Cloudflare; see [Implementation notes (robustness)](#implementation-notes-robustness).
-**Decided 2026-11-17:** workers move from Cloudflare's WebSocket adapters to
-WebRTC; see [Transport decision](#transport-decision-2026-11-17). Milestones
-1–3 still run on adapters until milestone 4 replaces them.
+Status: **milestones 1–5 implemented** (2026-11-17). Workers run over
+WebRTC (milestone 4, see [Transport decision](#transport-decision-2026-11-17)
+and [Implementation notes (milestone 4)](#implementation-notes-milestone-4)),
+checked against real Cloudflare. Milestone 3 and robustness (milestone 5)
+were built first, on Cloudflare's WebSocket adapters, and checked against
+real Cloudflare then; see [Milestone 3 against real Cloudflare](#milestone-3-against-real-cloudflare-2026-11-17)
+and [Implementation notes (robustness)](#implementation-notes-robustness).
 See [Implementation notes](#implementation-notes-milestones-13) for where the
 code differs from this draft.
 
@@ -402,9 +400,10 @@ model as follows.
   `ex_webrtc` peer connection to Cloudflare. The worker's inputs are pulled
   into that session (`location: "remote"`), the same call a browser
   subscription uses, and its outputs are pushed from it (`location:
-  "local"`). The room server makes every Cloudflare call, and the peer only
-  makes or answers offers in-process, so changing a worker's inputs costs
-  one HTTP call and a local renegotiation, with no client round trip.
+  "local"`). The room server decides what to push, pull and close; the
+  peer makes its own session's Cloudflare calls and does the SDP
+  in-process, so changing a worker's inputs costs one HTTP call and a local
+  renegotiation, with no client round trip.
 - **Track directory.** The room server keeps
   `track name -> {session_id, cf_track_name, status}`, where status is
   `:pending` (declared, not yet flowing) or `:live`.
@@ -633,7 +632,11 @@ Workers' media runs over WebRTC (see
   the worker's Cloudflare session. It answers Cloudflare's offers after a
   pull, makes offers for pushes and closes, and routes RTP between the
   connection and the worker's inlets and outlets. The room server tells it
-  what to do; it never calls Cloudflare itself.
+  what to push, pull and close (`Peer.push/4`, `pull/4`, `close/2`) and
+  hears back as `{:peer_result, ...}`; the peer carries it out against its
+  own session, one offer/answer exchange at a time, batching requests that
+  queue up. Its Cloudflare calls run in tasks, so it keeps routing RTP
+  while one is pending.
 - **An inlet per input.** A jitter buffer for the RTP stream, Opus decode,
   conversion to the worker's format and the hold to real time. It sends the
   worker 20 ms of PCM at a time by registered name, so a restarted worker
@@ -645,18 +648,22 @@ Workers' media runs over WebRTC (see
 Inlets and outlets are separate processes so that decoding and encoding
 spread over schedulers instead of queueing behind the peer.
 
-Connectivity: the peer gathers host candidates and Cloudflare learns the
-app's public address from the connectivity checks, so NAT needs no
-configuration. Some hosts need ICE options; Subvocal's WebRTC transport
-already handles Fly.io's (`ExWebRTC.ICE.FlyIpFilter`, see
-`Subvocal.Transport.WebRTC.ICEOptions`). At startup Octoroom opens one test
-peer connection to Cloudflare and fails with a clear error if outbound UDP
-is blocked.
+Connectivity: the peer gathers host candidates only (no STUN) and
+Cloudflare learns the app's public address from the connectivity checks,
+so NAT needs no configuration. Extra `ExWebRTC.PeerConnection` options come
+from `config :octoroom, :webrtc, [...]`; some hosts need them, such as
+Fly.io's ICE IP filter (`ExWebRTC.ICE.FlyIpFilter`, as Subvocal's
+`Subvocal.Transport.WebRTC.ICEOptions` sets it). A peer whose connection
+isn't up 10 s after its first negotiation, or whose ICE fails, logs an
+error saying workers need outbound UDP to Cloudflare and stops; the room
+retries with backoff and gives up after five tries. (This replaces the
+startup check planned earlier: failing the app's boot on a network problem
+would take browser calls down with it.)
 
-`Octoroom.Peer` is a behaviour. Tests use a fake that moves PCM in-process,
-and another transport (another SFU, or WebSocket adapters if a deployment
-can't use UDP) would plug in there without the worker or the room server
-changing.
+The peer connection sits behind `Octoroom.Peer.Media`. Tests use a fake
+(`Octoroom.Test.FakePeerMedia`) that moves PCM in-process, and another
+transport (another SFU, or WebSocket adapters if a deployment can't use
+UDP) would plug in there without the worker or the room server changing.
 
 ## Video
 
@@ -1010,7 +1017,8 @@ Either one keeps `kind: :phone`, the router and the policy unchanged.
 | Pull of a pending track times out | Shouldn't happen, because pulls wait for `:live`. If it does, the track goes back to `:pending`. |
 | Room server crashes | The room supervisor is `rest_for_one`, so workers and outlets restart with it. The new room server recovers the room as after a deploy (see [Restarts and deploys](#restarts-and-deploys)). |
 | Node restarts or deploys | See [Restarts and deploys](#restarts-and-deploys). |
-| Leaked sessions | None to clean up. A worker's session ends when its peer connection closes, including when the node dies (Cloudflare reports it disconnected within a minute). There is no janitor. |
+| Worker peer doesn't connect | After 10 s (or when ICE fails) it logs that workers need outbound UDP to Cloudflare and stops; the room retries with backoff and gives up after five tries, broadcasting `{:error, {:peer, worker_id}, reason}`. |
+| Leaked sessions | None to clean up. A worker's session ends when its peer connection closes, including when the node dies (Cloudflare reports it disconnected within a minute). `Octoroom.Janitor` only deletes room records no resume token can reach any more. |
 
 ## Restarts and deploys
 
@@ -1079,9 +1087,10 @@ keyed by room id, and reloads it when `ctx.resumed` is set.
 
 ### `Octoroom.Store`
 
-A behaviour with a small surface: room records (the room's assigns).
-Worker sessions need no records, because they end with their peer
-connections.
+A behaviour with a small surface: room records (the room's assigns and
+run). Worker sessions need no records, because they end with their peer
+connections. `Octoroom.Janitor` deletes room records older than a resume
+token's max age.
 
 - Default: ETS plus a DETS or file snapshot, enough for one node that
   restarts in place.
@@ -1121,8 +1130,9 @@ v1 is single-node. Things that change for a cluster:
   `Req`, and tests use an in-memory fake that models sessions, tracks,
   pending and live states, and the `empty_track_error` rule.
 - Audio conversion, the Opus round trip, the inlet's jitter buffer and
-  outlet pacing get unit tests. Room and worker tests use a fake
-  `Octoroom.Peer` that moves PCM in-process, so they need no UDP.
+  outlet pacing get unit tests. Room and worker tests run the real
+  `Octoroom.Peer` over a fake peer connection (`Octoroom.Test.FakePeerMedia`)
+  that moves PCM in-process, so they need no UDP.
 - Integration tests against real Cloudflare are tagged `:cloudflare` and
   excluded by default. They need Cloudflare credentials and outbound UDP,
   and no public URL or tunnel.
@@ -1135,7 +1145,7 @@ v1 is single-node. Things that change for a cluster:
 | --- | --- | --- |
 | `req` | Cloudflare API | no |
 | `ex_webrtc` | Worker peer connections. Its DTLS and SRTP use NIFs. | no |
-| An Opus binding | Encode and decode in inlets and outlets. Which one is open; Subvocal uses `membrane_opus_plugin`. | no |
+| `membrane_opus_plugin` | Only its Opus NIFs (`Membrane.Opus.{Encoder,Decoder}.Native`), for inlets and outlets. It downloads a precompiled libopus. | no |
 | `plug`, `websock_adapter` | The phone provider's webhook and stream endpoint | yes |
 | `jason` | JSON | no |
 | `phoenix`, `phoenix_pubsub` | `Octoroom.Phoenix.Channel`, room events | yes. Without them, the core still runs and events go through `Registry`. |
@@ -1332,12 +1342,99 @@ Consequences for recovery (milestone 5):
   pulls of it must be closed and re-pulled once the new outlet is live (the
   normal `:pending` → `:live` path, but the stale pull has to go first).
 
+### Implementation notes (milestone 4)
+
+Workers' media moved from WebSocket adapters to one `ex_webrtc` peer
+connection per worker (2026-11-17). What was built, and what differs from
+[Worker media transport](#worker-media-transport) as first written:
+
+- **`Octoroom.Peer`** owns a worker's Cloudflare session and makes its
+  calls itself (the draft had the room server make them): an operation
+  queue that batches pushes, pulls and closes, Cloudflare calls in tasks,
+  SDP in-process. The room server decides what to push, pull and close,
+  hears back as `{:peer_result, worker_id, pid, result}`, and ignores
+  results from a peer it has replaced. A push, renegotiation or close that
+  fails leaves the connection's signaling state unknown, so the peer stops
+  and the room starts the worker's media afresh, with backoff.
+- **Peers come and go with media.** A worker gets a peer when its first
+  inlet or outlet starts and loses it when its last one stops; tracks of a
+  peer that's stopping aren't closed one by one. A worker that crashes
+  keeps its peer, inlets and outlets. A peer that stops takes its worker's
+  inlets and outlets with it; listeners' pulls of its outputs close, and
+  everything comes back through the normal reconcile. Peers trap exits so
+  stopping one closes its peer connection properly: Cloudflare reported an
+  abruptly killed session disconnected only after ~40 s.
+- **Inlets** decode with one Opus decoder per channel count, picked per
+  packet from the TOC byte: the Opus NIF refuses packets whose channel
+  count differs from the decoder's, and browsers send mono. Mono is
+  upmixed to room PCM (48 kHz stereo). Packets go through
+  `ExWebRTC.RTP.JitterBuffer` (50 ms) first; undecodable ones are counted
+  and dropped.
+- **Outlets** encode 20 ms Opus frames (VoIP, automatic bitrate) and send
+  RTP with their own sequence numbers and timestamps; after the queue runs
+  dry, the next packet's timestamp moves on by the time that passed and
+  sets the marker bit. An outlet gets its sink from the peer only once the
+  connection is up, so its first packet reaches Cloudflare.
+- **Crashed inlets and outlets back off** like failed pulls; without that,
+  an inlet crashing on every packet restarted (and renegotiated) about
+  every 300 ms. Failure counts for a worker's peer and outputs reset when
+  its peer connects or an output is pushed.
+- **Cloudflare quirks** handled in `Octoroom.Peer.WebRTC` (2026-11-17):
+  applying Cloudflare's offer as a session's first negotiation starts ICE
+  checks before Cloudflare has the answer, and they fail for good, so the
+  offer's candidates are held back until `renegotiate` succeeds. Later
+  offers repeat candidates ex_webrtc already has (it warns on each), so
+  they're always stripped. Once every m-line is rejected, Cloudflare's
+  answer has no `a=group:BUNDLE`, which ex_webrtc refuses; an empty one is
+  put back.
+- **No STUN.** Host candidates are enough against Cloudflare's ICE-lite
+  SFU: in a spike both directions connected ~250 ms after the answer.
+- **libsrtp from the system**: see [Open questions](#open-questions).
+- **Gone:** `Octoroom.Plug`, `Octoroom.Adapter` and its socket,
+  `Octoroom.Cloudflare.Packet`, the adapter calls in `Octoroom.Cloudflare`,
+  `public_ws_url`, adapter records in the store, and the `plug` and
+  `websock_adapter` dependencies. Telemetry's `[:octoroom, :adapter,
+  :create]` became `[:octoroom, :peer, :connect]`.
+- **Tests** use `Octoroom.Test.FakePeerMedia`: placeholder SDP, and PCM
+  moved through `FakeCloudflare`, which delivers a frame pushed on a track
+  to every session that pulled it.
+
+#### Milestone 4 against real Cloudflare (2026-11-17)
+
+`examples/call` on a Mac with **no tunnel** (only Cloudflare credentials),
+one built-in-browser tab sending the test tone, checked the same way as
+milestone 3:
+
+| Check | Result |
+| --- | --- |
+| Echo delay | 2.339–2.351 s from beep onsets on the mic against the echo (9 beeps), against 2.45–2.58 s on adapters: ~110–240 ms less, as the spike's ~170 ms predicted. The round trip on top of the 2 s held is now ~340 ms. |
+| Pacing (5 min, machine idle) | Over 300.67 s of wall time the metronome sent 15,034 frames (300.68 s), queue flat at 1,040–1,060 ms, no new underruns; the recording grew 300.68 s. |
+| Worker crash | Crash my echo: restarted, 0 renegotiations in the browser, output stayed live (underruns +5 during the gap). |
+| Cleanup | Echo off: the browser closed its pull of the echo (one close), the echo's peer stopped, and its session reported disconnected. Stopping a peer now closes its connection, and a stopped node's worker sessions reported disconnected within ~6 s; before peers trapped exits, a killed one took ~40 s. |
+| Server restart | Stopped and restarted the node mid-call: the page resumed on the same peer connection; the echo and metronome came back on new sessions and were re-pulled (three offer/answer exchanges, all for worker outputs); the metronome assign survived. |
+
+Findings:
+
+- **Inputs still arrive faster than real time** (~0.45–0.59% of frames
+  dropped by inlets' hold), close to the adapters' 0.56%, so the surplus
+  isn't the adapters'. The node's monotonic clock, OS clocks and system
+  time agreed to 50 µs over 20 s, so it isn't the BEAM's clock either; the
+  browser's sending side is the likely source. The hold keeps recordings
+  exact.
+- **CPU contention shows up as queue growth.** An earlier 5-minute window,
+  during which the test suite ran eight times on the same machine, had the
+  metronome's queue grow 140 → 1,060 ms and the recording run 0.33% short:
+  stalls longer than 100 ms restart an outlet's clock instead of bursting,
+  and lose that time. On an idle machine both were exact. A busy production
+  node would see the same, so outlet stalls are worth a telemetry event.
+
 ### Implementation notes (robustness)
 
-Built ahead of milestone 4, so it runs on the WebSocket adapters. What's
-adapter-specific goes with them in milestone 4: adapter records in the store,
-`Octoroom.Janitor`, closing a previous run's adapters, and batching adapter
-calls. Everything else carries over to WebRTC workers unchanged.
+Built ahead of milestone 4, so it ran on the WebSocket adapters. What was
+adapter-specific went with them in milestone 4: adapter records in the store,
+the janitor's adapter sweep (it still expires room records), closing a
+previous run's adapters, and batching adapter calls. Everything else
+carried over to WebRTC workers unchanged.
 
 - **`Octoroom.Store`** is a key-value behaviour (`get`, `put`, `delete`,
   `all` over two tables, `:rooms` and `:adapters`) with `Octoroom.Store.ETS`
@@ -1449,9 +1546,11 @@ Findings:
      stays live: listeners hear a gap, and browsers don't renegotiate;
    - after the toggle or a leave, Cloudflare shows the worker's adapters
      closed, so nothing keeps running or billing.
-4. **WebRTC worker transport.** `Octoroom.Peer` with a session per worker,
+4. **WebRTC worker transport** (done 2026-11-17; see
+   [Implementation notes (milestone 4)](#implementation-notes-milestone-4)).
+   `Octoroom.Peer` with a session per worker,
    inlets with a jitter buffer and Opus decode, outlets with Opus encode,
-   the startup UDP check, and the fake peer for tests. Then remove
+   a clear error when outbound UDP is blocked, and the fake peer for tests. Then remove
    `public_ws_url`, `Octoroom.Plug`, `Adapter.Socket` and `Cloudflare.Packet`.
    Done when `examples/call` runs with no tunnel and passes milestone 3's
    checks against real Cloudflare again:
@@ -1500,9 +1599,15 @@ Findings:
   connections, but every worker change in the room waits in one queue.
   Start with one per worker and measure peer connection cost in a room
   with 20 workers.
-- **Precompiled NIFs.** `ex_webrtc`'s DTLS and SRTP and the Opus binding
-  must install without native libraries on the common targets (macOS,
-  glibc and musl Linux, x86-64 and ARM). Check each before milestone 4.
+- **Native libraries.** On macOS (2026-11-17): libopus comes precompiled;
+  `ex_libsrtp`'s precompiled libsrtp links a libcrypto Homebrew doesn't put
+  on the default path and fails to load, so apps build against the system's
+  libsrtp (`brew install srtp`, with
+  `config :bundlex, :disable_precompiled_os_deps, apps: [:ex_libsrtp]`, as
+  Subvocal already does); `ex_dtls` builds against the system's OpenSSL.
+  Linux (glibc and musl, x86-64 and ARM) is unchecked. Getting rid of the
+  libsrtp step (a fixed precompiled build upstream) would make install a
+  plain `mix deps.get`.
 - **No outbound UDP.** Does Cloudflare accept ICE over TCP? If it does,
   that's the fallback for hosts that block UDP; if not, those hosts can't
   run workers.

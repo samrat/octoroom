@@ -44,12 +44,6 @@ defmodule Octoroom.Cloudflare do
   @callback close_tracks(config, session_id, [mid], offer :: sdp | nil) ::
               {:ok, %{sdp: sdp | nil}} | {:error, term}
 
-  @doc "Creates WebSocket adapters. Each result carries `:adapter_id` and, for ingest, `:session_id`."
-  @callback new_adapters(config, [map]) :: {:ok, [map]} | {:error, term}
-
-  @doc "Closes WebSocket adapters, so Cloudflare stops dialing and billing."
-  @callback close_adapters(config, [String.t()]) :: :ok | {:error, term}
-
   @typedoc """
   A track as Cloudflare reports it in a session: pushed (`:local`) or pulled
   (`:remote`, with the session it's pulled from).
@@ -91,7 +85,5 @@ defmodule Octoroom.Cloudflare do
   def close_tracks(%{client: c} = config, session, mids, offer),
     do: c.close_tracks(config, session, mids, offer)
 
-  def new_adapters(%{client: c} = config, tracks), do: c.new_adapters(config, tracks)
-  def close_adapters(%{client: c} = config, ids), do: c.close_adapters(config, ids)
   def session_state(%{client: c} = config, session), do: c.session_state(config, session)
 end

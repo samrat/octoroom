@@ -3,7 +3,7 @@ defmodule Octoroom.InletTest do
 
   alias Octoroom.Inlet
 
-  # 20 ms of adapter PCM.
+  # 20 ms of room PCM.
   @frame :binary.copy(<<0>>, 3_840)
 
   setup do
@@ -16,7 +16,6 @@ defmodule Octoroom.InletTest do
         room_id: room_id,
         worker_id: "w",
         input: "a/mic",
-        ws_id: Octoroom.Adapter.new_id(),
         burst_ms: burst_ms
       }
 
@@ -75,5 +74,24 @@ defmodule Octoroom.InletTest do
     assert n <= div(elapsed, 20) + 3
     assert %{dropped: dropped} = Inlet.stats(inlet)
     assert dropped >= 1
+  end
+
+  test "puts RTP back in order and decodes it", ctx do
+    inlet = ctx.start.(300)
+    encoder = Membrane.Opus.Encoder.Native.create(48_000, 2, 2048, -1000, 3001)
+
+    packets =
+      for seq <- 0..2 do
+        {:ok, payload} = Membrane.Opus.Encoder.Native.encode_packet(encoder, @frame, 960)
+        ExRTP.Packet.new(payload, sequence_number: seq, timestamp: seq * 960)
+      end
+
+    for i <- [0, 2, 1], do: send(inlet, {:octoroom_rtp, Enum.at(packets, i)})
+
+    # Released after the jitter buffer's latency, as 20 ms of room PCM each.
+    for _ <- 1..3 do
+      assert_receive {:octoroom_input, "a/mic", pcm}, 200
+      assert byte_size(pcm) == 3_840
+    end
   end
 end

@@ -1,10 +1,10 @@
 defmodule Octoroom.Worker.Server do
   @moduledoc false
 
-  # Runs one worker module. Inlets send it adapter PCM as
+  # Runs one worker module. Inlets send it room PCM as
   # `{:octoroom_input, input, pcm}`; it converts that to the worker's format,
   # calls `handle_audio/3`, and carries out the returned actions: converting
-  # played audio back to adapter PCM for the output's outlet, flushing, and
+  # played audio back to room PCM for the output's outlet, flushing, and
   # emitting events. The room server sends `{:octoroom_io, inputs, outputs}`
   # when the worker's spec changes without a restart.
 
@@ -58,7 +58,7 @@ defmodule Octoroom.Worker.Server do
   @impl true
   def handle_info({:octoroom_input, input, pcm}, state) do
     rest = Map.get(state.rest, input, <<>>)
-    {pcm, rest} = from_adapter(rest <> pcm, state)
+    {pcm, rest} = from_room(rest <> pcm, state)
     state = put_in(state.rest[input], rest)
 
     if pcm == <<>>,
@@ -99,7 +99,7 @@ defmodule Octoroom.Worker.Server do
 
   defp action({:play, {output, pcm}}, state) do
     output = output!(output, state)
-    {out, prev} = to_adapter(pcm, Map.get(state.prev, output, {0, 0}), state)
+    {out, prev} = to_room(pcm, Map.get(state.prev, output, {0, 0}), state)
     Outlet.play(state.room_id, output, out)
     put_in(state.prev[output], prev)
   end
@@ -126,16 +126,16 @@ defmodule Octoroom.Worker.Server do
       else: raise(ArgumentError, "worker #{inspect(state.id)} has no output #{inspect(name)}")
   end
 
-  # The adapter's own format needs no conversion.
-  defp from_adapter(pcm, %{rate: 48_000, channels: 2}) do
+  # The room's own format needs no conversion.
+  defp from_room(pcm, %{rate: 48_000, channels: 2}) do
     size = byte_size(pcm) - rem(byte_size(pcm), 4)
     <<whole::binary-size(size), rest::binary>> = pcm
     {whole, rest}
   end
 
-  defp from_adapter(pcm, state), do: Audio.from_adapter(pcm, state.rate, state.channels)
+  defp from_room(pcm, state), do: Audio.from_room(pcm, state.rate, state.channels)
 
-  defp to_adapter(pcm, prev, %{rate: 48_000, channels: 2}) do
+  defp to_room(pcm, prev, %{rate: 48_000, channels: 2}) do
     case byte_size(pcm) - rem(byte_size(pcm), 4) do
       0 ->
         {<<>>, prev}
@@ -146,5 +146,5 @@ defmodule Octoroom.Worker.Server do
     end
   end
 
-  defp to_adapter(pcm, prev, state), do: Audio.to_adapter(pcm, state.rate, state.channels, prev)
+  defp to_room(pcm, prev, state), do: Audio.to_room(pcm, state.rate, state.channels, prev)
 end

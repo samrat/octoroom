@@ -1,26 +1,8 @@
 defmodule Octoroom.PrimitivesTest do
   use ExUnit.Case, async: true
 
-  import Plug.Test
-
-  alias Octoroom.{Adapter, Audio}
-  alias Octoroom.Cloudflare.{HTTP, Packet}
-
-  describe "packet" do
-    test "round-trips a payload" do
-      payload = :binary.copy(<<1, 2>>, 1_920)
-      assert {:ok, %{payload: ^payload}} = payload |> Packet.encode() |> Packet.decode()
-    end
-
-    test "reads sequence number and timestamp" do
-      bin = <<0x08, 0x96, 0x01, 0x10, 0x05, 0x2A, 0x02, 9, 9>>
-      assert {:ok, %{seq: 150, timestamp: 5, payload: <<9, 9>>}} = Packet.decode(bin)
-    end
-
-    test "reports garbage" do
-      assert {:error, :invalid_packet} = Packet.decode(<<0x2A, 0x05, 1>>)
-    end
-  end
+  alias Octoroom.Audio
+  alias Octoroom.Cloudflare.HTTP
 
   describe "audio" do
     defp stereo(values),
@@ -30,7 +12,7 @@ defmodule Octoroom.PrimitivesTest do
 
     test "averages three stereo frames into one 16 kHz mono sample and carries the rest" do
       assert {<<600::little-signed-16>>, <<1, 2>>} =
-               Audio.from_adapter(stereo([300, 600, 900]) <> <<1, 2>>, 16_000, 1)
+               Audio.from_room(stereo([300, 600, 900]) <> <<1, 2>>, 16_000, 1)
     end
 
     test "keeps stereo when asked" do
@@ -38,25 +20,25 @@ defmodule Octoroom.PrimitivesTest do
         <<100::little-signed-16, 200::little-signed-16, 300::little-signed-16,
           400::little-signed-16>>
 
-      assert {out, <<>>} = Audio.from_adapter(pcm, 24_000, 2)
+      assert {out, <<>>} = Audio.from_room(pcm, 24_000, 2)
       assert samples(out) == [200, 300]
-      assert Audio.from_adapter(pcm, 48_000, 2) == {pcm, <<>>}
+      assert Audio.from_room(pcm, 48_000, 2) == {pcm, <<>>}
     end
 
     test "interpolates 24 kHz mono to 48 kHz stereo" do
-      {out, last} = Audio.to_adapter(<<100::little-signed-16, 300::little-signed-16>>, 24_000, 1)
+      {out, last} = Audio.to_room(<<100::little-signed-16, 300::little-signed-16>>, 24_000, 1)
       assert last == {300, 300}
       assert samples(out) == [50, 50, 100, 100, 200, 200, 300, 300]
     end
 
     test "interpolates 16 kHz across calls" do
-      {_, last} = Audio.to_adapter(<<300::little-signed-16>>, 16_000, 1)
-      {out, _} = Audio.to_adapter(<<600::little-signed-16>>, 16_000, 1, last)
+      {_, last} = Audio.to_room(<<300::little-signed-16>>, 16_000, 1)
+      {out, _} = Audio.to_room(<<600::little-signed-16>>, 16_000, 1, last)
       assert samples(out) == [400, 400, 500, 500, 600, 600]
     end
 
     test "rejects rates that don't divide 48 kHz" do
-      assert_raise ArgumentError, fn -> Audio.from_adapter(<<>>, 44_100, 1) end
+      assert_raise ArgumentError, fn -> Audio.from_room(<<>>, 44_100, 1) end
     end
   end
 
@@ -172,55 +154,6 @@ defmodule Octoroom.PrimitivesTest do
       assert {:error, :disconnected} = HTTP.session_state(config(gone), "s1")
     end
 
-    test "adapter calls go in batches of four" do
-      test = self()
-
-      fun = fn opts ->
-        n = length(opts[:json].tracks)
-        send(test, {:batch, opts[:url], n})
-
-        tracks =
-          for i <- 1..n, do: %{"adapterId" => "a#{System.unique_integer([:positive])}-#{i}"}
-
-        {:ok, %{status: 200, body: %{"tracks" => tracks}}}
-      end
-
-      ids = for i <- 1..9, do: "id#{i}"
-      assert :ok = HTTP.close_adapters(config(fun), ids)
-      assert_received {:batch, _, 4}
-      assert_received {:batch, _, 4}
-      assert_received {:batch, _, 1}
-
-      tracks = for i <- 1..5, do: %{location: "local", trackName: "t#{i}"}
-      assert {:ok, created} = HTTP.new_adapters(config(fun), tracks)
-      assert length(created) == 5
-    end
-
-    test "a failed adapter batch closes the ones already created" do
-      {:ok, calls} = Agent.start_link(fn -> 0 end)
-
-      fun = fn opts ->
-        n = Agent.get_and_update(calls, &{&1, &1 + 1})
-
-        cond do
-          String.ends_with?(opts[:url], "/close") ->
-            send(self(), {:closed, Enum.map(opts[:json].tracks, & &1.adapterId)})
-            {:ok, %{status: 200, body: %{}}}
-
-          n == 0 ->
-            {:ok,
-             %{status: 200, body: %{"tracks" => for(i <- 1..4, do: %{"adapterId" => "a#{i}"})}}}
-
-          true ->
-            {:ok, %{status: 400, body: "nope"}}
-        end
-      end
-
-      tracks = for i <- 1..6, do: %{location: "local", trackName: "t#{i}"}
-      assert {:error, _} = HTTP.new_adapters(config(fun), tracks)
-      assert_received {:closed, ["a1", "a2", "a3", "a4"]}
-    end
-
     test "push fails on a per-track error" do
       resp = fn _ -> {:ok, %{status: 200, body: %{"tracks" => [%{"errorCode" => "bad_mid"}]}}} end
 
@@ -288,63 +221,6 @@ defmodule Octoroom.PrimitivesTest do
       HTTP.close_tracks(config(resp), "s", ["1"], nil)
       assert_received {:req, opts}
       assert opts[:json] == %{tracks: [%{mid: "1"}], force: true}
-    end
-  end
-
-  describe "adapter socket" do
-    alias Octoroom.Adapter.Socket
-
-    test "egress forwards decoded audio to its owner" do
-      assert {:ok, state} = Socket.init(%{role: :egress, owner: self()})
-      assert_received {:octoroom_adapter_socket, :egress, socket}
-
-      assert {:ok, _} = Socket.handle_in({Packet.encode(<<1, 2>>), opcode: :binary}, state)
-      assert_received {:octoroom_pcm, ^socket, <<1, 2>>}
-    end
-
-    test "ingest encodes frames for Cloudflare" do
-      {:ok, state} = Socket.init(%{role: :ingest, owner: self()})
-      expected = Packet.encode(<<3, 4>>)
-
-      assert {:push, {:binary, ^expected}, _} =
-               Socket.handle_info({:octoroom_pcm, <<3, 4>>}, state)
-    end
-
-    test "closes when its owner stops" do
-      owner = spawn(fn -> :ok end)
-      {:ok, state} = Socket.init(%{role: :ingest, owner: owner})
-      assert_receive {:DOWN, ref, :process, ^owner, _}
-      assert ref == state.ref
-
-      assert {:stop, :normal, _} =
-               Socket.handle_info({:DOWN, ref, :process, owner, :normal}, state)
-    end
-  end
-
-  describe "plug" do
-    @opts Octoroom.Plug.init(path: "/octoroom")
-
-    test "passes other paths through" do
-      refute (conn(:get, "/other/ingest/abc") |> Octoroom.Plug.call(@opts)).halted
-    end
-
-    test "404s for an unknown id" do
-      conn = conn(:get, "/octoroom/ingest/nope") |> Octoroom.Plug.call(@opts)
-      assert conn.halted
-      assert conn.status == 404
-    end
-
-    test "400s for a non-WebSocket request to a registered id" do
-      id = Adapter.new_id()
-      {:ok, _} = Adapter.register(:ingest, id)
-      conn = conn(:get, "/octoroom/ingest/#{id}") |> Octoroom.Plug.call(@opts)
-      assert conn.halted
-      assert conn.status == 400
-    end
-
-    test "builds the URL Cloudflare dials" do
-      assert Adapter.url("wss://example.test/octoroom/", :egress, "abc") ==
-               "wss://example.test/octoroom/egress/abc"
     end
   end
 end

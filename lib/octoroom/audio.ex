@@ -1,33 +1,33 @@
 defmodule Octoroom.Audio do
   @moduledoc """
-  Conversions between Cloudflare's adapter PCM (48 kHz stereo s16le, 20 ms
+  Conversions between room PCM (48 kHz stereo s16le, Opus's own format, 20 ms
   frames) and the format a worker asks for. Rates must divide 48 kHz
   (8, 12, 16, 24 or 48 kHz) and channels must be 1 or 2.
   """
 
-  @adapter_rate 48_000
+  @room_rate 48_000
   # 20 ms at 48 kHz stereo s16le.
   @frame_bytes 3_840
 
-  def adapter_rate, do: @adapter_rate
+  def room_rate, do: @room_rate
   def frame_bytes, do: @frame_bytes
 
   @doc "Raises unless `rate` and `channels` can be converted."
   def validate!(rate, channels) do
-    unless is_integer(rate) and rate > 0 and rem(@adapter_rate, rate) == 0 and channels in [1, 2],
+    unless is_integer(rate) and rate > 0 and rem(@room_rate, rate) == 0 and channels in [1, 2],
       do: raise(ArgumentError, "unsupported audio format: #{inspect({rate, channels})}")
 
     :ok
   end
 
   @doc """
-  Adapter PCM to `rate`/`channels`. Each run of `48_000 / rate` frames is
+  Room PCM to `rate`/`channels`. Each run of `48_000 / rate` frames is
   averaged into one, which also low-passes before decimating. Returns
   `{pcm, rest}`, where `rest` belongs in front of the next call's input.
   """
-  def from_adapter(pcm, rate, channels) when is_binary(pcm) do
+  def from_room(pcm, rate, channels) when is_binary(pcm) do
     validate!(rate, channels)
-    factor = div(@adapter_rate, rate)
+    factor = div(@room_rate, rate)
     group = factor * 4
     size = byte_size(pcm) - rem(byte_size(pcm), group)
     <<whole::binary-size(size), rest::binary>> = pcm
@@ -55,13 +55,13 @@ defmodule Octoroom.Audio do
   defp sum_stereo(<<>>, sl, sr), do: {sl, sr}
 
   @doc """
-  PCM at `rate`/`channels` to adapter PCM, by linear interpolation. `prev` is
+  PCM at `rate`/`channels` to room PCM, by linear interpolation. `prev` is
   the last frame of the previous call as `{left, right}` (`{0, 0}` to start);
   returns `{pcm, last_frame}`. A trailing partial frame is dropped.
   """
-  def to_adapter(pcm, rate, channels, prev \\ {0, 0}) when is_binary(pcm) do
+  def to_room(pcm, rate, channels, prev \\ {0, 0}) when is_binary(pcm) do
     validate!(rate, channels)
-    factor = div(@adapter_rate, rate)
+    factor = div(@room_rate, rate)
 
     frames =
       case channels do

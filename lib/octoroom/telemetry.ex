@@ -7,8 +7,9 @@ defmodule Octoroom.Telemetry do
 
     * `[:octoroom, :cloudflare, :request]`: one HTTP attempt.
       Measurements `duration_ms`; metadata `method`, `path`.
-    * `[:octoroom, :adapter, :create]`: adapters created in one call.
-      Measurements `count`.
+    * `[:octoroom, :peer, :connect]`: a worker's peer connection to
+      Cloudflare came up. Measurements `duration_ms` (from the peer's
+      start); metadata `worker_id`.
     * `[:octoroom, :pull, :stop]`: a batched pull finished, from the
       Cloudflare call to the browser's answer. Measurements `duration_ms`,
       `tracks`; metadata `participant_id`.
@@ -35,15 +36,14 @@ defmodule Octoroom.Telemetry do
     * `[:octoroom, :failure]`: something will be retried with backoff, or,
       with `given_up: true`, won't be. Measurements `count`; metadata `id`
       (participant id, `:worker` or `:media`), `name`, `reason`, `given_up`.
-    * `[:octoroom, :janitor, :sweep]`: measurements `closed` (adapters),
-      `deleted_rooms`.
+    * `[:octoroom, :janitor, :sweep]`: measurements `deleted_rooms`.
   """
 
   @doc "Every event name above, for `:telemetry.attach_many/4`."
   def events do
     [
       [:octoroom, :cloudflare, :request],
-      [:octoroom, :adapter, :create],
+      [:octoroom, :peer, :connect],
       [:octoroom, :pull, :stop],
       [:octoroom, :room, :start],
       [:octoroom, :room, :stop],

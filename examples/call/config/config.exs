@@ -12,4 +12,8 @@ config :call, Call.Endpoint,
   render_errors: [formats: [html: Call.ErrorHTML], layout: false]
 
 config :phoenix, :json_library, Jason
+
+# Octoroom's workers use ex_webrtc, whose libsrtp is built against the
+# system's (`brew install srtp`; see Octoroom's README).
+config :bundlex, :disable_precompiled_os_deps, apps: [:ex_libsrtp]
 config :logger, level: :info

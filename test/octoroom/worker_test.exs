@@ -2,7 +2,7 @@ defmodule Octoroom.WorkerTest do
   use ExUnit.Case, async: true
 
   alias Octoroom.Room.Server
-  alias Octoroom.Test.{Client, FakeCloudflare}
+  alias Octoroom.Test.{Client, FakeCloudflare, FakePeerMedia}
 
   @frame :binary.copy(<<1, 0>>, 1_920)
 
@@ -91,7 +91,7 @@ defmodule Octoroom.WorkerTest do
       opts: [
         cloudflare: FakeCloudflare.config(fake),
         signal_timeout: 1_000,
-        public_ws_url: "wss://example.test/octoroom"
+        peer_media: FakePeerMedia
       ]
     }
   end
@@ -138,13 +138,21 @@ defmodule Octoroom.WorkerTest do
     end
   end
 
-  defp egress_adapter?(ctx, session, track) do
-    ctx.fake
-    |> FakeCloudflare.adapters()
-    |> Enum.any?(fn {_, a} ->
-      a.role == :egress and a.session_id == session and a.track_name == track
-    end)
+  defp connected(ctx) do
+    for w <- Octoroom.Room.state(ctx.room_id).workers, into: %{}, do: {w.id, w.connected}
   end
+
+  # Drops the Cloudflare calls the test has been told about so far.
+  defp flush_cloudflare do
+    receive do
+      {:cloudflare, _, _} -> flush_cloudflare()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp media(ctx),
+    do: DynamicSupervisor.which_children(Octoroom.Room.Supervisor.media(ctx.room_id))
 
   # Alice joins with an echo, publishes, speaks one frame, and pulls her
   # echo once it's live.
@@ -155,22 +163,21 @@ defmodule Octoroom.WorkerTest do
     assert worker_ctx.inputs == ["#{alice.id}/mic"]
     assert worker_ctx.outputs == ["#{alice.id}/echo"]
 
-    # The output's ingest adapter is created at once; the input waits for
-    # alice's mic to be live.
-    assert_receive {:cloudflare, :new_adapters,
-                    [[%{location: "local", trackName: cf_track} = out]]}
+    # The output is pushed from the worker's own session at once; the input
+    # waits for alice's mic to be live.
+    assert_receive {:cloudflare, :new_session, []}
 
-    assert out.endpoint =~ ~r"^wss://example.test/octoroom/ingest/"
+    assert_receive {:cloudflare, :push_tracks,
+                    [worker_session, _offer, [%{track_name: cf_track}]]}
 
     alice = publish(ctx, alice)
     session = alice.session
     mic = "#{alice.id}/mic"
 
-    assert_receive {:cloudflare, :new_adapters,
-                    [[%{location: "remote", sessionId: ^session, trackName: ^mic} = in_]]}
+    assert_receive {:cloudflare, :pull_tracks,
+                    [^worker_session, [%{session_id: ^session, track_name: ^mic}]]}
 
-    assert in_.endpoint =~ ~r"^wss://example.test/octoroom/egress/"
-    wait_until(fn -> egress_adapter?(ctx, session, mic) end)
+    wait_until(fn -> connected(ctx)[worker_id] == [mic] end)
 
     # Nothing to pull until the echo has sent a frame.
     refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 50
@@ -184,7 +191,14 @@ defmodule Octoroom.WorkerTest do
     assert [%{track: ^echo, participant_id: nil, worker_id: ^worker_id}] =
              accept_pull(alice, 1_500)
 
-    %{alice: alice, worker: worker, worker_id: worker_id, echo: echo, cf_track: cf_track}
+    %{
+      alice: alice,
+      worker: worker,
+      worker_id: worker_id,
+      echo: echo,
+      cf_track: cf_track,
+      worker_session: worker_session
+    }
   end
 
   test "a private echo: a worker's output goes live and only its owner hears it", ctx do
@@ -212,16 +226,20 @@ defmodule Octoroom.WorkerTest do
     assert hears["bob"] == [alice_mic]
   end
 
-  test "turning a worker off stops it and closes its adapters", ctx do
+  test "turning a worker off stops it and its peer", ctx do
     %{alice: alice, worker: worker} = live_echo(ctx)
     ref = Process.monitor(worker)
-    assert map_size(FakeCloudflare.adapters(ctx.fake)) == 2
+    # Its peer, the inlet and the outlet.
+    assert length(media(ctx)) == 3
 
     :ok = Octoroom.Room.update_meta(ctx.room_id, alice.id, &%{&1 | echo: false})
     assert_receive {:worker_terminated, ^worker, :shutdown}
     assert_receive {:DOWN, ^ref, :process, _, _}
     accept_close(alice)
-    wait_until(fn -> FakeCloudflare.adapters(ctx.fake) == %{} end)
+    # The peer goes with the worker's last media; its session ends with its
+    # peer connection, so nothing is closed track by track.
+    wait_until(fn -> media(ctx) == [] end)
+    refute_received {:cloudflare, :close_tracks, [_, ["out" <> _], _]}
 
     state = Octoroom.Room.state(ctx.room_id)
     assert state.workers == []
@@ -231,16 +249,18 @@ defmodule Octoroom.WorkerTest do
   test "a crashed worker is restarted and its track stays published", ctx do
     Octoroom.subscribe(ctx.room_id)
     %{alice: alice, worker: worker, worker_id: id, cf_track: cf_track} = live_echo(ctx)
+    flush_cloudflare()
 
     Process.exit(worker, :kill)
     assert_receive {:octoroom, _, {:worker_down, ^id, :killed}}
     assert_receive {:worker_started, ^id, worker2, _}, 1_500
     assert worker2 != worker
 
-    # Same adapters, no renegotiation: the new worker hears and plays
-    # through the old inlet and outlet.
-    refute_received {:cloudflare, :new_adapters, _}
-    refute_received {:cloudflare, :close_adapters, _}
+    # Same peer and session, no renegotiation: the new worker hears and
+    # plays through the old inlet and outlet.
+    refute_received {:cloudflare, :new_session, _}
+    refute_received {:cloudflare, :push_tracks, _}
+    refute_received {:cloudflare, :close_tracks, _}
     refute_received {:client, "alice", {:octoroom_signal, :renegotiate, _}}
     refute_received {:client, "alice", {:octoroom_signal, :close, _}}
     FakeCloudflare.egress(ctx.fake, alice.session, "#{alice.id}/mic", @frame)
@@ -264,7 +284,8 @@ defmodule Octoroom.WorkerTest do
     Octoroom.subscribe(ctx.room_id)
     alice = join(ctx, "alice", RecRoom) |> then(&publish(ctx, &1))
     assert_receive {:worker_started, "rec", rec, %{inputs: [_]}}
-    assert_receive {:cloudflare, :new_adapters, [[%{location: "remote"}]]}
+    alice_session = alice.session
+    assert_receive {:cloudflare, :pull_tracks, [rec_session, [%{session_id: ^alice_session}]]}
 
     bob = join(ctx, "bob", RecRoom)
     assert_receive {:worker_info, ^rec, {:octoroom, :inputs, inputs}}
@@ -275,38 +296,56 @@ defmodule Octoroom.WorkerTest do
     bob = publish(ctx, bob)
     session = bob.session
     mic = "#{bob.id}/mic"
-    assert_receive {:cloudflare, :new_adapters, [[%{sessionId: ^session, trackName: ^mic}]]}
-    wait_until(fn -> egress_adapter?(ctx, session, mic) end)
+
+    assert_receive {:cloudflare, :pull_tracks,
+                    [^rec_session, [%{session_id: ^session, track_name: ^mic}]]}
+
+    wait_until(fn -> length(connected(ctx)["rec"]) == 2 end)
+
+    # Both inputs reach the worker through its one session.
+    FakeCloudflare.egress(ctx.fake, session, mic, @frame)
+    FakeCloudflare.egress(ctx.fake, alice_session, "#{alice.id}/mic", @frame)
 
     wait_until(fn ->
-      [%{connected: connected}] = Octoroom.Room.state(ctx.room_id).workers
-      length(connected) == 2
+      [%{dropped: dropped}] = Octoroom.Room.state(ctx.room_id).workers
+      map_size(dropped) == 2
     end)
 
     Client.stop(bob)
     assert_receive {:worker_info, ^rec, {:octoroom, :inputs, [_]}}
-    assert_receive {:cloudflare, :close_adapters, [[_]]}
+    assert_receive {:cloudflare, :close_tracks, [^rec_session, [_mid], "close offer"]}
     refute_received {:worker_started, _, _, _}
 
-    # The last one out: the room stops, and its adapters are closed.
+    # The last one out: the room stops, and its media with it.
     room = Octoroom.Room.Server.whereis(ctx.room_id)
     ref = Process.monitor(room)
     Client.stop(alice)
     assert_receive {:DOWN, ^ref, :process, _, :normal}
     assert_receive {:worker_terminated, ^rec, :shutdown}
-    wait_until(fn -> FakeCloudflare.adapters(ctx.fake) == %{} end)
   end
 
-  test "without a public URL, workers run but get no adapters", ctx do
-    opts = Keyword.delete(ctx.opts, :public_ws_url)
+  test "a worker whose peer fails gets its media back, and listeners re-pull", ctx do
+    Octoroom.subscribe(ctx.room_id)
+    %{alice: alice, worker: worker, worker_id: id, echo: echo} = live_echo(ctx)
+    [peer] = for {_, pid, _, [Octoroom.Peer]} <- media(ctx), do: pid
+    flush_cloudflare()
 
-    alice =
-      Client.join("alice", EchoRoom, ctx.room_id, %{name: "a", echo: true, test: self()}, opts)
+    # The connection to Cloudflare failing stops the peer.
+    Process.exit(peer, {:shutdown, :connection_failed})
 
-    assert_receive {:worker_started, _, _, _}
-    refute_receive {:cloudflare, :new_adapters, _}, 50
-    assert [%{running: true}] = Octoroom.Room.state(ctx.room_id).workers
-    Client.stop(alice)
+    # The echo track went with it, so alice's pull of it closes.
+    assert [_] = accept_close(alice)
+
+    # A new peer pushes the output again and pulls the input; the worker
+    # itself keeps running.
+    assert_receive {:cloudflare, :new_session, []}, 1_500
+    assert_receive {:cloudflare, :push_tracks, [new_session, _, [_]]}
+    wait_until(fn -> connected(ctx)[id] == ["#{alice.id}/mic"] end)
+    assert Process.alive?(worker)
+
+    FakeCloudflare.egress(ctx.fake, alice.session, "#{alice.id}/mic", @frame)
+    assert [%{track: ^echo}] = accept_pull(alice, 1_500)
+    assert new_session in FakeCloudflare.media_sessions(ctx.fake)
   end
 
   defmodule Doomed do

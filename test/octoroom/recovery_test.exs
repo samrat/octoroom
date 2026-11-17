@@ -60,7 +60,7 @@ defmodule Octoroom.RecoveryTest do
         cloudflare: FakeCloudflare.config(fake),
         signal_timeout: 1_000,
         grace_ms: 300,
-        public_ws_url: "wss://example.test/octoroom"
+        peer_media: Octoroom.Test.FakePeerMedia
       ]
     }
   end

@@ -25,10 +25,12 @@ defmodule Octoroom.MixProject do
   defp deps do
     [
       {:req, "~> 0.5"},
-      {:plug, "~> 1.16"},
-      {:websock_adapter, "~> 0.5"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},
+      {:ex_webrtc, "~> 0.17"},
+      # Only its Opus NIFs (Membrane.Opus.{Encoder,Decoder}.Native), which
+      # ship with a precompiled libopus.
+      {:membrane_opus_plugin, "~> 0.20"},
       {:phoenix, "~> 1.7", optional: true}
     ]
   end

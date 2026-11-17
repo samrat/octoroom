@@ -130,7 +130,6 @@ defmodule Call.Layouts do
           .meter > span { display: block; height: 100%; width: 0; background: var(--ok); transition: width .15s; }
           .empty { color: var(--muted); margin-top: 20px; }
           .workers { margin-top: 12px; }
-          .warn { background: #f3802022; border-radius: 10px; padding: 10px 12px; margin: 12px 0 0; }
           .recorded { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 12px; }
           .recorded .dir { width: 100%; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
           .viewers { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
@@ -180,8 +179,7 @@ defmodule Call.CallLive do
         captions: [],
         recorded: %{},
         recording_dir: nil,
-        captions?: Call.Room.captions_available?(),
-        public_url?: Application.get_env(:octoroom, :public_ws_url) not in [nil, ""]
+        captions?: Call.Room.captions_available?()
       )
 
     {:ok, load(socket)}
@@ -340,11 +338,6 @@ defmodule Call.CallLive do
         <div id="status">Not in the call.</div>
       </div>
 
-      <p :if={not @public_url?} class="warn">
-        <code>OCTOROOM_PUBLIC_WS_URL</code>
-        isn’t set, so workers run but Cloudflare can’t reach them: nobody will hear them. See the README.
-      </p>
-
       <div class="controls workers">
         <strong>Mic check</strong>
         <button phx-click="toggle_echo" disabled={@me == nil}>
@@ -479,10 +472,6 @@ defmodule Call.Endpoint do
 
   socket "/live", Phoenix.LiveView.Socket
   socket "/socket", Call.UserSocket, websocket: true
-
-  # Serves the sockets Cloudflare dials for workers: set
-  # OCTOROOM_PUBLIC_WS_URL to this path's public wss:// URL.
-  plug Octoroom.Plug, path: "/octoroom"
 
   plug Plug.Static,
     at: "/assets/phoenix",

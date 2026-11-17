@@ -1,14 +1,15 @@
 defmodule Octoroom.Outlet do
   @moduledoc """
-  One worker output track. Owns the socket of the track's ingest adapter
-  and paces audio to real time: Cloudflare plays whatever it is sent, so
-  anything sent early would still play after a barge-in.
+  One worker output track. Paces audio to real time and sends it, Opus
+  encoded, through the worker's peer connection: Cloudflare forwards
+  whatever it is sent, so anything sent early would still play after a
+  barge-in.
 
-  Workers queue adapter PCM (48 kHz stereo s16le) with `play/3`. Every
-  20 ms the outlet sends the next whole frame and sends nothing when the
-  queue is empty. `flush/2` empties the queue, so at most one frame plus the
-  network is already on its way. Audio played before Cloudflare has dialed
-  in is dropped as it comes due, as a live stream would be.
+  Workers queue room PCM (48 kHz stereo s16le) with `play/3`. Every 20 ms
+  the outlet sends the next whole frame and sends nothing when the queue is
+  empty. `flush/2` empties the queue, so at most one frame plus the network
+  is already on its way. Audio played before the track is pushed and its
+  connection is up is dropped as it comes due, as a live stream would be.
 
   The first frame sent tells the room server the track is live, so
   listeners can pull it. The outlet is separate from its worker: if the
@@ -17,9 +18,11 @@ defmodule Octoroom.Outlet do
 
   use GenServer, restart: :temporary
 
-  alias Octoroom.Adapter
+  alias ExWebRTC.PeerConnection
 
   @frame_ms 20
+  # Samples per frame at Opus's 48 kHz RTP clock.
+  @frame_samples 960
   # 20 ms of 48 kHz stereo s16le.
   @frame_bytes 3_840
   # Behind by more than this (a long GC pause, a suspended VM), the clock
@@ -38,7 +41,7 @@ defmodule Octoroom.Outlet do
     end
   end
 
-  @doc "Queues adapter PCM on an output track. A no-op if the outlet isn't running."
+  @doc "Queues room PCM on an output track. A no-op if the outlet isn't running."
   def play(room_id, name, pcm) when is_binary(pcm), do: cast(room_id, name, {:play, pcm})
 
   @doc "Drops an output track's queued, unplayed audio."
@@ -64,14 +67,20 @@ defmodule Octoroom.Outlet do
   end
 
   @impl true
-  def init(%{name: name, server: server, ws_id: ws_id}) do
-    {:ok, _} = Adapter.register(:ingest, ws_id)
-
+  def init(%{name: name, server: server}) do
     {:ok,
      %{
        name: name,
        server: server,
-       socket: nil,
+       # Where frames go, from the worker's peer: `{:rtp, pc, track_id}` or
+       # `{:pcm, fun}` (tests).
+       sink: nil,
+       encoder: nil,
+       seq: :rand.uniform(65_536) - 1,
+       timestamp: :rand.uniform(4_294_967_296) - 1,
+       # Whether the next frame starts a talkspurt (the clock restarted).
+       spurt: true,
+       last_sent: nil,
        buffer: <<>>,
        queue: :queue.new(),
        queued: 0,
@@ -101,7 +110,7 @@ defmodule Octoroom.Outlet do
       sent: state.sent,
       dropped: state.dropped,
       underruns: state.underruns,
-      connected: state.socket != nil,
+      connected: state.sink != nil,
       live: state.live
     }
 
@@ -111,14 +120,7 @@ defmodule Octoroom.Outlet do
   @impl true
   def handle_info({:timeout, _ref, :tick}, state), do: {:noreply, tick(state)}
 
-  def handle_info({:octoroom_adapter_socket, :ingest, socket}, state) do
-    Process.monitor(socket)
-    {:noreply, %{state | socket: socket}}
-  end
-
-  # Cloudflare may dial again; the id stays registered while the outlet lives.
-  def handle_info({:DOWN, _ref, :process, socket, _reason}, %{socket: socket} = state),
-    do: {:noreply, %{state | socket: nil}}
+  def handle_info({:octoroom_sink, sink}, state), do: {:noreply, %{state | sink: sink}}
 
   def handle_info(_message, state), do: {:noreply, state}
 
@@ -128,7 +130,7 @@ defmodule Octoroom.Outlet do
     case :queue.out(state.queue) do
       {:empty, _} ->
         underruns = if state.next, do: state.underruns + 1, else: state.underruns
-        %{state | next: nil, underruns: underruns}
+        %{state | next: nil, underruns: underruns, spurt: true}
 
       {{:value, frame}, queue} ->
         state = %{state | queue: queue, queued: state.queued - 1} |> send_frame(frame)
@@ -140,13 +142,52 @@ defmodule Octoroom.Outlet do
     end
   end
 
-  defp send_frame(%{socket: nil} = state, _frame), do: %{state | dropped: state.dropped + 1}
+  defp send_frame(%{sink: nil} = state, _frame), do: %{state | dropped: state.dropped + 1}
 
   defp send_frame(state, frame) do
-    send(state.socket, {:octoroom_pcm, frame})
+    state = deliver(state, frame)
     unless state.live, do: send(state.server, {:outlet_live, state.name, self()})
     %{state | live: true, sent: state.sent + 1}
   end
+
+  defp deliver(%{sink: {:pcm, fun}} = state, frame) do
+    fun.(frame)
+    state
+  end
+
+  defp deliver(%{sink: {:rtp, pc, track_id}} = state, frame) do
+    encoder = state.encoder || new_encoder()
+    {:ok, payload} = Membrane.Opus.Encoder.Native.encode_packet(encoder, frame, @frame_samples)
+    now = System.monotonic_time(:millisecond)
+
+    # After a pause, the RTP clock moves on by the time that passed, and the
+    # marker bit starts a talkspurt, so the receiver doesn't stretch the gap.
+    timestamp =
+      if state.spurt and state.last_sent,
+        do: state.timestamp + max(@frame_samples, (now - state.last_sent) * 48),
+        else: state.timestamp + @frame_samples
+
+    packet =
+      ExRTP.Packet.new(payload,
+        sequence_number: state.seq,
+        timestamp: rem(timestamp, 4_294_967_296),
+        marker: state.spurt
+      )
+
+    PeerConnection.send_rtp(pc, track_id, packet)
+
+    %{
+      state
+      | encoder: encoder,
+        seq: rem(state.seq + 1, 65_536),
+        timestamp: rem(timestamp, 4_294_967_296),
+        spurt: false,
+        last_sent: now
+    }
+  end
+
+  # VoIP application, automatic bitrate, voice signal.
+  defp new_encoder, do: Membrane.Opus.Encoder.Native.create(48_000, 2, 2048, -1000, 3001)
 
   defp split(<<frame::binary-size(@frame_bytes), rest::binary>>, acc),
     do: split(rest, [frame | acc])
