@@ -409,6 +409,52 @@ defmodule Octoroom.RoomTest do
       refute_receive {:DOWN, ^ref, _, _, _}, 50
     end
 
+    test "a join with malformed metadata is refused, and an empty room stops again", ctx do
+      for meta <- [nil, %{publish: :mic}, %{"publish" => "mic"}, %{publish: ["mic", :camera]}] do
+        assert {:error, {:bad_meta, ^meta}} =
+                 Octoroom.Room.join(GroupRoom, ctx.room_id, meta, ctx.opts)
+
+        Process.sleep(20)
+        assert Server.whereis(ctx.room_id) == nil
+      end
+
+      # A running room refuses the join and carries on.
+      alice = join(ctx, "alice")
+      ref = Process.monitor(alice.server)
+
+      assert {:error, {:bad_meta, nil}} =
+               Octoroom.Room.join(GroupRoom, ctx.room_id, nil, ctx.opts)
+
+      publish(ctx, alice)
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+      assert [%{media: :live}] = Octoroom.Room.state(ctx.room_id).participants
+    end
+
+    test "update_meta/3 can't set a malformed publish list", ctx do
+      alice = join(ctx, "alice")
+      ref = Process.monitor(alice.server)
+
+      assert {:error, {:bad_return, %{publish: "mic"}}} =
+               Octoroom.Room.update_meta(ctx.room_id, alice.id, &Map.put(&1, :publish, "mic"))
+
+      publish(ctx, alice)
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
+    test "metadata that slips past the join's check is refused publishing", ctx do
+      # A resume carries metadata straight from its data, without a join.
+      data = %{participant_id: "mallory", session_id: nil, meta: %{publish: :mic}}
+      mallory = Client.resume("mallory", GroupRoom, ctx.room_id, data, ctx.opts)
+      ref = Process.monitor(mallory.server)
+
+      Server.publish(mallory.server, mallory.id, "offer", %{"mic" => "0"}, :pub)
+
+      assert_receive {:client, "mallory",
+                      {:octoroom_signal, :reply, :pub, {:error, :not_allowed}}}
+
+      refute_receive {:DOWN, ^ref, _, _, _}, 50
+    end
+
     test "a mount/1 that fails fails the join with a clear reason", ctx do
       assert {:error, {:mount_failed, %RuntimeError{message: "no assigns"}}} =
                Octoroom.Room.join(PolicyRoom, "raise-" <> ctx.room_id, %{}, ctx.opts)

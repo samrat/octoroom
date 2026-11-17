@@ -34,7 +34,9 @@ defmodule Octoroom.Room do
   (`mic/1`, `camera/1`, `screen/1`, `screen_audio/1`). By default it may
   publish any of them; a `:publish` key in the metadata `join/2` returns
   limits it, e.g. `%{name: name, publish: ["mic"]}` for audio only. The room
-  server refuses any other source. What a participant publishes right now
+  server refuses any other source. Metadata must be a map, and `:publish` (or
+  `"publish"`) a list of strings when present; a join with anything else is
+  refused. What a participant publishes right now
   is in its `tracks`.
   """
 
@@ -190,7 +192,9 @@ defmodule Octoroom.Room do
 
   Returns `{:ok, reply, server}`, where `reply` has `participant_id`,
   `participants`, `ice_servers`, `resumed` (false) and `resume`: the data a
-  resume token carries (see `resume/4`).
+  resume token carries (see `resume/4`). Metadata that isn't a map, or whose
+  `:publish` isn't a list of source names, is refused with
+  `{:error, {:bad_meta, meta}}`.
   """
   def join(module, room_id, meta, opts \\ []) do
     call_starting(module, room_id, {:join, self(), meta}, opts, 5)
@@ -255,8 +259,8 @@ defmodule Octoroom.Room do
 
   Returns `:ok`, `{:error, :no_participant}`, or `{:error, reason}` when
   `fun` raises, throws or exits (`reason` is the exception, `{:throw, value}`
-  or `{:exit, reason}`) or returns something other than a map
-  (`{:bad_return, value}`). The metadata is then left as it was, and the
+  or `{:exit, reason}`) or returns something other than a map whose
+  `:publish`, if present, is a list of source names (`{:bad_return, value}`). The metadata is then left as it was, and the
   failure is logged and broadcast as `{:error, {:policy, :update_meta},
   reason}`.
   """

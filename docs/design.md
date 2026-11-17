@@ -1601,6 +1601,14 @@ room looped. Now both are refused at the boundary where they come in.
   a malformed `mute`, which has no reply, is dropped. Values of the right
   shape that are still wrong (an unknown source, a stale `op_id`) were
   already refused further in.
+- **Join metadata.** `check_sources/2` reads the metadata's `:publish` (or
+  `"publish"`, so an app passing client params through as metadata let a
+  client set it), and metadata that wasn't a map, or a `publish` that
+  wasn't a list, crashed the room on the participant's first publish. A
+  join now refuses such metadata with `{:error, {:bad_meta, meta}}` (a room
+  started just for that join stops again, unless it's recovering), and
+  `update_meta/3` refuses it as a bad return. Metadata that gets past both
+  (resume data that didn't come from a join) is refused publishing.
 - **Room callbacks.** Every call from the room server into the room module
   catches raises, throws and exits and checks the result's shape, and a
   failure keeps the last good answer:

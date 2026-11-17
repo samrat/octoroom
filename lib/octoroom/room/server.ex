@@ -225,12 +225,25 @@ defmodule Octoroom.Room.Server do
   end
 
   @impl true
+  # Metadata comes from the app's `join/2`, which may pass client params
+  # through. Metadata of the wrong shape would crash the room on the
+  # participant's first publish, so it's refused here. A room started for
+  # this join stops again, unless it's recovering.
   def handle_call({:join, pid, meta}, _from, state) do
-    p = new_participant(new_id(), meta, pid)
-    state = add_participant(state, p)
-    :telemetry.execute([:octoroom, :participant, :join], %{}, %{room_id: state.id, id: p.id})
-    # The participant can't hear or be heard yet, but workers may follow it.
-    {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
+    if meta?(meta) do
+      p = new_participant(new_id(), meta, pid)
+      state = add_participant(state, p)
+      :telemetry.execute([:octoroom, :participant, :join], %{}, %{room_id: state.id, id: p.id})
+      # The participant can't hear or be heard yet, but workers may follow it.
+      {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
+    else
+      reply = {:error, {:bad_meta, meta}}
+
+      # A recovering room keeps running (and its record) for those resuming.
+      if state.participants == %{} and state.recovering == nil,
+        do: {:stop, :normal, reply, state},
+        else: {:reply, reply, state}
+    end
   end
 
   # A client coming back with its resume token's data.
@@ -281,7 +294,9 @@ defmodule Octoroom.Room.Server do
         {:reply, {:error, :no_participant}, state}
 
       p ->
-        case call_room(fn -> fun.(p.meta) end, &is_map/1, "a map") do
+        expected = "a map, with :publish a list of source names if present"
+
+        case call_room(fn -> fun.(p.meta) end, &meta?/1, expected) do
           {:ok, meta} ->
             p = %{p | meta: meta}
             state = put_in(state.participants[id], p)
@@ -1767,14 +1782,36 @@ defmodule Octoroom.Room.Server do
   defp check_sources(_p, []), do: {:error, :no_sources}
 
   defp check_sources(p, sources) do
-    allowed = Map.get(p.meta, :publish) || Map.get(p.meta, "publish")
+    allowed = publish_list(p.meta)
 
     cond do
       Enum.any?(sources, &(Track.kind(&1) == nil)) -> {:error, :unknown_source}
+      allowed == :invalid -> {:error, :not_allowed}
       allowed != nil and Enum.any?(sources, &(&1 not in allowed)) -> {:error, :not_allowed}
       true -> :ok
     end
   end
+
+  # Participant metadata: a map, whose `:publish` (or `"publish"`), when
+  # present, lists the sources it may publish. Joins and `update_meta/3`
+  # refuse anything else.
+  defp meta?(meta), do: publish_list(meta) != :invalid
+
+  # The metadata's publish list, nil when it has none, or `:invalid`.
+  # Metadata that slipped past `meta?/1` (a resume with data that didn't
+  # come from a join) is refused publishing rather than crashing the room.
+  defp publish_list(meta) when is_map(meta) do
+    case Map.get(meta, :publish) || Map.get(meta, "publish") do
+      nil -> nil
+      list -> if strings?(list), do: list, else: :invalid
+    end
+  end
+
+  defp publish_list(_meta), do: :invalid
+
+  defp strings?([]), do: true
+  defp strings?([s | rest]) when is_binary(s), do: strings?(rest)
+  defp strings?(_), do: false
 
   defp room(state) do
     %Room{
