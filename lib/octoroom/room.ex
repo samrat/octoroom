@@ -15,6 +15,14 @@ defmodule Octoroom.Room do
   `subscriptions/2` and `workers/1` must be pure and fast: they run after
   every room change and read only the `%Octoroom.Room{}` they're given.
 
+  If one raises, throws, exits or returns the wrong shape, the room keeps its
+  last good answer: `workers/1` failing leaves the workers as they are, and
+  `subscriptions/2` failing for a listener leaves that listener's
+  subscriptions as they are (tracks that stop being published still close).
+  The failure is logged, broadcast as `{:error, {:policy, callback},
+  reason}` and emitted as `[:octoroom, :policy, :error]` telemetry, once
+  each time it starts or changes.
+
   The struct holds the room's `id`, its `participants` in join order (each an
   `Octoroom.Participant`), its `workers` (the specs `workers/1` last
   returned) and its `assigns`.
@@ -26,7 +34,9 @@ defmodule Octoroom.Room do
   (`mic/1`, `camera/1`, `screen/1`, `screen_audio/1`). By default it may
   publish any of them; a `:publish` key in the metadata `join/2` returns
   limits it, e.g. `%{name: name, publish: ["mic"]}` for audio only. The room
-  server refuses any other source. What a participant publishes right now
+  server refuses any other source. Metadata must be a map, and `:publish` (or
+  `"publish"`) a list of strings when present; a join with anything else is
+  refused. What a participant publishes right now
   is in its `tracks`.
   """
 
@@ -53,7 +63,11 @@ defmodule Octoroom.Room do
   @doc "May this client join, and with what metadata? Runs in the client's channel process."
   @callback join(params :: map, socket :: term) :: {:ok, meta :: map} | {:error, term}
 
-  @doc "Runs once when the room process starts. Returns the room's assigns."
+  @doc """
+  Runs once when the room process starts. Returns the room's assigns. If it
+  raises or returns anything else, the room doesn't start, and the join
+  that started it fails with `{:error, {:mount_failed, reason}}`.
+  """
   @callback mount(room_id :: String.t()) :: {:ok, map}
 
   @doc """
@@ -178,7 +192,9 @@ defmodule Octoroom.Room do
 
   Returns `{:ok, reply, server}`, where `reply` has `participant_id`,
   `participants`, `ice_servers`, `resumed` (false) and `resume`: the data a
-  resume token carries (see `resume/4`).
+  resume token carries (see `resume/4`). Metadata that isn't a map, or whose
+  `:publish` isn't a list of source names, is refused with
+  `{:error, {:bad_meta, meta}}`.
   """
   def join(module, room_id, meta, opts \\ []) do
     call_starting(module, room_id, {:join, self(), meta}, opts, 5)
@@ -216,9 +232,17 @@ defmodule Octoroom.Room do
     spec = {Room.Supervisor, Keyword.merge(opts, room_id: room_id, module: module)}
 
     case DynamicSupervisor.start_child(Octoroom.RoomSupervisor, spec) do
-      {:ok, _} -> server!(room_id)
-      {:error, {:already_started, _}} -> server!(room_id)
-      error -> error
+      {:ok, _} ->
+        server!(room_id)
+
+      {:error, {:already_started, _}} ->
+        server!(room_id)
+
+      {:error, {:shutdown, {:failed_to_start_child, :server, {:mount_failed, _} = e}}} ->
+        {:error, e}
+
+      error ->
+        error
     end
   end
 
@@ -229,7 +253,17 @@ defmodule Octoroom.Room do
     end
   end
 
-  @doc "Updates a participant's metadata with `fun`, then reconciles."
+  @doc """
+  Updates a participant's metadata with `fun`, then reconciles. `fun` runs
+  in the room server.
+
+  Returns `:ok`, `{:error, :no_participant}`, or `{:error, reason}` when
+  `fun` raises, throws or exits (`reason` is the exception, `{:throw, value}`
+  or `{:exit, reason}`) or returns something other than a map whose
+  `:publish`, if present, is a list of source names (`{:bad_return, value}`). The metadata is then left as it was, and the
+  failure is logged and broadcast as `{:error, {:policy, :update_meta},
+  reason}`.
+  """
   def update_meta(room_id, participant_id, fun) when is_function(fun, 1),
     do: call(room_id, {:update_meta, participant_id, fun})
 
