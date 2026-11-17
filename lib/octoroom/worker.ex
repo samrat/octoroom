@@ -25,7 +25,11 @@ defmodule Octoroom.Worker do
   A room starts workers from its `workers/1` callback (see
   `Octoroom.Room.worker/3`). `audio:` picks the PCM format the worker sees,
   s16le at a `rate` dividing 48 kHz and 1 or 2 `channels` (default 48 kHz
-  stereo, the room's own format).
+  stereo, the room's own format). The worker plays audio in the same format
+  unless `output:` gives another, for a worker that hears at one rate and
+  speaks at another:
+
+      use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]
 
   Callbacks return `{:ok, state}` or `{:ok, state, actions}`, where actions
   is a keyword list of:
@@ -68,12 +72,19 @@ defmodule Octoroom.Worker do
     rate = Keyword.get(audio, :rate, 48_000)
     channels = Keyword.get(audio, :channels, 2)
     Octoroom.Audio.validate!(rate, channels)
+    output = Keyword.get(audio, :output, [])
+    out_rate = Keyword.get(output, :rate, rate)
+    out_channels = Keyword.get(output, :channels, channels)
+    Octoroom.Audio.validate!(out_rate, out_channels)
 
     quote do
       @behaviour Octoroom.Worker
 
       @doc false
       def __octoroom_audio__, do: {unquote(rate), unquote(channels)}
+
+      @doc false
+      def __octoroom_audio_output__, do: {unquote(out_rate), unquote(out_channels)}
 
       @impl true
       def handle_info(_message, state), do: {:ok, state}

@@ -26,6 +26,7 @@ defmodule Octoroom.Worker.Server do
     Process.flag(:trap_exit, true)
     module = spec.module
     {rate, channels} = module.__octoroom_audio__()
+    {out_rate, out_channels} = module.__octoroom_audio_output__()
 
     ctx = %Context{
       room_id: room_id,
@@ -42,6 +43,8 @@ defmodule Octoroom.Worker.Server do
       module: module,
       rate: rate,
       channels: channels,
+      out_rate: out_rate,
+      out_channels: out_channels,
       inputs: spec.inputs,
       outputs: spec.outputs,
       rest: %{},
@@ -135,7 +138,7 @@ defmodule Octoroom.Worker.Server do
 
   defp from_room(pcm, state), do: Audio.from_room(pcm, state.rate, state.channels)
 
-  defp to_room(pcm, prev, %{rate: 48_000, channels: 2}) do
+  defp to_room(pcm, prev, %{out_rate: 48_000, out_channels: 2}) do
     case byte_size(pcm) - rem(byte_size(pcm), 4) do
       0 ->
         {<<>>, prev}
@@ -146,5 +149,6 @@ defmodule Octoroom.Worker.Server do
     end
   end
 
-  defp to_room(pcm, prev, state), do: Audio.to_room(pcm, state.rate, state.channels, prev)
+  defp to_room(pcm, prev, state),
+    do: Audio.to_room(pcm, state.out_rate, state.out_channels, prev)
 end

@@ -18,6 +18,7 @@ defmodule Call.MixProject do
   defp deps do
     [
       {:octoroom, path: "../.."},
+      {:octoroom_agents, path: "../../agents"},
       {:phoenix, "~> 1.8"},
       {:phoenix_live_view, "~> 1.1"},
       {:bandit, "~> 1.5"},

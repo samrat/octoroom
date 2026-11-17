@@ -28,11 +28,27 @@ defmodule Octoroom.WorkerTest do
     end
 
     def handle_info(:flush, s), do: {:ok, s, flush: :default}
+    def handle_info({:play, pcm}, s), do: {:ok, s, play: {:default, pcm}}
     def handle_info({:emit, event}, s), do: {:ok, s, emit: event}
     def handle_info(_msg, s), do: {:ok, s}
 
     @impl true
     def terminate(reason, {test, _}), do: send(test, {:worker_terminated, self(), reason})
+  end
+
+  # Hears at 16 kHz and speaks at 24 kHz.
+  defmodule Echo24 do
+    use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]
+
+    @impl true
+    defdelegate init(args, ctx), to: Octoroom.WorkerTest.Echo
+    # 20 ms heard is 13 ms at 24 kHz, less than an outlet frame: play it twice.
+    @impl true
+    def handle_audio(input, pcm, s),
+      do: Octoroom.WorkerTest.Echo.handle_audio(input, pcm <> pcm, s)
+
+    @impl true
+    defdelegate handle_info(msg, s), to: Octoroom.WorkerTest.Echo
   end
 
   # Everyone with `echo: true` gets a private echo: they hear their own
@@ -46,7 +62,9 @@ defmodule Octoroom.WorkerTest do
     @impl true
     def workers(room) do
       for %{meta: %{echo: true}} = p <- room.participants do
-        worker("echo:#{p.id}", Octoroom.WorkerTest.Echo,
+        module = if p.meta[:out24], do: Octoroom.WorkerTest.Echo24, else: Octoroom.WorkerTest.Echo
+
+        worker("echo:#{p.id}", module,
           inputs: [mic(p)],
           outputs: ["#{p.id}/echo"],
           args: %{test: p.meta.test}
@@ -156,8 +174,8 @@ defmodule Octoroom.WorkerTest do
 
   # Alice joins with an echo, publishes, speaks one frame, and pulls her
   # echo once it's live.
-  defp live_echo(ctx) do
-    alice = join(ctx, "alice", EchoRoom, %{echo: true})
+  defp live_echo(ctx, meta \\ %{}) do
+    alice = join(ctx, "alice", EchoRoom, Map.put(meta, :echo, true))
     worker_id = "echo:#{alice.id}"
     assert_receive {:worker_started, ^worker_id, worker, worker_ctx}
     assert worker_ctx.inputs == ["#{alice.id}/mic"]
@@ -318,6 +336,15 @@ defmodule Octoroom.WorkerTest do
     :ok = Octoroom.Worker.send(ctx.room_id, id, :flush)
     wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, echo).queued_ms == 0 end)
     assert Octoroom.Worker.send(ctx.room_id, "nobody", :flush) == {:error, :no_worker}
+  end
+
+  test "a worker can play at a different rate than it hears", ctx do
+    %{echo: echo, worker_id: id} = live_echo(ctx, %{out24: true})
+
+    # 5 s at 24 kHz mono. Read as 16 kHz it would be 7.5 s.
+    :ok = Octoroom.Worker.send(ctx.room_id, id, {:play, :binary.copy(<<0, 0>>, 5 * 24_000)})
+    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, echo).queued_ms > 0 end)
+    assert Octoroom.Outlet.stats(ctx.room_id, echo).queued_ms in 4_000..5_000
   end
 
   test "a worker's inputs follow the room without a restart", ctx do
