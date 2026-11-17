@@ -9,7 +9,8 @@ were built first, on Cloudflare's WebSocket adapters, and checked against
 real Cloudflare then; see [Milestone 3 against real Cloudflare](#milestone-3-against-real-cloudflare-2026-11-17)
 and [Implementation notes (robustness)](#implementation-notes-robustness).
 See [Implementation notes](#implementation-notes-milestones-13) for where the
-code differs from this draft.
+code differs from this draft, and [Implementation notes (bad input)](#implementation-notes-bad-input)
+for how a room survives malformed client messages and failing callbacks.
 
 ## Summary
 
@@ -589,6 +590,10 @@ after a reconnect is rejected instead of applied to the wrong state. The
 client applies `tracks` only after the matching renegotiation completes, so
 mids always refer to transceivers that exist.
 
+A client message with a known event but a body of the wrong shape (a
+`mids` that isn't a map of strings, a non-string `sdp`) gets the error reply
+`{reason: "bad_payload"}`; an unknown event gets `unknown_event`.
+
 Gain is applied in the browser with a Web Audio `GainNode` per remote track.
 Cloudflare forwards each track unchanged.
 
@@ -1014,6 +1019,8 @@ Either one keeps `kind: :phone`, the router and the policy unchanged.
 | Worker peer connection fails      | The peer is restarted with a new session. Its output tracks go back to `:pending`; listeners' pulls of the old tracks are closed and re-pulled once the new ones are live.                                                                     |
 | Cloudflare call fails             | Retried with backoff and capped. After the cap, the operation is dropped, `{:error, ...}` is emitted to the room, and the reconciler tries again on the next trigger.                                                                          |
 | Pull of a pending track times out | Shouldn't happen, because pulls wait for `:live`. If it does, the track goes back to `:pending`.                                                                                                                                               |
+| Bad client payload                | Refused with a `bad_payload` reply, by the channel and again by the room server, so it can't crash the room. See [Implementation notes (bad input)](#implementation-notes-bad-input). |
+| Room callback raises              | `workers/1` or `subscriptions/2` raising, throwing, exiting or returning the wrong shape keeps its last good answer, and is logged, broadcast and emitted as telemetry. See [Implementation notes (bad input)](#implementation-notes-bad-input). |
 | Room server crashes               | The room supervisor is `rest_for_one`, so workers and outlets restart with it. The new room server recovers the room as after a deploy (see [Restarts and deploys](#restarts-and-deploys)).                                                    |
 | Node restarts or deploys          | See [Restarts and deploys](#restarts-and-deploys).                                                                                                                                                                                             |
 | Worker peer doesn't connect       | After 10 s (or when ICE fails) it logs that workers need outbound UDP to Cloudflare and stops; the room retries with backoff and gives up after five tries, broadcasting `{:error, {:peer, worker_id}, reason}`.                               |
@@ -1575,6 +1582,58 @@ Two tabs of `examples/call` in one Chromium, with test patterns (640×360 at
   A restart with video publications wasn't repeated.
 - Still open: how many video pulls one browser session handles before
   simulcast (step 3) is needed.
+
+### Implementation notes (bad input)
+
+Built 2026-11-17. The room server is the room's single writer, and when it
+crashes the whole room restarts and recovers (see [Restarts and
+deploys](#restarts-and-deploys)). That's right for real crashes, but a
+malformed client message or a bug in app code could trigger it at will,
+and a raising policy did again on every reconcile after recovery, so the
+room looped. Now both are refused at the boundary where they come in.
+
+- **Client payloads.** The channel checks each event's body (`sdp` and
+  `op_id` strings, `mids` a map of string to string, `sources` a list of
+  strings, `source` a string) and replies `bad_payload` otherwise, instead
+  of the misleading `unknown_event`. The room server checks the same shapes
+  again before handling a request, since it's also called without a channel
+  (`Octoroom.Room.join/4` is public), and replies `{:error, :bad_payload}`;
+  a malformed `mute`, which has no reply, is dropped. Values of the right
+  shape that are still wrong (an unknown source, a stale `op_id`) were
+  already refused further in.
+- **Join metadata.** `check_sources/2` reads the metadata's `:publish` (or
+  `"publish"`, so an app passing client params through as metadata let a
+  client set it), and metadata that wasn't a map, or a `publish` that
+  wasn't a list, crashed the room on the participant's first publish. A
+  join now refuses such metadata with `{:error, {:bad_meta, meta}}` (a room
+  started just for that join stops again, unless it's recovering), and
+  `update_meta/3` refuses it as a bad return. Metadata that gets past both
+  (resume data that didn't come from a join) is refused publishing.
+- **Room callbacks.** Every call from the room server into the room module
+  catches raises, throws and exits and checks the result's shape, and a
+  failure keeps the last good answer:
+  - `workers/1`: the specs stay as they were, so running workers keep
+    running. Their inlets and outlets still follow the directory.
+  - `subscriptions/2`, per listener: its desired list is what it holds now,
+    at its current gains, so the diff has nothing to do for it. Tracks that
+    leave the directory still close. Other listeners reconcile as usual.
+  - The function given to `update_meta/3` runs in the room server too: the
+    metadata stays, and the caller gets `{:error, reason}` instead of
+    crashing with the room.
+  - `mount/1`: the room doesn't start, and the join fails with
+    `{:error, {:mount_failed, reason}}` instead of a supervisor's
+    `failed_to_start_child`.
+
+  `reason` is the exception, `{:throw, value}`, `{:exit, reason}` or
+  `{:bad_return, value}`. Each failure is logged (with the stacktrace),
+  broadcast as `{:error, {:policy, callback}, reason}` and emitted as
+  `[:octoroom, :policy, :error]`. Reconcile runs on every room change, so
+  the room keeps the last pass's errors and reports one only when it starts
+  or changes.
+- **Tests:** the bad-input cases in `test/octoroom/room_test.exs` drive the
+  room server directly, and `test/octoroom/phoenix/channel_test.exs` calls
+  the channel's `__handle_in__/3` with a stand-in socket whose "room
+  server" is the test process.
 
 ## Milestones
 
