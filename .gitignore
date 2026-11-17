@@ -21,3 +21,8 @@ octoroom-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+# SwiftPM build output (the Swift client).
+/.build/
+/.swiftpm/
+/Package.resolved

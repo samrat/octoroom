@@ -63,7 +63,7 @@ Cloudflare. The server only needs outbound UDP, which most hosts allow.
 - Running or self-hosting an SFU. Cloudflare is the only media plane.
 - Video beyond browsers in v1. Browsers publish cameras and screen shares;
   simulcast and video for workers are later steps of [Video](#video).
-- Native mobile SDKs in v1. The browser client comes first.
+- Native mobile SDKs beyond the Swift client in v1.
 - Broadcast to thousands of passive listeners. HLS or MoQ fit that better.
 
 ## Developer experience
@@ -1636,8 +1636,11 @@ Two tabs of `examples/call` in one Chromium, with test patterns (640×360 at
    other through `subscriptions/2`, the coach stays inaudible to the
    phone, mouth-to-ear latency both ways is measured, and hanging up
    closes the bridge's peer.
-8. **Later:** video (see [Video](#video) for its order), SIP, clustering,
-   Swift client.
+8. **Later:** video (see [Video](#video) for its order), SIP, clustering.
+   A Swift client for iOS and macOS exists (see
+   [swift/README.md](../swift/README.md)): a port of the browser client
+   with the same protocol, checked end to end against Cloudflare with
+   video (2026-11-17).
 
 ## Open questions
 

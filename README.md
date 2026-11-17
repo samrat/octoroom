@@ -23,3 +23,6 @@ in your app's config: the precompiled libsrtp links a libcrypto that isn't
 on the default path.
 
 Try it: [examples/call](examples/call) is a LiveView group call with video.
+
+Native apps join the same rooms with the Swift client for iOS and macOS:
+see [swift/README.md](swift/README.md).

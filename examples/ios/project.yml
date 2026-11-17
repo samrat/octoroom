@@ -1,0 +1,31 @@
+# The Octoroom iOS example. Generate the Xcode project with `xcodegen`.
+name: OctoroomCall
+options:
+  bundleIdPrefix: dev.octoroom
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  Octoroom:
+    path: ../..
+targets:
+  OctoroomCall:
+    type: application
+    platform: iOS
+    sources: [OctoroomCall]
+    dependencies:
+      - package: Octoroom
+        product: Octoroom
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.octoroom.call
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Automatic
+    info:
+      path: OctoroomCall/Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSMicrophoneUsageDescription: Octoroom sends your voice to the call.
+        NSCameraUsageDescription: Octoroom sends your camera to the call.
+        UILaunchScreen: {}
+        CFBundleDisplayName: Octoroom
