@@ -379,8 +379,9 @@ export function installBrowser() {
     removeEventListener(event, callback) {
       this.listeners[event] = (this.listeners[event] || []).filter((c) => c !== callback)
     },
-    dispatch(event) {
-      for (const callback of [...(this.listeners[event] || [])]) callback()
+    dispatch(type, init = {}) {
+      const event = {type, defaultPrevented: false, ...init}
+      for (const callback of [...(this.listeners[type] || [])]) callback(event)
     },
   }
 

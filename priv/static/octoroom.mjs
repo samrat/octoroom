@@ -148,8 +148,14 @@ export class RoomClient {
       await step(this.connectMedia({join_ms: mediaStarted - joinStarted, media_ms: performance.now() - mediaStarted}))
       this.abortJoin = null
       // Closing the tab looks like a dropped connection, which the server
-      // holds for a while in case it comes back: say goodbye instead.
-      this.onPageHide = () => this.leave()
+      // holds for a while in case it comes back: say goodbye instead. On
+      // beforeunload, because by pagehide the Phoenix socket's own pagehide
+      // listener (added first, when the socket was made) has usually closed
+      // the connection, and the leave never goes out. pagehide still leaves,
+      // for browsers without beforeunload (iOS Safari) and for a page that
+      // asked the user to confirm leaving: that unload may be cancelled.
+      this.onPageHide = (event) => (event.type === "pagehide" || !event.defaultPrevented) && this.leave()
+      window.addEventListener("beforeunload", this.onPageHide)
       window.addEventListener("pagehide", this.onPageHide)
       this.setState("joined")
       return reply
@@ -526,7 +532,10 @@ export class RoomClient {
     this.generation++
     this.abortJoin?.()
     this.abortJoin = null
-    if (this.onPageHide) window.removeEventListener("pagehide", this.onPageHide)
+    if (this.onPageHide) {
+      window.removeEventListener("beforeunload", this.onPageHide)
+      window.removeEventListener("pagehide", this.onPageHide)
+    }
     this.onPageHide = null
     this.clearRemote()
     this.pc?.close()
