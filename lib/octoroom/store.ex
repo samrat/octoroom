@@ -1,10 +1,10 @@
 defmodule Octoroom.Store do
   @moduledoc """
   Where Octoroom keeps what must outlive a room server or a node restart:
-  room records. A small key-value behaviour, so it can sit on ETS, Postgres
-  or Redis.
+  room records and what workers save. A small key-value behaviour, so it can
+  sit on ETS, Postgres or Redis.
 
-  One table:
+  Two tables:
 
     * `:rooms`: room id => `%{run: run_id, assigns: map, updated_at: unix_ms}`.
       Written when a room server starts and when its assigns change, deleted
@@ -12,6 +12,12 @@ defmodule Octoroom.Store do
       behind means the room didn't stop cleanly, so the next room server with
       that id recovers it. `Octoroom.Janitor` deletes records whose room
       hasn't come back within a resume token's max age.
+    * `:workers`: `{room id, worker id}` => whatever the worker last saved
+      (the `save:` action of `Octoroom.Worker`), handed back as
+      `ctx.saved` when it starts again. Deleted when the room stops the
+      worker for good, when the room stops because its last participant
+      left, when a fresh room with that id starts, and with the room's
+      record by the janitor.
 
   Workers' Cloudflare sessions need no records: each ends with its peer
   connection.

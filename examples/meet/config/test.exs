@@ -16,3 +16,7 @@ config :phoenix, :plug_init_mode, :runtime
 # Enable helpful, but potentially expensive runtime checks
 config :phoenix_live_view,
   enable_expensive_runtime_checks: true
+
+# Keep the room store in memory: a snapshot file would be the dev server's
+# (both run as nonode@nohost), and a test run would overwrite it.
+config :octoroom, store: {Octoroom.Store.ETS, path: nil}, janitor: [enabled: false]

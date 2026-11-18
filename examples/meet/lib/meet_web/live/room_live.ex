@@ -5,6 +5,11 @@ defmodule MeetWeb.RoomLive do
   what the room server knows (who's here, what each person publishes) and
   what the assistants hear and decide, as a transcript: one entry per turn,
   with a row of tags for each assistant's decision.
+
+  The assistants save their conversations, so the transcript is rebuilt
+  from them when the call appears: after the server restarts (LiveView
+  mounts again) and for someone who joins mid-call. Decisions aren't saved:
+  rebuilt turns have no tags.
   """
   use MeetWeb, :live_view
 
@@ -44,6 +49,62 @@ defmodule MeetWeb.RoomLive do
       |> stream(:transcript, [])
 
     {:ok, load(socket)}
+  end
+
+  # The conversation so far, from what the assistants saved: the primary's
+  # turns (or another's, if it has none) and every assistant's replies.
+  # Entries already shown are replaced: the saved ones include them.
+  defp restore_transcript(socket) do
+    %{room: room, assistants: assistants} = socket.assigns
+    saved = for a <- assistants, do: {a, Octoroom.Agent.conversation(room, a.id)}
+
+    turns =
+      Enum.find_value(saved, [], fn {_a, items} ->
+        case Enum.filter(items, &(&1.role == "user")) do
+          [] -> nil
+          turns -> turns
+        end
+      end)
+
+    replies =
+      for {a, items} <- saved, %{role: "assistant"} = item <- items do
+        %{
+          id: "reply-#{a.id}-#{item.message_id}",
+          kind: :reply,
+          agent: a.id,
+          name: a.name,
+          text: item.text,
+          status: item.status,
+          at: clock(item.at),
+          at_ms: item.at
+        }
+      end
+
+    turns =
+      turns
+      |> Enum.with_index(1)
+      |> Enum.map(fn {item, n} ->
+        %{
+          id: "turn-#{n}",
+          kind: :turn,
+          speaker: item[:speaker],
+          text: item.text,
+          at: clock(item.at),
+          at_ms: item.at,
+          verdicts: []
+        }
+      end)
+
+    entries = Enum.sort_by(turns ++ replies, & &1.at_ms)
+
+    socket
+    |> assign(
+      turns: length(turns),
+      last_turns: %{},
+      early: %{},
+      reply_times: Map.new(replies, &{&1.id, &1.at})
+    )
+    |> stream(:transcript, entries, reset: true)
   end
 
   # -- What the room server tells us
@@ -92,6 +153,10 @@ defmodule MeetWeb.RoomLive do
 
   def handle_event("client", %{"state" => state} = params, socket) do
     me = if state == "joined", do: params["participant_id"]
+
+    # The transcript is on the page only in the call, and a stream's entries
+    # are sent once: fill it as the call appears.
+    socket = if me && !socket.assigns.me, do: restore_transcript(socket), else: socket
     {:noreply, socket |> assign(me: me, joining: state == "joining") |> load()}
   end
 
@@ -244,6 +309,18 @@ defmodule MeetWeb.RoomLive do
   end
 
   defp now, do: NaiveDateTime.local_now() |> Calendar.strftime("%H:%M")
+
+  # A saved item's time (unix ms) on the local clock, like `now/0`.
+  defp clock(at_ms) do
+    offset =
+      round(NaiveDateTime.diff(NaiveDateTime.local_now(), NaiveDateTime.utc_now()) / 60)
+
+    at_ms
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.to_naive()
+    |> NaiveDateTime.add(offset, :minute)
+    |> Calendar.strftime("%H:%M")
+  end
 
   # -- Rendering
 

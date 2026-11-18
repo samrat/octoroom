@@ -129,4 +129,52 @@ defmodule Octoroom.Agent.Processors.ContextTest do
                         message_id: ^id
                       }}}
   end
+
+  defp memories do
+    receive do
+      {:voice_pipeline, _, {:memory, memory}} -> [memory | memories()]
+    after
+      0 -> []
+    end
+  end
+
+  test "tells its owner what to keep: finished messages only" do
+    start()
+    |> Harness.push(%Frames.Transcription{text: "Hi.", speaker: "Alice", turn_id: 1})
+    |> Harness.push(%Frames.AssistantDraft{text: "Hello there."}, :upstream)
+    |> Harness.push(%Frames.AssistantMessage{text: "Hello there."}, :upstream)
+
+    # Once for the user's turn (its reply's place isn't kept), once for the
+    # reply; the draft and the item it reserved change only the sequence.
+    assert [
+             %{history: [%{role: "user", content: "[Alice] Hi."}], conversation: c1},
+             %{conversation: c2},
+             %{
+               history: [_, %{role: "assistant", content: "Hello there."}],
+               conversation: c2
+             }
+           ] = memories()
+
+    assert c1.id == c2.id and c2.sequence > c1.sequence
+  end
+
+  test "carries on from what was saved" do
+    saved = %{
+      history: [
+        %{role: "user", content: "[Alice] My name is Alice."},
+        %{role: "assistant", content: "Nice to meet you, Alice."}
+      ],
+      conversation: %{id: "conv", sequence: 7}
+    }
+
+    harness =
+      processor(:context, Context)
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Transcription{text: "What's my name?", turn_id: 1})
+
+    assert last_request(harness) == saved.history ++ [%{role: "user", content: "What's my name?"}]
+
+    assert_received {:voice_pipeline, _,
+                     {:conversation, %{conversation_id: "conv", sequence: 8, role: "user"}}}
+  end
 end

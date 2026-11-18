@@ -74,7 +74,8 @@ defmodule Octoroom.Agent do
   @doc """
   Something to answer as soon as the agent starts, as if a person had said
   it ("Greet the visitor"). Not used when the agent restarts during a room's
-  recovery (`ctx.resumed`), so it doesn't greet twice.
+  recovery (`ctx.resumed`) or carries on a saved conversation, so it
+  doesn't greet twice.
   """
   @callback initial_text(ctx) :: String.t() | nil
 
@@ -178,4 +179,22 @@ defmodule Octoroom.Agent do
   @doc "Stops what the agent is saying. Returns `:ok`, or `{:error, :no_worker}`."
   def interrupt(room_id, agent_id),
     do: Octoroom.Worker.send(room_id, agent_id, {:octoroom_agent, :interrupt})
+
+  @doc """
+  The agent's conversation so far: its `{:conversation, item}` events'
+  items, the latest version of each, oldest first, each with `at` (unix ms,
+  when it was first seen). Up to the last 200.
+
+  The agent saves it with its history (`Octoroom.Worker`'s `save:`), so
+  it's there while the room is down and after the agent restarts, which
+  then carries on the conversation. For an app that rebuilds a transcript
+  when it mounts. A reply that was playing when the agent stopped comes
+  back `"interrupted"`.
+  """
+  def conversation(room_id, agent_id) do
+    case Octoroom.Worker.saved(room_id, agent_id) do
+      %{items: items} -> items
+      _ -> []
+    end
+  end
 end

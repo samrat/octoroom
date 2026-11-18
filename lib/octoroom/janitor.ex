@@ -1,6 +1,7 @@
 defmodule Octoroom.Janitor do
   @moduledoc """
-  Deletes room records whose room hasn't run for longer than `:room_ttl_ms`:
+  Deletes room records, and what the room's workers saved, whose room
+  hasn't run for longer than `:room_ttl_ms`:
   past that, no resume token can bring the room back, so the record would
   only make a new room with the same id think it's recovering.
 
@@ -49,6 +50,7 @@ defmodule Octoroom.Janitor do
           run_of.(room_id) == nil,
           now - r.updated_at > opts[:room_ttl_ms] do
         Store.delete(store, :rooms, room_id)
+        Octoroom.Worker.forget_room(store, room_id)
         room_id
       end
 

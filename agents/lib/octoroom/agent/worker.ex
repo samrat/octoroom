@@ -190,7 +190,10 @@ defmodule Octoroom.Agent.Worker do
         # time can be negative, so it starts at now, not 0.
         speaking_until: now(),
         vad_stop: %{},
-        turn: nil
+        turn: nil,
+        # Saved (`save:`) for the next start: the context stage's memory and
+        # the conversation items.
+        memory: restored(ctx.saved)
       }
 
       {state, actions} = push_back(state, %Frames.Start{session_id: session_id(ctx)}, [])
@@ -262,7 +265,19 @@ defmodule Octoroom.Agent.Worker do
     result(state, actions)
   end
 
-  # Conversation items, sent by the context stage to its owner (this process).
+  # What the context stage would need to carry on after a restart.
+  def handle_info({:voice_pipeline, _from, {:memory, memory}}, state) do
+    state = %{state | memory: Map.merge(state.memory, memory)}
+    {:ok, state, save: state.memory}
+  end
+
+  # Conversation items, sent by the context stage to its owner (this
+  # process): kept with the memory, for `Octoroom.Agent.conversation/2`.
+  def handle_info({:voice_pipeline, _from, {:conversation, item} = event}, state) do
+    state = update_in(state.memory.items, &put_item(&1, item))
+    {:ok, state, emit: {:agent, event}, save: state.memory}
+  end
+
   def handle_info({:voice_pipeline, _from, event}, state),
     do: {:ok, state, emit: {:agent, event}}
 
@@ -466,13 +481,48 @@ defmodule Octoroom.Agent.Worker do
       session_id: session_id(ctx),
       telemetry: %{room_id: ctx.room_id, agent_id: ctx.id},
       instructions: Map.get(args, :instructions),
-      initial_text: Map.get(args, :initial_text),
+      # Carrying on a conversation: no greeting.
+      initial_text: if(restored?(ctx), do: nil, else: Map.get(args, :initial_text)),
       tools: Map.get(args, :tools, []),
-      context: tool_context
+      context: tool_context,
+      saved: if(restored?(ctx), do: Map.take(ctx.saved, [:history, :conversation]))
     }
   end
 
   defp session_id(ctx), do: "#{ctx.room_id}/#{ctx.id}"
+
+  @max_items 200
+
+  # What was saved, with a reply that was playing when the agent stopped
+  # marked interrupted: the rest of it was never heard.
+  defp restored(%{history: history, conversation: conversation, items: items}) do
+    items =
+      Enum.map(items, fn
+        %{status: "playing"} = item ->
+          Map.merge(item, %{status: "interrupted", interrupted: true})
+
+        item ->
+          item
+      end)
+
+    %{history: history, conversation: conversation, items: items}
+  end
+
+  defp restored(_nothing), do: %{history: [], conversation: nil, items: []}
+
+  defp restored?(ctx), do: match?(%{history: [_ | _]}, ctx.saved)
+
+  # The latest version of each item, in the order they started, with when
+  # each was first seen (`at`, unix ms).
+  defp put_item(items, item) do
+    case Enum.find_index(items, &(&1.message_id == item.message_id)) do
+      nil ->
+        Enum.take(items ++ [Map.put(item, :at, System.system_time(:millisecond))], -@max_items)
+
+      index ->
+        List.update_at(items, index, &Map.merge(item, Map.take(&1, [:at])))
+    end
+  end
 
   # -- Front ends: one per input --
 

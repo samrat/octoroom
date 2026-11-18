@@ -254,6 +254,57 @@ defmodule Octoroom.Agent.WorkerTest do
     assert byte_size(frame) == 3_840
   end
 
+  test "a restarted agent carries on the conversation, and apps can read it", ctx do
+    %{alice: alice} = start(ctx, 50, %{initial_text: "Greet everyone."})
+    assert_receive {:llm, ["Be brief.", "Greet everyone."]}
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}},
+                   1_000
+
+    say(ctx, alice, {:final, "My name is Alice."})
+    assert_receive {:llm, [_, _, _, "[Alice] My name is Alice."]}
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}},
+                   1_000
+
+    wait_until(fn -> length(Octoroom.Agent.conversation(ctx.room_id, "assistant")) == 3 end)
+
+    assert [
+             %{role: "assistant", text: "Hello there.", at: at},
+             %{role: "user", text: "My name is Alice.", speaker: "Alice"},
+             %{role: "assistant", text: "Hello there.", status: "completed"}
+           ] = Octoroom.Agent.conversation(ctx.room_id, "assistant")
+
+    assert is_integer(at)
+
+    # It crashes; the room starts it again with what it saved.
+    pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+    Process.exit(pid, :kill)
+    wait_until(fn -> Octoroom.Worker.whereis(ctx.room_id, "assistant") not in [nil, pid] end)
+    hear(ctx, alice)
+
+    say(ctx, alice, {:final, "What's my name?"})
+
+    # No second greeting: the first request after the restart is this turn,
+    # with everything before it.
+    assert_receive {:llm, request}, 2_000
+
+    assert request == [
+             "Be brief.",
+             "Greet everyone.",
+             "Hello there.",
+             "[Alice] My name is Alice.",
+             "Hello there.",
+             "[Alice] What's my name?"
+           ]
+
+    assert length(Octoroom.Agent.conversation(ctx.room_id, "assistant")) == 4
+  end
+
   test "talking over the agent flushes what it hasn't played yet", ctx do
     %{cf_track: cf, alice: alice} = start(ctx, 5_000)
 

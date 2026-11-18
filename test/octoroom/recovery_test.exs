@@ -49,6 +49,41 @@ defmodule Octoroom.RecoveryTest do
       do: [track("#{listener.id}/echo") | for(p <- others(room, listener), do: mic(p))]
   end
 
+  # Saves whatever it's sent, and tells the test what it got back at start.
+  defmodule Memo do
+    use Octoroom.Worker, audio: [rate: 48_000, channels: 2]
+
+    @impl true
+    def init(%{test: test}, ctx) do
+      send(test, {:memo_started, ctx.saved})
+      {:ok, nil}
+    end
+
+    @impl true
+    def handle_audio(_input, _pcm, s), do: {:ok, s}
+
+    @impl true
+    def handle_info({:save, data}, s), do: {:ok, s, save: data}
+  end
+
+  # A memo worker while someone's here, unless the room's `memo` assign is
+  # false.
+  defmodule MemoRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def workers(%{participants: [p | _], assigns: assigns}) do
+      if Map.get(assigns, :memo, true),
+        do: [worker("memo", Octoroom.RecoveryTest.Memo, args: %{test: p.meta.test})],
+        else: []
+    end
+
+    def workers(_room), do: []
+  end
+
   setup do
     {:ok, fake} = FakeCloudflare.start_link(self())
     room_id = "room-#{System.unique_integer([:positive])}"
@@ -315,6 +350,60 @@ defmodule Octoroom.RecoveryTest do
       assert alice2.id == alice.id
       refute alice2.reply.resumed
       refute_received {:cloudflare, :session_state, _}
+    end
+  end
+
+  describe "what a worker saves" do
+    defp save(ctx, data) do
+      :ok = Octoroom.Worker.send(ctx.room_id, "memo", {:save, data})
+      eventually(fn -> Octoroom.Worker.saved(ctx.room_id, "memo") == data end)
+    end
+
+    test "comes back as ctx.saved when the room restarts", ctx do
+      alice = join(ctx, "alice", MemoRoom)
+      assert_receive {:memo_started, nil}
+      alice = publish(ctx, alice)
+      save(ctx, %{said: ["hi"]})
+      kill_room(ctx)
+
+      Client.resume("alice", MemoRoom, ctx.room_id, alice.resume, ctx.opts)
+      assert_receive {:memo_started, %{said: ["hi"]}}
+    end
+
+    test "and when the worker crashes", ctx do
+      join(ctx, "alice", MemoRoom)
+      assert_receive {:memo_started, nil}
+      save(ctx, :first)
+      Process.exit(Octoroom.Worker.whereis(ctx.room_id, "memo"), :kill)
+      assert_receive {:memo_started, :first}, 2_000
+    end
+
+    test "is forgotten when the room stops the worker", ctx do
+      join(ctx, "alice", MemoRoom)
+      assert_receive {:memo_started, nil}
+      save(ctx, :first)
+      :ok = Octoroom.Room.assign(ctx.room_id, :memo, false)
+      eventually(fn -> Octoroom.Worker.saved(ctx.room_id, "memo") == nil end)
+
+      :ok = Octoroom.Room.assign(ctx.room_id, :memo, true)
+      assert_receive {:memo_started, nil}
+    end
+
+    test "is forgotten when the last person leaves", ctx do
+      alice = join(ctx, "alice", MemoRoom)
+      assert_receive {:memo_started, nil}
+      save(ctx, :first)
+      ref = Process.monitor(alice.server)
+      Process.exit(alice.pid, {:shutdown, :left})
+      assert_receive {:DOWN, ^ref, :process, _, :normal}
+      assert Octoroom.Worker.saved(ctx.room_id, "memo") == nil
+    end
+
+    test "from an earlier room is forgotten when a fresh one starts", ctx do
+      store = Octoroom.Store.config()
+      Octoroom.Store.put(store, :workers, {ctx.room_id, "memo"}, :stale)
+      join(ctx, "alice", MemoRoom)
+      assert_receive {:memo_started, nil}
     end
   end
 
