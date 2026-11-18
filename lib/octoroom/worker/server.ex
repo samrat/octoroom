@@ -1,9 +1,9 @@
 defmodule Octoroom.Worker.Server do
   @moduledoc false
 
-  # Runs one worker module. Inlets send it room PCM as
-  # `{:octoroom_input, input, pcm}`; it converts that to the worker's format,
-  # calls `handle_audio/3`, and carries out the returned actions: converting
+  # Runs one worker module. Inlets send it PCM already in the worker's
+  # format as `{:octoroom_input, input, pcm, format}`; it calls
+  # `handle_audio/3`, and carries out the returned actions: converting
   # played audio back to room PCM for the output's outlet, flushing, and
   # emitting events. The room server sends `{:octoroom_io, inputs, outputs}`
   # when the worker's spec changes without a restart.
@@ -50,7 +50,6 @@ defmodule Octoroom.Worker.Server do
       out_channels: out_channels,
       inputs: spec.inputs,
       outputs: spec.outputs,
-      rest: %{},
       prev: %{},
       user: nil
     }
@@ -62,19 +61,17 @@ defmodule Octoroom.Worker.Server do
   end
 
   @impl true
-  def handle_info({:octoroom_input, input, pcm}, state) do
-    rest = Map.get(state.rest, input, <<>>)
-    {pcm, rest} = from_room(rest <> pcm, state)
-    state = put_in(state.rest[input], rest)
+  def handle_info({:octoroom_input, input, pcm, {rate, channels}}, state)
+      when rate == state.rate and channels == state.channels,
+      do: {:noreply, state.module.handle_audio(input, pcm, state.user) |> handle_result(state)}
 
-    if pcm == <<>>,
-      do: {:noreply, state},
-      else: {:noreply, state.module.handle_audio(input, pcm, state.user) |> handle_result(state)}
-  end
+  # Decoded for the module this worker ran before a restart; the room has
+  # told the inlet the new format, and the next frames will be in it.
+  def handle_info({:octoroom_input, _input, _pcm, _format}, state), do: {:noreply, state}
 
   def handle_info({:octoroom_io, inputs, outputs}, state) do
     old = state
-    state = %{state | inputs: inputs, outputs: outputs, rest: Map.take(state.rest, inputs)}
+    state = %{state | inputs: inputs, outputs: outputs}
 
     state =
       if inputs != old.inputs, do: user_info({:octoroom, :inputs, inputs}, state), else: state
@@ -140,14 +137,6 @@ defmodule Octoroom.Worker.Server do
   end
 
   # The room's own format needs no conversion.
-  defp from_room(pcm, %{rate: 48_000, channels: 2}) do
-    size = byte_size(pcm) - rem(byte_size(pcm), 4)
-    <<whole::binary-size(size), rest::binary>> = pcm
-    {whole, rest}
-  end
-
-  defp from_room(pcm, state), do: Audio.from_room(pcm, state.rate, state.channels)
-
   defp to_room(pcm, prev, %{out_rate: 48_000, out_channels: 2}) do
     case byte_size(pcm) - rem(byte_size(pcm), 4) do
       0 ->

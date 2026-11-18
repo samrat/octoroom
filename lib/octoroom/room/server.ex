@@ -1395,7 +1395,12 @@ defmodule Octoroom.Room.Server do
     with true <- Map.has_key?(state.workers, worker_id) and source != nil,
          true <- may_retry?(state, :media, {:inlet, key}),
          {:ok, peer, state} <- ensure_peer(state, worker_id) do
-      opts = %{room_id: state.id, worker_id: worker_id, input: input}
+      opts = %{
+        room_id: state.id,
+        worker_id: worker_id,
+        input: input,
+        format: state.workers[worker_id].spec.module.__octoroom_audio__()
+      }
 
       case start_child(state, :media, {Inlet, opts}) do
         {:ok, pid} ->
@@ -1557,6 +1562,13 @@ defmodule Octoroom.Room.Server do
             module: spec.module,
             resumed: state.recovering != nil
           })
+
+          # Inlets outlive a restart; a new module may hear in another format.
+          format = spec.module.__octoroom_audio__()
+
+          for {{id, _input}, %{pid: inlet}} <- state.inlets,
+              id == spec.id,
+              do: send(inlet, {:octoroom_format, format})
 
           put_in(state.workers[spec.id], w)
 
