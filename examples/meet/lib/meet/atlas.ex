@@ -18,6 +18,10 @@ defmodule Meet.Atlas do
     """
   end
 
+  # Nemotron through OpenRouter: quicker to first text than Gemini.
+  @impl true
+  def backend(_ctx), do: %{llm: %{provider: :openrouter}}
+
   @impl true
   def questions(ctx) do
     Map.put(Octoroom.Agent.default_questions(ctx), "capital", %{

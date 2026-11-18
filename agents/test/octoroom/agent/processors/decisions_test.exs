@@ -85,4 +85,75 @@ defmodule Octoroom.Agent.Processors.DecisionsTest do
     harness = Harness.push(harness, %Frames.VADUserStartedSpeaking{})
     assert Harness.pending_tasks(harness) == []
   end
+
+  describe "judging transcripts" do
+    test "evaluates the final transcript and holds it until the answers come" do
+      test = self()
+
+      harness =
+        start(
+          fn text ->
+            send(test, {:evaluated, text})
+            {:ok, @answers}
+          end,
+          input: :transcript
+        )
+        |> Harness.push([%Frames.VADUserStartedSpeaking{}, audio(1_000)])
+        |> Harness.push(%Frames.VADUserStoppedSpeaking{})
+
+      # Nothing to judge until the transcript is final.
+      assert Harness.pending_tasks(harness) == []
+
+      harness =
+        harness
+        |> Harness.push(%Frames.UserStoppedSpeaking{turn_id: 1})
+        |> Harness.push(%Frames.Transcription{text: " What time is it? ", turn_id: 1})
+
+      assert Harness.outputs(harness, Frames.Transcription) == []
+
+      harness = Harness.run_tasks(harness)
+      assert_received {:evaluated, "What time is it?"}
+
+      assert [%Frames.Transcription{decision: decision}] =
+               Harness.outputs(harness, Frames.Transcription)
+
+      assert %{addressee: "assistant", confidence: 0.81, answerable: 0.95} = decision
+      refute Map.has_key?(decision, :audio_ms)
+    end
+
+    test "is the default for a model other than Google's" do
+      harness =
+        start(fn text -> {:ok, Map.put(@answers, "text", text)} end,
+          model: "openrouter:cloudflare/clef-flash"
+        )
+        |> Harness.push(%Frames.Transcription{text: "Hi", turn_id: 1})
+        |> Harness.run_tasks()
+
+      assert [%Frames.Transcription{decision: %{answers: %{"text" => "Hi"}}}] =
+               Harness.outputs(harness, Frames.Transcription)
+    end
+
+    test "a slow call lets the transcript go without a decision" do
+      harness =
+        start(fn _text -> {:ok, @answers} end, input: :transcript, max_wait_ms: 50)
+        |> Harness.push(%Frames.Transcription{text: "Hi", turn_id: 1})
+        |> Harness.fire_timer(:decisions, {:wait, 1})
+
+      assert [%Frames.Transcription{decision: nil}] =
+               Harness.outputs(harness, Frames.Transcription)
+    end
+
+    test "a turn with no text goes on without a decision" do
+      harness =
+        start(fn _text -> {:ok, @answers} end, input: :transcript)
+        |> Harness.push(%Frames.UserAudio{turn_id: 1, audio: :binary.copy(<<1, 0>>, 16_000)})
+        |> Harness.push(%Frames.Transcription{text: "  ", turn_id: 2})
+
+      assert Harness.pending_tasks(harness) == []
+      assert [%Frames.UserAudio{decision: nil}] = Harness.outputs(harness, Frames.UserAudio)
+
+      assert [%Frames.Transcription{decision: nil}] =
+               Harness.outputs(harness, Frames.Transcription)
+    end
+  end
 end

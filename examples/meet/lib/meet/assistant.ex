@@ -18,6 +18,10 @@ defmodule Meet.Assistant do
     """
   end
 
+  # Nemotron through OpenRouter: quicker to first text than Gemini.
+  @impl true
+  def backend(_ctx), do: %{llm: %{provider: :openrouter}}
+
   @impl true
   def tools(_ctx) do
     [

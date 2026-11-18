@@ -7,9 +7,11 @@ import Config
 # any compile-time configuration in here, as it won't be applied.
 # The block below contains prod specific runtime configuration.
 
-# Octoroom needs a Cloudflare Realtime SFU app, and the assistant needs
-# SONIOX_API_KEY, GOOGLE_API_KEY and INWORLD_API_KEY. They're read from the
-# environment, or from a `.env` file next to mix.exs (KEY=value lines).
+# Octoroom needs a Cloudflare Realtime SFU app, and the assistants need
+# SONIOX_API_KEY, OPENROUTER_API_KEY (the LLM and the decision model) and
+# INWORLD_API_KEY; GOOGLE_API_KEY only to go back to Gemini. They're read
+# from the environment, or from a `.env` file next to mix.exs (KEY=value
+# lines).
 env_file = Path.expand("../.env", __DIR__)
 
 # KEY=value, KEY="value" or KEY='value', as a shell reads them.
@@ -40,7 +42,7 @@ config :octoroom,
 
 # The assistant's speech-to-text, LLM and text-to-speech read their keys
 # from the environment.
-for key <- ~w(SONIOX_API_KEY GOOGLE_API_KEY INWORLD_API_KEY),
+for key <- ~w(SONIOX_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY INWORLD_API_KEY),
     value = env.(key),
     value not in [nil, ""],
     do: System.put_env(key, value)
