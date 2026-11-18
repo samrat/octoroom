@@ -2090,15 +2090,16 @@ defmodule Octoroom.Room.Server do
     Octoroom.broadcast(state.id, {:subscriptions, p.id, hears})
   end
 
-  # To subscribers of the room's events, and to every participant's process.
+  # To `scope: :room` subscribers, and to every participant's process and
+  # `scope: {:participant, id}` subscribers. Those subscribers get it while
+  # the participant is disconnected too: they're separate processes.
   defp event(state, event, opts \\ []) do
     Octoroom.broadcast(state.id, event)
     except = Keyword.get(opts, :except)
+    recipients = for {id, _p} <- state.participants, id != except, do: id
 
-    for {id, p} <- state.participants, id != except do
-      signal(p, :room_event, event)
-    end
-
+    for id <- recipients, do: signal(state.participants[id], :room_event, event)
+    Octoroom.deliver(state.id, recipients, event)
     :ok
   end
 

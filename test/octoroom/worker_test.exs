@@ -229,7 +229,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "a private echo: a worker's output goes live and only its owner hears it", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     test = self()
     handler = "outlet-#{ctx.room_id}"
 
@@ -329,7 +329,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "a crashed worker is restarted and its track stays published", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     %{alice: alice, worker: worker, worker_id: id, cf_track: cf_track} = live_echo(ctx)
     flush_cloudflare()
 
@@ -350,7 +350,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "flush and emit reach the worker's outlet and the room", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     %{echo: echo, worker_id: id} = live_echo(ctx)
 
     :ok = Octoroom.Worker.send(ctx.room_id, id, {:emit, :hello})
@@ -375,7 +375,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "a worker's inputs follow the room without a restart", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice", RecRoom) |> then(&publish(ctx, &1))
     assert_receive {:worker_started, "rec", rec, %{inputs: [_]}}
     alice_session = alice.session
@@ -419,7 +419,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "a worker whose peer fails gets its media back, and listeners re-pull", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     %{alice: alice, worker: worker, worker_id: id, echo: echo} = live_echo(ctx)
     [peer] = for {_, pid, _, [Octoroom.Peer]} <- media(ctx), do: pid
     flush_cloudflare()
@@ -463,7 +463,7 @@ defmodule Octoroom.WorkerTest do
   end
 
   test "a worker that keeps failing is given up, and the room is told", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     opts = Keyword.put(ctx.opts, :retry_base_ms, 1)
     Client.join("a", DoomedRoom, ctx.room_id, %{}, opts)
 

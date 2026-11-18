@@ -18,7 +18,7 @@ defmodule MeetWeb.RoomLive do
     room = params["room"] || "lobby"
 
     if connected?(socket) do
-      Octoroom.subscribe(room)
+      Octoroom.subscribe(room, scope: :room)
       Phoenix.PubSub.subscribe(Meet.PubSub, "theme:#{room}")
     end
 

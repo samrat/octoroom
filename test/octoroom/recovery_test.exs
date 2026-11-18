@@ -183,7 +183,7 @@ defmodule Octoroom.RecoveryTest do
   describe "a dropped connection" do
     test "coming back within the grace period changes nothing at Cloudflare", ctx do
       {alice, bob} = call(ctx)
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
 
       Client.drop(alice)
       assert_receive {:octoroom, _, {:disconnected, %{id: id}}} when id == alice.id
@@ -205,7 +205,7 @@ defmodule Octoroom.RecoveryTest do
 
     test "a channel shut down with the node isn't a leave either", ctx do
       {alice, _bob} = call(ctx)
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
       Process.exit(alice.pid, :shutdown)
       assert_receive {:octoroom, _, {:disconnected, %{id: id}}} when id == alice.id
       refute_receive {:octoroom, _, {:left, _}}, 100
@@ -213,7 +213,7 @@ defmodule Octoroom.RecoveryTest do
 
     test "nor is Phoenix draining sockets; leaving is", ctx do
       {alice, bob} = call(ctx)
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
       Process.exit(alice.pid, {:shutdown, :restart})
       assert_receive {:octoroom, _, {:disconnected, _}}
       Process.exit(bob.pid, {:shutdown, :left})
