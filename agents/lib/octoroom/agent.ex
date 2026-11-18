@@ -201,14 +201,22 @@ defmodule Octoroom.Agent do
     * `description:` - what it's for ("answers questions about capital
       cities"), told to the decision model so it can tell agents apart.
     * `voice:` - `false` for an agent that listens and calls tools but
-      never speaks (no text-to-speech, no output track). Default `true`.
+      never speaks (no text-to-speech, no output track: a data output
+      named after the id instead, for its presence and transcript).
+      Default `true`.
     * `args:` - passed to the callbacks as `ctx.args`. Changing it
       restarts the agent.
     * `gate:`, `thresholds:`, `decisions:`, `follow_up_ms:` - see
       `Octoroom.Agent.Worker`.
 
   It speaks on one output track named after the id. The room's default
-  `subscriptions/2` includes worker outputs, so everyone hears it.
+  `subscriptions/2` includes worker outputs, so everyone hears it. Whoever
+  is subscribed to that output (or, without a voice, its data output) sees
+  the agent in their client: its presence (`name`, `description`, and a
+  state of `listening`, `thinking`, `speaking` or `waiting`), its
+  `transcript` events, and a `transcript_snapshot` when they subscribe.
+  They may also type to it (`room.send(id, {text})` in the browser), if it
+  hears them (see `Octoroom.Agent.Worker`).
   """
   def agent(id, module, opts) when is_binary(id) and is_atom(module) and is_list(opts) do
     {hears, opts} =
@@ -234,6 +242,7 @@ defmodule Octoroom.Agent do
     Octoroom.Room.worker(id, Octoroom.Agent.Worker,
       inputs: hears,
       outputs: if(voice?, do: [id], else: []),
+      data: if(voice?, do: [], else: [id]),
       args: worker_args
     )
   end

@@ -36,6 +36,7 @@ defmodule Octoroom.Worker.Server do
       id: spec.id,
       inputs: spec.inputs,
       outputs: spec.outputs,
+      data: Map.get(spec, :data, []),
       participants: participants,
       resumed: Map.get(opts, :resumed),
       saved: Store.get(store, :workers, {room_id, spec.id})
