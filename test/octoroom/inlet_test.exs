@@ -11,12 +11,13 @@ defmodule Octoroom.InletTest do
     # The test stands in for the worker the inlet forwards to.
     {:ok, _} = Registry.register(Octoroom.Registry, {:worker, room_id, "w"}, nil)
 
-    start = fn burst_ms ->
+    start = fn burst_ms, format ->
       opts = %{
         room_id: room_id,
         worker_id: "w",
         input: "a/mic",
-        burst_ms: burst_ms
+        burst_ms: burst_ms,
+        format: format
       }
 
       {:ok, pid} = Inlet.start_link(opts)
@@ -30,14 +31,14 @@ defmodule Octoroom.InletTest do
 
   defp forwarded(timeout \\ 50) do
     receive do
-      {:octoroom_input, "a/mic", _} -> 1 + forwarded(timeout)
+      {:octoroom_input, "a/mic", _, _} -> 1 + forwarded(timeout)
     after
       timeout -> 0
     end
   end
 
   test "passes a burst up to the bucket and drops the rest", ctx do
-    inlet = ctx.start.(100)
+    inlet = ctx.start.(100, {48_000, 2})
     push(inlet, 12)
     # 100 ms of tokens is five frames (plus whatever refilled meanwhile).
     n = forwarded()
@@ -47,7 +48,7 @@ defmodule Octoroom.InletTest do
   end
 
   test "refills at real time", ctx do
-    inlet = ctx.start.(40)
+    inlet = ctx.start.(40, {48_000, 2})
     push(inlet, 10)
     assert forwarded() in 2..3
 
@@ -58,7 +59,7 @@ defmodule Octoroom.InletTest do
   end
 
   test "holds a fast stream to real time", ctx do
-    inlet = ctx.start.(60)
+    inlet = ctx.start.(60, {48_000, 2})
     started = System.monotonic_time(:millisecond)
 
     # Two frames every 30 ms: a third faster than real time. (Sleeps run
@@ -77,7 +78,7 @@ defmodule Octoroom.InletTest do
   end
 
   test "puts RTP back in order and decodes it", ctx do
-    inlet = ctx.start.(300)
+    inlet = ctx.start.(300, {48_000, 2})
     encoder = Membrane.Opus.Encoder.Native.create(48_000, 2, 2048, -1000, 3001)
 
     packets =
@@ -90,8 +91,34 @@ defmodule Octoroom.InletTest do
 
     # Released after the jitter buffer's latency, as 20 ms of room PCM each.
     for _ <- 1..3 do
-      assert_receive {:octoroom_input, "a/mic", pcm}, 200
+      assert_receive {:octoroom_input, "a/mic", pcm, {48_000, 2}}, 200
       assert byte_size(pcm) == 3_840
     end
+  end
+
+  test "decodes mono packets straight to the worker's format", ctx do
+    inlet = ctx.start.(300, {16_000, 1})
+    encoder = Membrane.Opus.Encoder.Native.create(48_000, 1, 2048, -1000, 3001)
+
+    {:ok, payload} =
+      Membrane.Opus.Encoder.Native.encode_packet(encoder, binary_part(@frame, 0, 1_920), 960)
+
+    send(inlet, {:octoroom_rtp, ExRTP.Packet.new(payload, sequence_number: 0, timestamp: 0)})
+
+    # 20 ms of 16 kHz mono.
+    assert_receive {:octoroom_input, "a/mic", pcm, {16_000, 1}}, 200
+    assert byte_size(pcm) == 640
+  end
+
+  test "converts room PCM, and follows a new format", ctx do
+    inlet = ctx.start.(300, {16_000, 1})
+    push(inlet, 1)
+    assert_receive {:octoroom_input, "a/mic", pcm, {16_000, 1}}, 200
+    assert byte_size(pcm) == 640
+
+    send(inlet, {:octoroom_format, {24_000, 2}})
+    push(inlet, 1)
+    assert_receive {:octoroom_input, "a/mic", pcm, {24_000, 2}}, 200
+    assert byte_size(pcm) == 1_920
   end
 end

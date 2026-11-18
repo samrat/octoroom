@@ -726,11 +726,14 @@ media gets:
   media afresh, with backoff. Peers trap exits, so stopping one closes its
   peer connection and Cloudflare sees the session end within seconds.
 - **An inlet per live input** (`Octoroom.Inlet`). RTP goes through a 50 ms
-  jitter buffer and an Opus decoder to room PCM (48 kHz stereo), is held to
-  real time, converted to the worker's format, and sent to the worker 20 ms
-  at a time by registered name, so a restarted worker picks up the same
-  streams. The decoder is picked per packet by channel count, because
-  browsers send mono. The hold is a token bucket: 20 ms of audio per 20 ms,
+  jitter buffer and an Opus decoder straight to the worker's format (libopus
+  resamples; [D43](decisions.md#d43-inlets-decode-to-the-workers-format)),
+  is held to real time, and sent to the worker 20 ms at a time by
+  registered name, tagged with its format, so a restarted worker picks up
+  the same streams. When a restart brings a module that hears in another
+  format, the room tells the inlet, and the worker drops the few frames
+  still in the old one. The decoder is picked per packet by channel count,
+  because browsers send mono. The hold is a token bucket: 20 ms of audio per 20 ms,
   up to 300 ms saved for bursts; frames that find it empty are dropped, and
   `Room.state/1` reports the count per input
   ([D16](decisions.md#d16-inlets-are-held-to-real-time)).

@@ -79,6 +79,7 @@ architecture.md in the same change.
 | [D40](#d40-a-decision-model-hears-each-turn-and-the-agent-may-wait-for-the-floor) | A decision model hears each turn, and the agent may wait for the floor | Current |
 | [D41](#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room) | The app asks the decision model its own questions, and several agents share a room | Current |
 | [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate) | Clients send their offer at the first ICE candidate | Current |
+| [D43](#d43-inlets-decode-to-the-workers-format) | Inlets decode to the worker's format | Current |
 
 ## Removed code
 
@@ -1028,6 +1029,43 @@ Cloudflare accepts an offer with none.
 **Open.** Not yet checked against real Cloudflare: `ice_ms` should drop to
 near 0 without `connect_ms` growing by the same amount. A network that
 needs TURN is unchecked.
+
+#### D43. Inlets decode to the worker's format
+
+**Status:** Current. Replaces decoding to room PCM and converting in the
+worker.
+
+**Context.** `bench/media.exs` runs N workers' media path for real
+(`ex_webrtc` over UDP, inlet, worker server, outlet) against a second BEAM
+standing in for Cloudflare. For an agent (16 kHz mono in, 24 kHz mono out,
+both continuous) the per-frame costs were: Opus encode ~110 us, Opus decode
+~23 us, upmixing mono to room PCM ~25 us, `Audio.from_room` to 16 kHz mono
+~26 us, `Audio.to_room` from 24 kHz mono ~70 us. Half of it was converting
+to and from room PCM in Elixir.
+
+**Decision.** The room passes the worker's input format to each inlet, and
+the inlet creates its Opus decoders at that rate: libopus resamples as it
+decodes, and the result goes to the worker as-is, tagged
+(`{:octoroom_input, input, pcm, format}`). `Audio.to_room` builds its output
+in one appended binary instead of lists of tuples (same output, ~4.5x
+faster). Outlets still encode 48 kHz stereo: with automatic bitrate, mono
+and 24 kHz encoders picked a costlier mode (185–200 us a frame against
+125 us), so neither was a saving.
+
+**Consequences.** For an agent, decoding costs ~17 us a frame instead of
+~70 us, and the output conversion ~17 us instead of ~78 us. On an M1 Pro
+the benchmark's CPU fell 25–30% (40 workers: 0.78 to 0.53 cores; 80: 1.58
+to 1.19). On a 2-vCPU exe.dev VM (AMD EPYC 9554P, shared with the
+benchmark's stand-in for Cloudflare) it fell 30% (40 workers: 1.00 to 0.70
+cores), and the VM's limit moved from about 60 workers to beyond 80: before,
+80 workers fell behind (31,915 underruns, packet gaps 36 ms at p50, memory
+growing to 633 MB); after, they ran with 2 underruns and gaps of 26 ms at
+p99. Inlets outlive worker restarts, so a restart that changes the
+module's format sends the inlet `{:octoroom_format, format}`, and frames
+already decoded in the old format are dropped by the worker.
+
+**Open.** Encoding is now the largest cost. The Opus NIF doesn't expose
+encoder complexity, which would be the next lever.
 
 ## Where the code came from
 

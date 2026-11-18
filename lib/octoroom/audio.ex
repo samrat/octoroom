@@ -54,6 +54,16 @@ defmodule Octoroom.Audio do
 
   defp sum_stereo(<<>>, sl, sr), do: {sl, sr}
 
+  @doc "Converts s16le PCM between 1 and 2 channels (mono is copied to both; stereo is averaged)."
+  def rechannel(pcm, same, same) when is_binary(pcm), do: pcm
+  def rechannel(pcm, 1, 2), do: for(<<s::binary-size(2) <- pcm>>, into: <<>>, do: s <> s)
+
+  def rechannel(pcm, 2, 1) do
+    for <<l::little-signed-16, r::little-signed-16 <- pcm>>, into: <<>> do
+      <<div(l + r, 2)::little-signed-16>>
+    end
+  end
+
   @doc """
   PCM at `rate`/`channels` to room PCM, by linear interpolation. `prev` is
   the last frame of the previous call as `{left, right}` (`{0, 0}` to start);
@@ -61,25 +71,27 @@ defmodule Octoroom.Audio do
   """
   def to_room(pcm, rate, channels, prev \\ {0, 0}) when is_binary(pcm) do
     validate!(rate, channels)
-    factor = div(@room_rate, rate)
+    up(pcm, channels, div(@room_rate, rate), prev, <<>>)
+  end
 
-    frames =
-      case channels do
-        1 -> for <<s::little-signed-16 <- pcm>>, do: {s, s}
-        2 -> for <<l::little-signed-16, r::little-signed-16 <- pcm>>, do: {l, r}
-      end
+  # One input frame at a time, appending `factor` interpolated stereo frames
+  # to a binary the runtime grows in place.
+  defp up(<<s::little-signed-16, rest::binary>>, 1, factor, {pl, pr}, acc),
+    do: up(rest, 1, factor, {s, s}, steps(acc, pl, pr, s, s, 1, factor))
 
-    {out, last} =
-      Enum.reduce(frames, {[], prev}, fn {l, r} = frame, {acc, {pl, pr}} ->
-        samples =
-          for i <- 1..factor do
-            <<pl + div((l - pl) * i, factor)::little-signed-16,
-              pr + div((r - pr) * i, factor)::little-signed-16>>
-          end
+  defp up(<<l::little-signed-16, r::little-signed-16, rest::binary>>, 2, factor, {pl, pr}, acc),
+    do: up(rest, 2, factor, {l, r}, steps(acc, pl, pr, l, r, 1, factor))
 
-        {[acc | samples], frame}
-      end)
+  defp up(_partial, _channels, _factor, prev, acc), do: {acc, prev}
 
-    {IO.iodata_to_binary(out), last}
+  defp steps(acc, _pl, _pr, l, r, factor, factor),
+    do: <<acc::binary, l::little-signed-16, r::little-signed-16>>
+
+  defp steps(acc, pl, pr, l, r, i, factor) do
+    acc =
+      <<acc::binary, pl + div((l - pl) * i, factor)::little-signed-16,
+        pr + div((r - pr) * i, factor)::little-signed-16>>
+
+    steps(acc, pl, pr, l, r, i + 1, factor)
   end
 end
