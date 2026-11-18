@@ -283,7 +283,7 @@ defmodule Octoroom.Agent do
   """
   def default_questions(ctx) do
     roster = roster(ctx)
-    names = roster |> Enum.map(& &1.name) |> Enum.join(", ")
+    names = Enum.map_join(roster, ", ", & &1.name)
 
     agents =
       Map.new(roster, fn a ->
