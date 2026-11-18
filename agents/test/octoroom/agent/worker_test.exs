@@ -763,6 +763,113 @@ defmodule Octoroom.Agent.WorkerTest do
     end
   end
 
+  describe "clients" do
+    test "see a voice agent's state and transcript", ctx do
+      %{alice: alice} = start(ctx)
+
+      assert_receive {:octoroom, _,
+                      {:worker, :updated,
+                       %{id: "assistant", state: "listening", attributes: %{name: "Assistant"}}}}
+
+      say(ctx, alice, {:final, "Hi!"})
+
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "thinking"}}}
+
+      assert_receive {:octoroom, _,
+                      {:worker_notify, "assistant", "assistant", "transcript",
+                       %{role: "user", text: "Hi!", speaker: "Alice", message_id: _}}}
+
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "speaking"}}}, 1_000
+
+      assert_receive {:octoroom, _,
+                      {:worker_notify, "assistant", "assistant", "transcript",
+                       %{role: "assistant", text: "Hello there.", status: "completed"}}},
+                     1_000
+
+      # Once its 200 ms of audio has played.
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "listening"}}}, 1_000
+    end
+
+    # A text-only agent that never answers on its own: only typed messages
+    # get a reply.
+    defp text_agent(ctx) do
+      meta = %{
+        name: "Alice",
+        args: args(self(), 0),
+        agent: [voice: false, respond: :never, description: "Takes notes."]
+      }
+
+      alice = join(ctx, "alice", meta)
+      hear(ctx, alice)
+    end
+
+    test "a text-only agent catches subscribers up, and answers what they type", ctx do
+      alice = text_agent(ctx)
+
+      # Seen as soon as the room starts it; its presence follows.
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker,
+                       %{op: :added, worker: %{id: "assistant", outputs: [], data: ["assistant"]}}}}
+
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker,
+                       %{
+                         op: :updated,
+                         worker: %{state: "listening", attributes: %{description: "Takes notes."}}
+                       }}}
+
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker_event,
+                       %{type: "transcript_snapshot", data: %{items: []}}}}
+
+      # Spoken, it only listens.
+      say(ctx, alice, {:final, "Note that down."})
+
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker_event,
+                       %{type: "transcript", data: %{role: "user", text: "Note that down."}}}}
+
+      refute_receive {:llm, _}, 100
+
+      # Typed, it answers, with Alice as the speaker.
+      Server.worker_message(alice.server, alice.id, "assistant", %{"text" => "What's up?"}, :msg)
+      assert_receive {:client, "alice", {:octoroom_signal, :reply, :msg, {:ok, %{}}}}
+      assert_receive {:llm, messages}
+      assert List.last(messages) == "[Alice] What's up?"
+
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker_event,
+                       %{type: "transcript", data: %{role: "user", text: "What's up?"}}}}
+
+      assert_receive {:client, "alice",
+                      {:octoroom_signal, :worker_event,
+                       %{
+                         type: "transcript",
+                         data: %{role: "assistant", text: "Hello there.", status: "completed"}
+                       }}},
+                     1_000
+
+      # Someone who joins now gets the conversation so far.
+      join(ctx, "bob", %{name: "Bob"})
+
+      assert_receive {:client, "bob",
+                      {:octoroom_signal, :worker_event,
+                       %{type: "transcript_snapshot", data: %{items: items}}}},
+                     1_000
+
+      assert Enum.map(items, &{&1.role, &1.text}) == [
+               {"user", "Note that down."},
+               {"user", "What's up?"},
+               {"assistant", "Hello there."}
+             ]
+
+      # Only text is answered.
+      Server.worker_message(alice.server, alice.id, "assistant", %{"draw" => "a cat"}, :msg2)
+      assert_receive {:client, "alice", {:octoroom_signal, :reply, :msg2, {:ok, %{}}}}
+      refute_receive {:llm, _}, 100
+    end
+  end
+
   test "a backend that can't speak at 24 kHz doesn't start", ctx do
     assert {:stop, {:unsupported_output_sample_rate, 16_000}} =
              Octoroom.Agent.Worker.init(

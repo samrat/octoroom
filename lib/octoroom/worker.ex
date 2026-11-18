@@ -186,7 +186,8 @@ end
 defmodule Octoroom.Worker.Context do
   @moduledoc """
   What a worker knows when it starts: its room, its id, its input and output
-  track names, and the room's participants at that moment. Call
+  track names, its data outputs, and the room's participants at that
+  moment. Call
   `Octoroom.Room.state/1` for anything newer.
 
   `resumed` is set when the worker starts while its room is recovering from
@@ -199,13 +200,14 @@ defmodule Octoroom.Worker.Context do
   well as on recovery.
   """
 
-  defstruct [:room_id, :id, :resumed, :saved, inputs: [], outputs: [], participants: []]
+  defstruct [:room_id, :id, :resumed, :saved, inputs: [], outputs: [], data: [], participants: []]
 
   @type t :: %__MODULE__{
           room_id: String.t(),
           id: String.t(),
           inputs: [String.t()],
           outputs: [String.t()],
+          data: [String.t()],
           participants: [Octoroom.Participant.t()],
           resumed: nil | %{gone_ms: non_neg_integer},
           saved: term

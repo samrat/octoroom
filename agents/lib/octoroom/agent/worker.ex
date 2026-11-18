@@ -145,6 +145,31 @@ defmodule Octoroom.Agent.Worker do
 
   `speech_end` is when that speaker's VAD reported they stopped, minus its
   `min_silence_ms`. What the browser adds after the outlet isn't included.
+
+  ## Clients
+
+  Participants subscribed to its first output (its voice, or its data
+  output with `voice: false`) see it in their client (see
+  `Octoroom.Worker`'s `presence:` and `notify:`; in the browser,
+  `agents/priv/static/octoroom_agents.mjs`):
+
+    * presence: `attributes` `name` and `description` (from `agents/2`),
+      and `state`: `"listening"`, `"thinking"` (a reply started),
+      `"speaking"` (its audio is playing; until the last of it has
+      played), or `"waiting"` (holding a turn, see above)
+    * `"transcript"` events: each conversation item as it changes,
+      `message_id`, `sequence`, `role`, `text`, `status`, `interrupted`,
+      and `speaker` and `source` for people
+    * a `"transcript_snapshot"` (`%{items: [...]}`, the last
+      `:snapshot_items`, default 50) to each participant as it subscribes
+    * `"error"` events: `%{stage, fatal}`
+
+  Decisions, waiting and latency stay server-side, as `emit`s.
+
+  A client's `%{"text" => text}` message (`room.send/2`) is a turn from
+  that participant that it always answers, whatever `:respond` and the gate
+  say: typing to it is addressing it. It interrupts a reply as speaking
+  would. Other payloads are ignored.
   """
 
   use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]
@@ -206,10 +231,20 @@ defmodule Octoroom.Agent.Worker do
         turn: nil,
         # Saved (`save:`) for the next start: the context stage's memory and
         # the conversation items.
-        memory: restored(ctx.saved)
+        memory: restored(ctx.saved),
+        # What clients are told (see "Clients" in the moduledoc): the
+        # outputs it can notify on, its presence state and attributes, and
+        # the timer that sets `listening` once a reply has played.
+        outputs: ctx.outputs,
+        data: ctx.data,
+        presence: nil,
+        attributes: attributes(name, args),
+        presence_timer: nil,
+        snapshot_items: Map.get(args, :snapshot_items, 50)
       }
 
-      {state, actions} = push_back(state, %Frames.Start{session_id: session_id(ctx)}, [])
+      {state, actions} = set_presence(state, "listening", [])
+      {state, actions} = push_back(state, %Frames.Start{session_id: session_id(ctx)}, actions)
       {state, actions} = Enum.reduce(ctx.inputs, {state, actions}, &add_front/2)
       result(state, actions)
     else
@@ -242,7 +277,55 @@ defmodule Octoroom.Agent.Worker do
     result(state, actions)
   end
 
-  def handle_info({:octoroom, :outputs, _outputs}, state), do: {:ok, state}
+  def handle_info({:octoroom, :outputs, outputs}, state), do: {:ok, %{state | outputs: outputs}}
+  def handle_info({:octoroom, :data, data}, state), do: {:ok, %{state | data: data}}
+
+  # Someone can now see it on its first output: catch them up on the
+  # conversation. A restarted agent is told about everyone again.
+  def handle_info({:octoroom, :subscribed, participant_id, output}, state) do
+    case channels(state) do
+      [^output | _] ->
+        items =
+          state.memory.items
+          |> Enum.take(-state.snapshot_items)
+          |> Enum.map(&client_item/1)
+
+        snapshot = {output, "transcript_snapshot", %{items: items}, participant_id}
+        {:ok, state, notify: snapshot}
+
+      _ ->
+        {:ok, state}
+    end
+  end
+
+  def handle_info({:octoroom, :unsubscribed, _participant_id, _output}, state), do: {:ok, state}
+
+  # Typed from a client (`room.send/2`). The room only lets through people
+  # the agent hears. It's their turn, as if they'd said it, and always
+  # answered: messaging the agent is addressing it.
+  def handle_info({:octoroom, :message, participant_id, %{"text" => text}}, state)
+      when is_binary(text) do
+    case String.trim(text) do
+      "" -> {:ok, state}
+      text -> typed(participant_id, text, state)
+    end
+  end
+
+  def handle_info({:octoroom, :message, participant_id, payload}, state) do
+    Logger.debug(
+      "agent #{state.id} ignored a message from #{participant_id}: #{inspect(payload)}"
+    )
+
+    {:ok, state}
+  end
+
+  # A reply's audio has played: it's listening again.
+  def handle_info({:octoroom_agent_presence, ref}, %{presence_timer: ref} = state) do
+    {state, actions} = set_presence(state, "listening", [])
+    result(state, actions)
+  end
+
+  def handle_info({:octoroom_agent_presence, _stale}, state), do: {:ok, state}
 
   # From `Octoroom.Agent.say/3`: the words go straight to text-to-speech, as
   # a reply of their own.
@@ -288,7 +371,12 @@ defmodule Octoroom.Agent.Worker do
   # process): kept with the memory, for `Octoroom.Agent.conversation/2`.
   def handle_info({:voice_pipeline, _from, {:conversation, item} = event}, state) do
     state = update_in(state.memory.items, &put_item(&1, item))
-    {:ok, state, emit: {:agent, event}, save: state.memory}
+
+    actions =
+      [emit: {:agent, event}, save: state.memory] ++
+        to_clients(state, "transcript", client_item(item))
+
+    {:ok, state, actions}
   end
 
   def handle_info({:voice_pipeline, _from, event}, state),
@@ -675,7 +763,7 @@ defmodule Octoroom.Agent.Worker do
     )
 
     event = {:agent, {:error, %{stage: error.processor, fatal: error.fatal?, source: input}}}
-    {state, actions ++ [emit: event]}
+    {state, actions ++ [emit: event] ++ error_to_clients(state, error)}
   end
 
   defp front_command(_input, {:output_upstream, _frame}, acc), do: acc
@@ -748,7 +836,8 @@ defmodule Octoroom.Agent.Worker do
       end
 
     frame = %{frame | turn_id: seq, speaker: name, respond: respond?}
-    push_back(%{state | seq: seq}, frame, actions)
+    {state, actions} = push_back(%{state | seq: seq}, frame, actions)
+    if respond?, do: set_presence(state, "thinking", actions), else: {state, actions}
   end
 
   # Unsure: hold the turn for `wait_ms`. If nobody speaks, answer it.
@@ -758,7 +847,7 @@ defmodule Octoroom.Agent.Worker do
     Process.send_after(self(), {:octoroom_agent_floor, ref}, ms)
     waiting = %{input: input, name: name, frame: frame, ref: ref}
     event = {:agent, {:waiting, %{source: input, speaker: name, ms: ms}}}
-    {%{state | waiting: waiting}, actions ++ [emit: event]}
+    set_presence(%{state | waiting: waiting}, "waiting", actions ++ [emit: event])
   end
 
   # Someone spoke (or another turn came) before the wait ran out: the held
@@ -767,7 +856,11 @@ defmodule Octoroom.Agent.Worker do
 
   defp end_wait(%{waiting: w} = state, actions) do
     actions = actions ++ [emit: {:agent, {:waiting, nil}}]
-    commit(w.input, w.name, w.frame, false, %{state | waiting: nil}, actions)
+    {state, actions} = commit(w.input, w.name, w.frame, false, %{state | waiting: nil}, actions)
+
+    if state.presence == "waiting",
+      do: set_presence(state, "listening", actions),
+      else: {state, actions}
   end
 
   defp mode(%{respond: nil, gate: :decision}), do: :addressed
@@ -928,7 +1021,8 @@ defmodule Octoroom.Agent.Worker do
         else: []
 
     state = %{state | addressee: nil, addressee_name: nil, last_reply: nil, turn: nil}
-    tell_back(state, {:octoroom_agent_speaker, nil}, actions ++ closed)
+    {state, actions} = set_presence(state, "thinking", actions ++ closed)
+    tell_back(state, {:octoroom_agent_speaker, nil}, actions)
   end
 
   defp tell_back(state, message, actions) do
@@ -954,7 +1048,12 @@ defmodule Octoroom.Agent.Worker do
     {state, latency} = first_audio(state)
     # 24 kHz mono s16le: 48 bytes per ms.
     until = max(now(), state.speaking_until) + div(byte_size(audio), 48)
-    {%{state | speaking_until: until}, [play: {:default, audio}] ++ latency}
+
+    set_presence(
+      %{state | speaking_until: until},
+      "speaking",
+      [play: {:default, audio}] ++ latency
+    )
   end
 
   defp back_command({:output, %Frames.OutputAudio{sample_rate: rate}}, state) do
@@ -969,14 +1068,15 @@ defmodule Octoroom.Agent.Worker do
       "agent #{state.id}: #{inspect(error.processor)} failed: #{inspect(error.reason)}"
     )
 
-    {state, [emit: {:agent, {:error, %{stage: error.processor, fatal: error.fatal?}}}]}
+    event = {:agent, {:error, %{stage: error.processor, fatal: error.fatal?}}}
+    {state, [emit: event] ++ error_to_clients(state, error)}
   end
 
   defp back_command({:output_upstream, _frame}, state), do: {state, []}
   defp back_command({:notify, event}, state), do: {state, [emit: {:agent, event}]}
 
   defp back_command({:interrupted, _generation}, state),
-    do: {%{state | turn: nil, speaking_until: now()}, [flush: :default]}
+    do: set_presence(%{state | turn: nil, speaking_until: now()}, "listening", flush: :default)
 
   defp back_command({:observe, %Frames.LLMText{}}, %{turn: %{} = turn} = state)
        when not is_map_key(turn, :llm),
@@ -987,6 +1087,7 @@ defmodule Octoroom.Agent.Worker do
   defp back_command({:observe, %Frames.AssistantMessage{}}, state) do
     at = max(now(), state.speaking_until)
     state = %{state | last_reply: {state.addressee, at}}
+    {state, listening} = listening_at(state, at)
 
     if mode(state) == :addressed and state.addressee do
       window = %{
@@ -995,9 +1096,9 @@ defmodule Octoroom.Agent.Worker do
         ms: at - now() + state.follow_up_ms
       }
 
-      {state, [emit: {:agent, {:follow_up, window}}]}
+      {state, listening ++ [emit: {:agent, {:follow_up, window}}]}
     else
-      {state, []}
+      {state, listening}
     end
   end
 
@@ -1016,6 +1117,95 @@ defmodule Octoroom.Agent.Worker do
 
   defp result(state, []), do: {:ok, state}
   defp result(state, actions), do: {:ok, state, actions}
+
+  # -- Clients --
+
+  defp attributes(name, args) do
+    case Map.get(args, :description) do
+      d when is_binary(d) and d != "" -> %{name: name, description: d}
+      _ -> %{name: name}
+    end
+  end
+
+  # What it can notify on: its outputs, then its data outputs.
+  defp channels(state), do: state.outputs ++ state.data
+
+  # Its presence, if it changed. Any change cancels a pending `listening`.
+  defp set_presence(state, status, actions) do
+    state = %{state | presence_timer: nil}
+
+    if state.presence == status,
+      do: {state, actions},
+      else:
+        {%{state | presence: status},
+         actions ++ [presence: %{state: status, attributes: state.attributes}]}
+  end
+
+  # When a reply's audio will have played (now, if it has).
+  defp listening_at(state, at) do
+    case at - now() do
+      ms when ms <= 0 ->
+        set_presence(state, "listening", [])
+
+      ms ->
+        ref = make_ref()
+        Process.send_after(self(), {:octoroom_agent_presence, ref}, ms)
+        {%{state | presence_timer: ref}, []}
+    end
+  end
+
+  # `notify:` on its first output, if it has one to notify on.
+  defp to_clients(state, type, data) do
+    if channels(state) == [], do: [], else: [notify: {:default, type, data}]
+  end
+
+  defp error_to_clients(state, error),
+    do: to_clients(state, "error", %{stage: inspect(error.processor), fatal: error.fatal?})
+
+  # What clients see of a conversation item: strings and numbers only.
+  defp client_item(item),
+    do:
+      Map.take(item, [
+        :message_id,
+        :sequence,
+        :role,
+        :text,
+        :status,
+        :interrupted,
+        :speaker,
+        :source,
+        :at
+      ])
+
+  defp typed(participant_id, text, state) do
+    input =
+      Enum.find(Map.keys(state.fronts), &(participant_id(&1) == participant_id)) ||
+        "#{participant_id}/mic"
+
+    {name, state} = speaker(input, state)
+    {state, actions} = end_wait(state, [])
+
+    {state, actions} =
+      if may_interrupt?(input, state),
+        do: push_back(state, %Frames.Interruption{}, actions),
+        else: {state, actions}
+
+    event = %{
+      source: input,
+      speaker: name,
+      text: text,
+      outcome: :reply,
+      why: :typed,
+      decision: nil
+    }
+
+    actions = actions ++ [emit: {:agent, {:decision, event}}]
+    # Latency is measured from now, not from the speaker's last VAD stop.
+    state = update_in(state.vad_stop, &Map.delete(&1, input))
+    frame = %Frames.Transcription{text: text, source: input}
+    {state, actions} = commit(input, name, frame, true, state, actions)
+    result(state, actions)
+  end
 
   # -- Latency --
 

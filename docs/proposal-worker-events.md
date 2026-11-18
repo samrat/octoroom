@@ -266,7 +266,13 @@ Each step is one commit, with tests passing.
    has a worker that sets presence or notifies until step 6.)
 6. **Agents.** Presence, `transcript` events, snapshots, typed messages,
    text-only data output, and `octoroom_agents.mjs`. meet moves to scoped
-   subscribe. Tests in `agents/test` with the fake providers.
+   subscribe. Tests in `agents/test` with the fake providers. (Done
+   2026-11-18, except meet: its transcript panel shows each turn's
+   decision and latency, which stay server-side `emit`s, so it stays on
+   `scope: :room`. As built: the snapshot is a `transcript_snapshot` event
+   rather than one `transcript` per item; `Worker.Context` gained `data`;
+   the helper's tests are `test/js/octoroom_agents.test.mjs`, so `bin/test
+   js` runs them.)
 7. **Swift.** Core client changes, the `OctoroomAgents` product, and the
    iOS example.
 8. **Docs.** architecture.md (the worker contract, the channel protocol),
