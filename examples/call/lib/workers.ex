@@ -271,7 +271,7 @@ defmodule Call.SonioxSocket do
   def handle_info(:configure, state) do
     config = %{
       api_key: state.key,
-      model: "stt-rt-v5",
+      model: "stt-rt-v6",
       audio_format: "pcm_s16le",
       sample_rate: 16_000,
       num_channels: 1,
