@@ -167,6 +167,87 @@ defmodule Octoroom.RoomTest do
     assert hears(ctx) == %{"alice" => ["#{bob2.id}/mic"], "bob" => ["#{alice.id}/mic"]}
   end
 
+  test "telemetry times each step of a join", ctx do
+    test = self()
+    room_id = ctx.room_id
+    handler = "join-#{room_id}"
+
+    :telemetry.attach_many(
+      handler,
+      [[:octoroom, :participant, :connected], [:octoroom, :participant, :first_pull]],
+      fn event, measurements, meta, _ ->
+        if meta.room_id == room_id, do: send(test, {:telemetry, event, measurements, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    alice = join(ctx, "alice")
+    Server.publish(alice.server, alice.id, "offer:alice", %{"mic" => "0"}, :pub)
+
+    assert_receive {:client, "alice",
+                    {:octoroom_signal, :reply, :pub, {:ok, %{sdp: "answer:" <> session}}}}
+
+    FakeCloudflare.mark_live(ctx.fake, session, "#{alice.id}/mic")
+    Server.connected(alice.server, alice.id, %{media_ms: 600, ice_ms: 2001, ice_timed_out: true})
+
+    alice_id = alice.id
+    assert_receive {:telemetry, [:octoroom, :participant, :connected], m, %{id: ^alice_id} = meta}
+    assert %{client_media_ms: 600, client_ice_ms: 2001} = m
+
+    for key <- [:duration_ms, :before_publish_ms, :publish_ms, :connect_ms],
+        do: assert(is_integer(m[key]) and m[key] >= 0, "#{key}: #{inspect(m[key])}")
+
+    assert m.duration_ms == m.before_publish_ms + m.publish_ms + m.connect_ms
+    assert meta.ice_timed_out and meta.sources == ["mic"]
+
+    # Reported once: a later `connected` (after publishing more) isn't a join.
+    Server.connected(alice.server, alice.id)
+    refute_receive {:telemetry, [:octoroom, :participant, :connected], _, _}, 50
+
+    # Alone, she hears nobody; once bob is live, she does.
+    refute_received {:telemetry, [:octoroom, :participant, :first_pull], _, _}
+    bob = join(ctx, "bob") |> then(&publish(ctx, &1))
+    accept_pull(alice)
+    accept_pull(bob)
+
+    assert_receive {:telemetry, [:octoroom, :participant, :first_pull], first, %{id: ^alice_id}}
+    assert %{tracks: 1, since_connected_ms: since} = first
+    assert first.duration_ms >= since
+
+    # Bob's join was timed by the server alone: his client sent no timings.
+    bob_id = bob.id
+    assert_received {:telemetry, [:octoroom, :participant, :connected], bob_m, %{id: ^bob_id}}
+    refute Map.has_key?(bob_m, :client_ice_ms)
+    assert_received {:telemetry, [:octoroom, :participant, :first_pull], _, %{id: ^bob_id}}
+  end
+
+  test "the default logger logs a line per step of a join" do
+    meta = %{room_id: "r", id: "p", sources: ["mic"], ice_timed_out: true}
+
+    client = %{
+      duration_ms: 3412,
+      before_publish_ms: 2700,
+      publish_ms: 410,
+      connect_ms: 302,
+      client_join_ms: 80,
+      client_media_ms: 600,
+      client_ice_ms: 2001,
+      client_publish_ms: 430,
+      client_connect_ms: 190
+    }
+
+    assert Octoroom.Telemetry.format([:octoroom, :participant, :connected], client, meta) ==
+             "Octoroom r p connected in 3412 ms: join 80, media 600, ice 2001 (timed out), " <>
+               "publish 430, connect 190"
+
+    server = Map.take(client, [:duration_ms, :before_publish_ms, :publish_ms, :connect_ms])
+
+    assert Octoroom.Telemetry.format([:octoroom, :participant, :connected], server, meta) ==
+             "Octoroom r p connected in 3412 ms: before publish 2700, publish 410, connect 302"
+  end
+
   test "pulls for several tracks go in one call", ctx do
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     bob = join(ctx, "bob") |> then(&publish(ctx, &1))

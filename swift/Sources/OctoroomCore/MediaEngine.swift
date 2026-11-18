@@ -66,6 +66,9 @@ public protocol PeerConnection: AnyObject {
   func setRemoteDescription(_ type: SDPType, sdp: String) async throws
   /// Returns when ICE gathering completes, or after `timeout`.
   func iceGatheringComplete(timeout: Duration) async
+  /// Returns true once the local description has a first ICE candidate (or
+  /// gathering completed), false after `timeout` or once closed.
+  func firstIceCandidate(timeout: Duration) async -> Bool
   func stats() async -> [StatsEntry]
   func close()
 }

@@ -227,8 +227,23 @@ defmodule Octoroom.WorkerTest do
 
   test "a private echo: a worker's output goes live and only its owner hears it", ctx do
     Octoroom.subscribe(ctx.room_id)
-    %{alice: alice, echo: echo} = live_echo(ctx)
+    test = self()
+    handler = "outlet-#{ctx.room_id}"
+
+    :telemetry.attach(
+      handler,
+      [:octoroom, :outlet, :live],
+      fn _, m, meta, _ ->
+        if meta.room_id == ctx.room_id, do: send(test, {:outlet_live, m, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    %{alice: alice, echo: echo, worker_id: worker_id} = live_echo(ctx)
     assert_receive {:octoroom, _, {:output_live, ^echo}}
+    assert_received {:outlet_live, %{duration_ms: ms}, %{name: ^echo, worker_id: ^worker_id}}
+    assert is_integer(ms) and ms >= 0
 
     state = Octoroom.Room.state(ctx.room_id)
     assert %{^echo => %{status: :live}} = state.outputs

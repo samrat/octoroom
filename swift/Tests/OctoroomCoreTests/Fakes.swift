@@ -245,6 +245,12 @@ final class FakePeer: PeerConnection {
 
   func iceGatheringComplete(timeout: Duration) async {}
 
+  var firstIceCandidateWaits: [Duration] = []
+  func firstIceCandidate(timeout: Duration) async -> Bool {
+    firstIceCandidateWaits.append(timeout)
+    return true
+  }
+
   func stats() async -> [StatsEntry] { stats }
 
   func close() { closed = true }

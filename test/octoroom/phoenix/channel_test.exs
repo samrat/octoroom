@@ -71,4 +71,31 @@ defmodule Octoroom.Phoenix.ChannelTest do
     assert {:reply, :ok, _} = Channel.__handle_in__("mute", payload, ctx.socket)
     assert_received {:"$gen_cast", {:mute, "p", "mic", true}}
   end
+
+  test "connected forwards the client's join timings, keeping only known numbers", ctx do
+    assert {:reply, :ok, _} = Channel.__handle_in__("connected", %{}, ctx.socket)
+    assert_received {:"$gen_cast", {:connected, "p", timings}}
+    assert timings == %{}
+
+    payload = %{
+      "timings" => %{
+        "join_ms" => 80,
+        "media_ms" => 612.5,
+        "ice_ms" => 2001,
+        "ice_timed_out" => true,
+        "publish_ms" => -1,
+        "connect_ms" => "190",
+        "made_up_ms" => 1
+      }
+    }
+
+    assert {:reply, :ok, _} = Channel.__handle_in__("connected", payload, ctx.socket)
+    assert_received {:"$gen_cast", {:connected, "p", timings}}
+    assert timings == %{join_ms: 80, media_ms: 612.5, ice_ms: 2001, ice_timed_out: true}
+
+    payload = %{"timings" => %{"ice_timed_out" => "yes"}}
+    assert {:reply, :ok, _} = Channel.__handle_in__("connected", payload, ctx.socket)
+    assert_received {:"$gen_cast", {:connected, "p", timings}}
+    assert timings == %{}
+  end
 end

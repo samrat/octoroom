@@ -80,6 +80,8 @@ final class Harness {
     #expect(publish.payload["mids"] == ["mic": "l0"])
     #expect(publish.payload["sdp"] == "offer 1")
     #expect(h.engine.pc.iceServers == [IceServer(urls: ["stun:stun.cloudflare.com:3478"])])
+    // The offer waited only briefly for a first candidate, not for gathering.
+    #expect(h.engine.pc.firstIceCandidateWaits == [.milliseconds(100)])
     h.server.reply(publish, ["sdp": "cloudflare answer"])
     try await until { h.engine.pc.remoteSDP == "cloudflare answer" }
     #expect(h.room.state == .joining)
