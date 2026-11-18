@@ -10,7 +10,7 @@ defmodule Octoroom.Agent.STT.SonioxTest do
       terminating?: false,
       config: %{
         api_key: "soniox-key",
-        model: "stt-rt-v5",
+        model: "stt-rt-v6",
         audio_format: "pcm_s16le",
         sample_rate: 16_000,
         num_channels: 1,

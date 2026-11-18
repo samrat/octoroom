@@ -9,7 +9,7 @@ defmodule Octoroom.Agent.SpeechProvider do
   Finds the provider in `opts` (a keyword list or map).
 
   `:provider` is a registered name (`:soniox`, `"soniox"`) or a module that
-  implements `behaviour`. Without one, a `:model` like `"soniox:stt-rt-v5"`
+  implements `behaviour`. Without one, a `:model` like `"soniox:stt-rt-v6"`
   names both. The provider's `default_options/0` fill in what `opts` leaves
   out. Returns the module and the merged options, without `:provider`.
   """
@@ -27,8 +27,8 @@ defmodule Octoroom.Agent.SpeechProvider do
 
   @doc """
   Moves the provider out of a `"provider:model"` model, when the prefix is a
-  registered provider: `%{model: "soniox:stt-rt-v5"}` becomes
-  `%{provider: :soniox, model: "stt-rt-v5"}`. Other configs are unchanged.
+  registered provider: `%{model: "soniox:stt-rt-v6"}` becomes
+  `%{provider: :soniox, model: "stt-rt-v6"}`. Other configs are unchanged.
   """
   def split_model(%{model: model} = config, registry) when is_binary(model) do
     with [prefix, id] <- String.split(model, ":", parts: 2),
@@ -43,7 +43,7 @@ defmodule Octoroom.Agent.SpeechProvider do
   def split_model(config, _registry), do: config
 
   @doc """
-  Puts a `provider` argument into `opts`: `"soniox:stt-rt-v5"` as the model,
+  Puts a `provider` argument into `opts`: `"soniox:stt-rt-v6"` as the model,
   `"soniox"`, `:soniox` or a module as the provider.
   """
   def with_provider(provider, opts) when is_binary(provider) do

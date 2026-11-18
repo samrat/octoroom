@@ -5,7 +5,7 @@ defmodule Octoroom.Agent.STT do
   A provider is a process, usually a WebSocket client, that one owner feeds
   with audio and that reports back with messages:
 
-      {:ok, stt} = Octoroom.Agent.STT.start_link("soniox:stt-rt-v5", sample_rate: 16_000)
+      {:ok, stt} = Octoroom.Agent.STT.start_link("soniox:stt-rt-v6", sample_rate: 16_000)
       Octoroom.Agent.STT.send_audio(stt, pcm)
       # receive {:stt, ^stt, {:final, "hello"}}
 
