@@ -660,6 +660,24 @@ defmodule Octoroom.Room.Server do
     end
   end
 
+  # A worker's output started talking again. Listeners whose pulls of it
+  # failed (Cloudflare can answer "track not found" for a track that has
+  # just started, or gone quiet) try again now, even ones that gave up.
+  def handle_info({:outlet_spurt, name, pid}, state) do
+    case state.outlets[name] do
+      %{pid: ^pid, status: :live} ->
+        {cleared, failures} =
+          Map.split_with(state.failures, fn {{id, n}, _} -> n == name and is_binary(id) end)
+
+        if cleared == %{},
+          do: {:noreply, state},
+          else: {:noreply, reconcile(%{state | failures: failures})}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:peer_result, worker_id, pid, result}, state) do
     case state.peers[worker_id] do
       %{pid: ^pid} -> {:noreply, state |> peer_result(worker_id, result) |> reconcile()}

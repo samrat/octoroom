@@ -203,17 +203,20 @@ defmodule Octoroom.WorkerTest do
 
     wait_until(fn -> connected(ctx)[worker_id] == [mic] end)
 
-    # Nothing to pull until the echo has sent a frame.
-    refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 50
-    FakeCloudflare.egress(ctx.fake, session, mic, @frame)
-    assert_receive {:ingest, ^cf_track, frame}
-    assert byte_size(frame) == 3_840
+    # Once its connection is up, the echo sends a frame of silence, so it's
+    # live, and alice pulls it, before it has anything to say.
+    assert_receive {:ingest, ^cf_track, silence}
+    assert silence == :binary.copy(<<0>>, 3_840)
 
     echo = "#{alice.id}/echo"
     # The server may pull before the fake has processed the first frame;
     # that pull fails as empty and is retried after 0.5 s.
     assert [%{track: ^echo, participant_id: nil, worker_id: ^worker_id}] =
              accept_pull(alice, 1_500)
+
+    FakeCloudflare.egress(ctx.fake, session, mic, @frame)
+    assert_receive {:ingest, ^cf_track, frame}
+    assert frame != silence
 
     %{
       alice: alice,
