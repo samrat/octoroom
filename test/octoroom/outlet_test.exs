@@ -11,10 +11,15 @@ defmodule Octoroom.OutletTest do
     %{room_id: room_id, outlet: pid}
   end
 
-  # The test is the sink: it receives `{:octoroom_pcm, frame}`.
+  # The test is the sink: it receives `{:octoroom_pcm, frame}`. The outlet
+  # sends a frame of silence and goes live at once.
   defp connect(ctx) do
     test = self()
     send(ctx.outlet, {:octoroom_sink, {:pcm, &send(test, {:octoroom_pcm, &1})}})
+    assert_receive {:octoroom_pcm, silence}
+    assert silence == :binary.copy(<<0>>, @frame)
+    assert_receive {:outlet_live, "out", pid}
+    assert pid == ctx.outlet
   end
 
   defp frames(n, byte \\ 1), do: :binary.copy(<<byte>>, n * @frame)
@@ -27,13 +32,25 @@ defmodule Octoroom.OutletTest do
     end
   end
 
+  test "sends a frame of silence once connected, so the track is live before it speaks", ctx do
+    connect(ctx)
+    refute_receive {:octoroom_pcm, _}, 50
+
+    assert %{sent: 1, live: true, connected: true, underruns: 0} =
+             Outlet.stats(ctx.room_id, "out")
+
+    # Speaking later starts a talkspurt; it isn't live a second time.
+    Outlet.play(ctx.room_id, "out", frames(1))
+    assert_receive {:outlet_spurt, "out", _}
+    assert_receive {:octoroom_pcm, _}
+    refute_received {:outlet_live, _, _}
+  end
+
   test "paces queued audio to one frame per 20 ms and reports live once", ctx do
     connect(ctx)
     started = System.monotonic_time(:millisecond)
     Outlet.play(ctx.room_id, "out", frames(10))
 
-    assert_receive {:outlet_live, "out", pid}
-    assert pid == ctx.outlet
     received = collect(100)
     assert length(received) == 10
     assert Enum.all?(received, fn {_, f} -> byte_size(f) == @frame end)
@@ -43,8 +60,22 @@ defmodule Octoroom.OutletTest do
     assert last - started >= 170
     refute_received {:outlet_live, _, _}
 
-    assert %{sent: 10, queued_ms: 0, live: true, connected: true, underruns: 1} =
+    assert %{sent: 11, queued_ms: 0, live: true, connected: true, underruns: 1} =
              Outlet.stats(ctx.room_id, "out")
+  end
+
+  test "tells the room when talking starts again after a pause", ctx do
+    connect(ctx)
+    Outlet.play(ctx.room_id, "out", frames(2))
+    assert_receive {:outlet_spurt, "out", _}
+    assert length(collect(80)) == 2
+    refute_received {:outlet_spurt, _, _}
+
+    Outlet.play(ctx.room_id, "out", frames(2))
+    assert_receive {:outlet_spurt, "out", pid}
+    assert pid == ctx.outlet
+    assert length(collect(80)) == 2
+    refute_received {:outlet_spurt, _, _}
   end
 
   test "holds a partial frame until the rest arrives", ctx do
@@ -76,9 +107,6 @@ defmodule Octoroom.OutletTest do
     refute_received {:outlet_live, _, _}
 
     connect(ctx)
-    Outlet.play(ctx.room_id, "out", frames(1))
-    assert_receive {:octoroom_pcm, _}
-    assert_receive {:outlet_live, "out", _}
   end
 
   # The test stands in for the peer connection: `PeerConnection.send_rtp/3`
@@ -93,6 +121,9 @@ defmodule Octoroom.OutletTest do
 
   test "sends Opus over RTP, with the clock moving on across a pause", ctx do
     send(ctx.outlet, {:octoroom_sink, {:rtp, self(), "track"}})
+    # The frame of silence it sends once connected.
+    [silence] = rtp(30)
+    assert silence.marker
 
     tone =
       for n <- 0..959, into: <<>> do
@@ -102,6 +133,7 @@ defmodule Octoroom.OutletTest do
 
     Outlet.play(ctx.room_id, "out", :binary.copy(tone, 3))
     [a, b, c] = rtp(100)
+    assert a.sequence_number == rem(silence.sequence_number + 1, 65_536)
 
     assert a.marker and not b.marker and not c.marker
     assert b.sequence_number == rem(a.sequence_number + 1, 65_536)

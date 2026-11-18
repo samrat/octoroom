@@ -236,6 +236,13 @@ Cloudflare added, and the failed ones are retried.
 
 **Consequences.** A client that lies only delays others hearing it.
 
+**Later.** A pushed track that has never sent a packet is forgotten:
+after 60 s, pulls of it fail with `not_found_track_error` even once it is
+sending, so a meet agent that first spoke a minute in was never heard. One
+packet once the connection is up keeps it pullable through 60 s of
+silence (checked against real Cloudflare), so an outlet sends a frame of
+silence as soon as it has its sink, and goes live then.
+
 #### D9. Events go through a Registry
 
 **Status:** Current. The draft said Phoenix PubSub.

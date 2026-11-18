@@ -12,8 +12,10 @@ defmodule Octoroom.Outlet do
   queued minus that is what listeners heard. Audio played before the track is pushed and its
   connection is up is dropped as it comes due, as a live stream would be.
 
-  The first frame sent tells the room server the track is live, so
-  listeners can pull it. The outlet is separate from its worker: if the
+  Once its connection is up, the outlet sends one frame of silence, so
+  Cloudflare keeps the track however long the worker stays quiet. The first
+  frame sent tells the room server the track is live, so listeners can
+  pull it. The outlet is separate from its worker: if the
   worker crashes, the track stays published.
   """
 
@@ -29,6 +31,7 @@ defmodule Octoroom.Outlet do
   # Behind by more than this (a long GC pause, a suspended VM), the clock
   # restarts instead of sending a burst to catch up.
   @max_lag_ms 100
+  @silence :binary.copy(<<0>>, @frame_bytes)
 
   def start_link(%{room_id: room_id, name: name} = opts),
     do: GenServer.start_link(__MODULE__, opts, name: via(room_id, name))
@@ -134,7 +137,18 @@ defmodule Octoroom.Outlet do
   @impl true
   def handle_info({:timeout, _ref, :tick}, state), do: {:noreply, tick(state)}
 
-  def handle_info({:octoroom_sink, sink}, state), do: {:noreply, %{state | sink: sink}}
+  # Cloudflare forgets a pushed track that has sent nothing for a while
+  # (pulls of it fail with `not_found_track_error`, packets or not), while
+  # one that has sent a packet stays pullable through long silences. So the
+  # outlet sends a frame of silence as soon as it can, which also makes the
+  # track live, and pullable, before its worker first speaks.
+  def handle_info({:octoroom_sink, sink}, state) do
+    state = %{state | sink: sink}
+
+    if state.live or state.next != nil,
+      do: {:noreply, state},
+      else: {:noreply, %{send_frame(state, @silence) | spurt: true}}
+  end
 
   def handle_info(_message, state), do: {:noreply, state}
 
@@ -158,10 +172,19 @@ defmodule Octoroom.Outlet do
 
   defp send_frame(%{sink: nil} = state, _frame), do: %{state | dropped: state.dropped + 1}
 
+  # The room hears when the track first goes live, and again when each later
+  # talkspurt starts, so it can retry pulls that failed while it was quiet.
   defp send_frame(state, frame) do
+    spurt? = state.spurt
     state = deliver(state, frame)
-    unless state.live, do: send(state.server, {:outlet_live, state.name, self()})
-    %{state | live: true, sent: state.sent + 1}
+
+    cond do
+      not state.live -> send(state.server, {:outlet_live, state.name, self()})
+      spurt? -> send(state.server, {:outlet_spurt, state.name, self()})
+      true -> :ok
+    end
+
+    %{state | live: true, spurt: false, sent: state.sent + 1}
   end
 
   defp deliver(%{sink: {:pcm, fun}} = state, frame) do
