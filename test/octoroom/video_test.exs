@@ -84,7 +84,7 @@ defmodule Octoroom.VideoTest do
   end
 
   test "participants see each other's cameras, labelled by kind and source", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     alice_id = alice.id
 
@@ -155,7 +155,7 @@ defmodule Octoroom.VideoTest do
   end
 
   test "unpublishing closes everyone's pulls first, then the publisher's track", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     bob = join(ctx, "bob") |> then(&publish(ctx, &1, %{"mic" => "0"}))
     accept_pull(alice)
@@ -191,7 +191,7 @@ defmodule Octoroom.VideoTest do
   end
 
   test "mute is a flag on the publication, with no renegotiation", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     alice_id = alice.id
     Server.mute(alice.server, alice.id, "camera", true)

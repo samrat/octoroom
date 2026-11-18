@@ -197,7 +197,7 @@ defmodule Octoroom.Agent.WorkerTest do
   # Alice joins and publishes her mic. The agent pulls it, and once it has
   # heard her, it can talk.
   defp start(ctx, reply_ms \\ 200, extra \\ %{}) do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     {agent, extra} = Map.pop(extra, :agent)
     meta = %{name: "Alice", args: args(self(), reply_ms, extra)}
     meta = if agent, do: Map.put(meta, :agent, agent), else: meta

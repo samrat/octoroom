@@ -110,7 +110,8 @@ defmodule Octoroom.Agent.Worker do
 
   ## Events
 
-  The worker `emit`s, to the room's subscribers (`Octoroom.subscribe/1`):
+  The worker `emit`s, to the room's `scope: :room` subscribers
+  (`Octoroom.subscribe/2`):
 
     * `{:agent, {:conversation, item}}` - a finished item (see
       `Octoroom.Agent.ConversationEvents`); user items carry `speaker` and

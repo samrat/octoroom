@@ -263,7 +263,7 @@ defmodule Call.CallLive do
     viewer = Base.url_encode64(:crypto.strong_rand_bytes(6), padding: false)
 
     if connected?(socket) do
-      Octoroom.subscribe(room)
+      Octoroom.subscribe(room, scope: :room)
       # Outlet stats (queue length, underruns) change without room events.
       :timer.send_interval(1_000, :refresh)
       Phoenix.PubSub.subscribe(Call.PubSub, presence_topic(room))

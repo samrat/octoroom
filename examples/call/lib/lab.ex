@@ -83,7 +83,7 @@ defmodule Call.LabLive do
     room = params["room"] || "lobby"
 
     if connected?(socket) do
-      Octoroom.subscribe(room)
+      Octoroom.subscribe(room, scope: :room)
       # Assign changes (assistant on/off, settings) send no room event.
       :timer.send_interval(1_000, :refresh)
     end

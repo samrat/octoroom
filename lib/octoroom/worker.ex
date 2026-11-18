@@ -43,7 +43,7 @@ defmodule Octoroom.Worker do
       output's outlet wasn't running), so what it queued minus `dropped_ms`
       is what listeners heard, give or take the frame on its way.
     * `emit: event`: broadcast `{:worker_event, worker_id, event}` to the
-      room's subscribers (see `Octoroom.subscribe/1`).
+      room's `scope: :room` subscribers (see `Octoroom.subscribe/2`).
     * `save: term`: keep `term` in the store (`Octoroom.Store`) as what
       this worker would need to carry on, such as its conversation so far.
       Each save replaces the last. The worker's next start in the same room

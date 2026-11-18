@@ -124,7 +124,7 @@ defmodule Octoroom.RoomTest do
   end
 
   test "two participants hear each other, and leave and rejoin works", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 50
 
@@ -165,6 +165,42 @@ defmodule Octoroom.RoomTest do
     assert id == bob2.id
     accept_pull(bob2)
     assert hears(ctx) == %{"alice" => ["#{bob2.id}/mic"], "bob" => ["#{alice.id}/mic"]}
+  end
+
+  test "a participant-scoped subscriber gets what that participant's client gets", ctx do
+    # Before the room exists, and for an id that never joins: nothing arrives.
+    Octoroom.subscribe(ctx.room_id, scope: {:participant, "nobody"})
+
+    alice = join(ctx, "alice") |> then(&publish(ctx, &1))
+    alice_id = alice.id
+    Octoroom.subscribe(ctx.room_id, scope: {:participant, alice_id})
+
+    bob = join(ctx, "bob") |> then(&publish(ctx, &1))
+    bob_id = bob.id
+    assert_receive {:octoroom, _, {:joined, %{id: ^bob_id}}}
+    assert_receive {:octoroom, _, {:published, %{id: ^bob_id}}}
+    accept_pull(alice)
+    accept_pull(bob)
+
+    # Room-wide events stay with `scope: :room` subscribers.
+    refute_receive {:octoroom, _, {:subscriptions, _, _}}, 50
+
+    Client.stop(bob)
+    assert_receive {:octoroom, _, {:left, %{id: ^bob_id}}}
+    accept_close(alice)
+
+    # One message per event: the "nobody" subscription got none of them.
+    refute_receive {:octoroom, _, {:joined, _}}, 50
+    refute_receive {:octoroom, _, {:left, _}}, 50
+  end
+
+  test "subscribe/2 refuses a missing or unknown scope", ctx do
+    assert_raise ArgumentError, fn -> Octoroom.subscribe(ctx.room_id, []) end
+    assert_raise ArgumentError, fn -> Octoroom.subscribe(ctx.room_id, scope: :all) end
+
+    assert_raise ArgumentError, fn ->
+      Octoroom.subscribe(ctx.room_id, scope: {:participant, 1})
+    end
   end
 
   test "telemetry times each step of a join", ctx do
@@ -300,7 +336,7 @@ defmodule Octoroom.RoomTest do
   end
 
   test "a participant that doesn't answer is removed", ctx do
-    Octoroom.subscribe(ctx.room_id)
+    Octoroom.subscribe(ctx.room_id, scope: :room)
     alice = join(ctx, "alice") |> then(&publish(ctx, &1))
     _bob = join(ctx, "bob") |> then(&publish(ctx, &1))
     alice_id = alice.id
@@ -383,7 +419,7 @@ defmodule Octoroom.RoomTest do
 
     test "subscriptions/2 failing for one listener keeps what it holds, and others reconcile",
          ctx do
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
       alice = join(ctx, "alice", PolicyRoom) |> then(&publish(ctx, &1))
 
       bob =
@@ -431,7 +467,7 @@ defmodule Octoroom.RoomTest do
     end
 
     test "workers/1 failing keeps the running workers, and listeners still reconcile", ctx do
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
       test = self()
       room_id = ctx.room_id
       handler = {__MODULE__, make_ref()}
@@ -473,7 +509,7 @@ defmodule Octoroom.RoomTest do
     end
 
     test "an update_meta/3 function that fails leaves the metadata alone", ctx do
-      Octoroom.subscribe(ctx.room_id)
+      Octoroom.subscribe(ctx.room_id, scope: :room)
       alice = join(ctx, "alice", PolicyRoom)
       ref = Process.monitor(alice.server)
       update = &Octoroom.Room.update_meta(ctx.room_id, alice.id, &1)
