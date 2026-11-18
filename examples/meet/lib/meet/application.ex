@@ -7,6 +7,9 @@ defmodule Meet.Application do
 
   @impl true
   def start(_type, _args) do
+    # Logs how long each step of a join takes.
+    Octoroom.Telemetry.attach_default_logger()
+
     children = [
       MeetWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:meet, :dns_cluster_query) || :ignore},

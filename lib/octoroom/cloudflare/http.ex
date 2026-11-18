@@ -187,13 +187,17 @@ defmodule Octoroom.Cloudflare.HTTP do
     result = request_fun.(opts)
     elapsed = System.monotonic_time(:millisecond) - started
 
+    response = handle_response(path, result)
+
     :telemetry.execute([:octoroom, :cloudflare, :request], %{duration_ms: elapsed}, %{
+      room_id: config[:room_id],
       method: method,
-      path: path
+      path: path,
+      result: elem(response, 0)
     })
 
     Logger.debug("Cloudflare #{method} #{path} in #{elapsed} ms")
-    handle_response(path, result)
+    response
   end
 
   defp handle_response(path, {:ok, %{status: status, body: body}}) when status in 200..299 do

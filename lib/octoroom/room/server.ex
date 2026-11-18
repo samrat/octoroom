@@ -120,9 +120,13 @@ defmodule Octoroom.Room.Server do
   def mute(server, participant_id, source, muted),
     do: GenServer.cast(server, {:mute, participant_id, source, muted})
 
-  @doc "The participant's connection to Cloudflare is up, so what it published is flowing."
-  def connected(server, participant_id),
-    do: GenServer.cast(server, {:connected, participant_id})
+  @doc """
+  The participant's connection to Cloudflare is up, so what it published is
+  flowing. `timings` are the client's own measurements of its join (see
+  `Octoroom.Telemetry`), already checked by the channel.
+  """
+  def connected(server, participant_id, timings \\ %{}),
+    do: GenServer.cast(server, {:connected, participant_id, timings})
 
   @doc "The participant's answer to a `:renegotiate` offer."
   def answer(server, participant_id, op_id, sdp, tag),
@@ -172,7 +176,8 @@ defmodule Octoroom.Room.Server do
     room_id = Keyword.fetch!(opts, :room_id)
     module = Keyword.fetch!(opts, :module)
     run = Keyword.fetch!(opts, :run)
-    cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
+    # The room id goes along to tag telemetry of Cloudflare calls.
+    cf = opts |> Keyword.get_lazy(:cloudflare, &Cloudflare.config/0) |> Map.put(:room_id, room_id)
     now = Store.now()
     Store.put(store, :rooms, room_id, %{run: run, assigns: assigns, updated_at: now})
     # A fresh room: what workers saved belongs to an earlier one that
@@ -423,6 +428,8 @@ defmodule Octoroom.Room.Server do
             tracks =
               for {source, mid} <- mids, do: %{mid: mid, track_name: track_name(id, source)}
 
+            p = %{p | timeline: %{joined: p.timeline.joined, publish: now_ms()}}
+
             run(state, id, :publish, fn ->
               with {:ok, session} <- Cloudflare.new_session(cf),
                    {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
@@ -538,9 +545,11 @@ defmodule Octoroom.Room.Server do
     end)
   end
 
-  defp cast({:connected, id}, state) do
+  defp cast({:connected, id, timings}, state) do
     with_participant(state, id, fn p ->
       pending = for {source, %{status: :pending}} <- p.tracks, do: source
+      p = connected_telemetry(state, p, timings)
+      state = put_p(state, p)
 
       if p.media == :pending or pending != [] do
         media = if p.media == :pending, do: :live, else: p.media
@@ -643,7 +652,7 @@ defmodule Octoroom.Room.Server do
       %{pid: ^pid, status: :pending} = o ->
         state = put_in(state.outlets[name], %{o | status: :live})
         failures = Map.reject(state.failures, fn {{_, n}, _} -> n == name end)
-        Octoroom.broadcast(state.id, {:output_live, name})
+        output_live(state, name, o)
         {:noreply, reconcile(%{state | failures: failures})}
 
       _ ->
@@ -735,7 +744,8 @@ defmodule Octoroom.Room.Server do
         media: :pending,
         publish_tag: nil,
         publishing: %{},
-        tracks: tracks
+        tracks: tracks,
+        timeline: Map.put(p.timeline, :published, now_ms())
     }
 
     signal(p, :resume, resume_data(p))
@@ -926,6 +936,8 @@ defmodule Octoroom.Room.Server do
       %{duration_ms: System.monotonic_time(:millisecond) - op.started, tracks: length(op.names)},
       %{room_id: state.id, participant_id: p.id}
     )
+
+    p = first_pull_telemetry(state, p, length(op.names))
 
     added = track_infos(state, p, op.names)
     signal(p, :tracks, %{added: added, removed: []})
@@ -1344,7 +1356,8 @@ defmodule Octoroom.Room.Server do
             cf_track: cf_track,
             session_id: nil,
             status: :creating,
-            live_seen: false
+            live_seen: false,
+            started: now_ms()
           }
 
           put_in(state.outlets[name], outlet)
@@ -1436,7 +1449,7 @@ defmodule Octoroom.Room.Server do
     case state.outlets[name] do
       %{worker_id: ^worker_id, status: :creating} = o ->
         status = if o.live_seen, do: :live, else: :pending
-        if status == :live, do: Octoroom.broadcast(state.id, {:output_live, name})
+        if status == :live, do: output_live(state, name, o)
         failures = Map.delete(state.failures, {:media, {:outlet, name}})
         o = %{o | session_id: session_id, status: status}
         %{state | failures: failures, outlets: Map.put(state.outlets, name, o)}
@@ -1676,8 +1689,69 @@ defmodule Octoroom.Room.Server do
       subs: %{},
       op: nil,
       # The grace timer while its connection is down.
-      disconnected: nil
+      disconnected: nil,
+      # When each step of its join happened (monotonic ms), for telemetry:
+      # :joined, then :publish, :published, :connected and :first_pull as
+      # they come. A publish on a new session starts again from :publish.
+      timeline: %{joined: now_ms()}
     }
+  end
+
+  ## Join telemetry
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  # The first `connected` after a publish: the join is done, as far as the
+  # participant's own media goes. Not for an adopted session, whose publish
+  # happened in an earlier run.
+  defp connected_telemetry(state, %{timeline: %{published: published} = t} = p, timings)
+       when not is_map_key(t, :connected) do
+    now = now_ms()
+
+    server = %{
+      duration_ms: now - t.joined,
+      before_publish_ms: t.publish - t.joined,
+      publish_ms: published - t.publish,
+      connect_ms: now - published
+    }
+
+    {flags, client} = Map.split(timings, [:ice_timed_out])
+    client = Map.new(client, fn {k, v} -> {:"client_#{k}", v} end)
+
+    meta =
+      Map.merge(flags, %{room_id: state.id, id: p.id, sources: Map.keys(p.tracks)})
+
+    :telemetry.execute([:octoroom, :participant, :connected], Map.merge(client, server), meta)
+    %{p | timeline: Map.put(t, :connected, now)}
+  end
+
+  defp connected_telemetry(_state, p, _timings), do: p
+
+  # The first pull into a connected participant's session finished: from
+  # here it hears someone.
+  defp first_pull_telemetry(state, %{timeline: %{connected: connected} = t} = p, tracks)
+       when not is_map_key(t, :first_pull) do
+    now = now_ms()
+
+    :telemetry.execute(
+      [:octoroom, :participant, :first_pull],
+      %{duration_ms: now - t.joined, since_connected_ms: now - connected, tracks: tracks},
+      %{room_id: state.id, id: p.id}
+    )
+
+    %{p | timeline: Map.put(t, :first_pull, now)}
+  end
+
+  defp first_pull_telemetry(_state, p, _tracks), do: p
+
+  defp output_live(state, name, outlet) do
+    :telemetry.execute(
+      [:octoroom, :outlet, :live],
+      %{duration_ms: now_ms() - outlet.started},
+      %{room_id: state.id, name: name, worker_id: outlet.worker_id}
+    )
+
+    Octoroom.broadcast(state.id, {:output_live, name})
   end
 
   defp add_participant(state, p) do

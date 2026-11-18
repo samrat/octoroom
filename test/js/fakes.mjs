@@ -193,7 +193,8 @@ export class FakePeerConnection {
   static instances = []
   static autoConnect = true
   // What a new connection's ICE gathering state is: "gathering" makes the
-  // client wait for `setIceGatheringState("complete")`.
+  // client wait for a candidate (`addCandidate`), or for
+  // `setIceGatheringState("complete")`.
   static iceGatheringState = "complete"
 
   constructor(config) {
@@ -296,6 +297,13 @@ export class FakePeerConnection {
     this.connectionState = state
     this.onconnectionstatechange?.()
     for (const callback of [...(this.listeners.connectionstatechange || [])]) callback()
+  }
+
+  // A candidate gathered: it's in the local description from now on.
+  addCandidate(line = "a=candidate:1 1 udp 2122260223 abc.local 50000 typ host") {
+    const {type, sdp} = this.localDescription
+    this.localDescription = {type, sdp: `${sdp}\r\n${line}`}
+    for (const callback of [...(this.listeners.icecandidate || [])]) callback({candidate: {candidate: line}})
   }
 
   setIceGatheringState(state) {

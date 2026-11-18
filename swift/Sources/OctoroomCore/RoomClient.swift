@@ -44,7 +44,8 @@ public final class RoomClient {
     case error(any Error)
   }
 
-  public static let iceGatheringTimeout: Duration = .seconds(2)
+  /// How long the offer waits for a first ICE candidate. See `connectMedia`.
+  public static let iceCandidateWait: Duration = .milliseconds(100)
   public static let connectTimeout: Duration = .seconds(15)
   public static let pushTimeout: Duration = .seconds(30)
 
@@ -295,8 +296,14 @@ public final class RoomClient {
     let entries = Source.allCases.compactMap { source in local[source].map { (source, $0) } }
     for (_, entry) in entries { entry.transceiver = try pc.addTransceiver(sending: entry.media) }
     try await pc.setLocalDescription(.offer, sdp: try await pc.createOffer())
-    // Cloudflare takes no trickle ICE: send the offer with its candidates.
-    await pc.iceGatheringComplete(timeout: Self.iceGatheringTimeout)
+    // Cloudflare is ICE-lite: this client sends the connectivity checks,
+    // from whatever candidates it has, to the ones in Cloudflare's answer,
+    // and Cloudflare learns this client's address from them. So the offer
+    // needn't carry every candidate, and gathering carries on after it's
+    // sent. Waiting for gathering to finish cost the full timeout whenever
+    // some interface's STUN never answered. The offer waits only for a first
+    // candidate, briefly, in case one with none is refused.
+    _ = await pc.firstIceCandidate(timeout: Self.iceCandidateWait)
 
     var mids: [String: JSONValue] = [:]
     for (source, entry) in entries { mids[source.rawValue] = entry.transceiver?.mid.map(JSONValue.string) ?? .null }

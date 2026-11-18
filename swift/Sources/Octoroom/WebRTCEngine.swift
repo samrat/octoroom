@@ -38,7 +38,9 @@ public final class WebRTCEngine: MediaEngine {
     }
     config.bundlePolicy = .maxBundle
     config.sdpSemantics = .unifiedPlan
-    // Cloudflare takes no trickle ICE: gather once, send the offer with all of it.
+    // Gather once: candidates found after the offer is sent are still
+    // checked against Cloudflare's, but networks changing later aren't
+    // followed (Cloudflare takes no trickle ICE).
     config.continualGatheringPolicy = .gatherOnce
     return try WebRTCPeerConnection(factory: factory, configuration: config)
   }
@@ -99,6 +101,7 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
   let pc: RTCPeerConnection
   var onConnectionStateChange: ((PeerConnectionState) -> Void)?
   private var gatheringWaiters: [() -> Void] = []
+  private var candidateWaiters: [(Bool) -> Void] = []
   private var closed = false
   private let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
 
@@ -203,6 +206,39 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
     }
   }
 
+  func firstIceCandidate(timeout: Duration) async -> Bool {
+    if closed { return false }
+    if hasCandidate { return true }
+    return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+      var done = false
+      let finish = { (found: Bool) in
+        guard !done else { return }
+        done = true
+        continuation.resume(returning: found)
+      }
+      candidateWaiters.append(finish)
+      Task {
+        try? await Task.sleep(for: timeout)
+        finish(false)
+      }
+    }
+  }
+
+  private var hasCandidate: Bool {
+    pc.iceGatheringState == .complete
+      || (pc.localDescription?.sdp.contains("\na=candidate:") ?? false)
+  }
+
+  private func wakeCandidateWaiters(_ found: Bool) {
+    let waiters = candidateWaiters
+    candidateWaiters = []
+    for waiter in waiters { waiter(found) }
+  }
+
+  fileprivate func candidateGathered() {
+    if hasCandidate { wakeCandidateWaiters(true) }
+  }
+
   func stats() async -> [StatsEntry] {
     let report: [StatsEntry] = await withCheckedContinuation { continuation in
       pc.statistics { report in
@@ -227,10 +263,12 @@ final class WebRTCPeerConnection: NSObject, PeerConnection {
     let waiters = gatheringWaiters
     gatheringWaiters = []
     for waiter in waiters { waiter() }
+    wakeCandidateWaiters(false)
   }
 
   fileprivate func gatheringChanged(_ state: RTCIceGatheringState) {
     guard state == .complete else { return }
+    wakeCandidateWaiters(true)
     let waiters = gatheringWaiters
     gatheringWaiters = []
     for waiter in waiters { waiter() }
@@ -260,7 +298,9 @@ extension WebRTCPeerConnection: RTCPeerConnectionDelegate {
   nonisolated func peerConnection(
     _ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState
   ) {}
-  nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {}
+  nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+    Task { @MainActor in self.candidateGathered() }
+  }
   nonisolated func peerConnection(
     _ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]
   ) {}

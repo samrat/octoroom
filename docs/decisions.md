@@ -77,6 +77,7 @@ architecture.md in the same change.
 | [D38](#d38-a-worker-can-speak-at-another-rate-than-it-hears)         | A worker can speak at another rate than it hears          | Current               |
 | [D39](#d39-an-agent-runs-a-front-end-per-speaker)                    | An agent runs a front end per speaker                     | Current               |
 | [D40](#d40-a-decision-model-hears-each-turn-and-the-agent-may-wait-for-the-floor) | A decision model hears each turn, and the agent may wait for the floor | Current |
+| [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate) | Clients send their offer at the first ICE candidate | Current |
 
 ## Removed code
 
@@ -935,6 +936,34 @@ on text, starts replies on a confident partial read and drops them if the
 final read disagrees, weights toward whoever was addressed last, and only
 lets a speaker interrupt after two words so a laugh doesn't.
 
+#### D42. Clients send their offer at the first ICE candidate
+
+**Status:** Current. Replaces the clients' wait for ICE gathering to
+finish.
+
+**Context.** The browser and Swift clients waited for ICE gathering to
+complete, up to 2 s, before sending their offer, reading "Cloudflare takes
+no trickle ICE" as "send every candidate". Join telemetry
+([E8](#e8-where-a-join-spends-its-time)) showed gathering never completing:
+both joins measured waited out the full 2 s, 60% of the time to connected.
+Some interface's STUN request never gets an answer (an IPv6 or VPN
+interface is the usual cause), so gathering never finishes.
+
+**Decision.** The offer goes as soon as the local description has a first
+candidate, or after 100 ms without one. Gathering carries on after it's
+sent. This works because Cloudflare is ICE-lite: the client sends the
+connectivity checks, from whatever candidates it has (later STUN and TURN
+ones included), to the candidates in Cloudflare's answer, and Cloudflare
+learns the client's address from those checks. Workers already rely on
+this with host candidates only
+([D28](#d28-host-candidates-only-with-workarounds-for-cloudflare)). The
+short wait for one candidate is there because it isn't known whether
+Cloudflare accepts an offer with none.
+
+**Open.** Not yet checked against real Cloudflare: `ice_ms` should drop to
+near 0 without `connect_ms` growing by the same amount. A network that
+needs TURN is unchecked.
+
 ## Where the code came from
 
 Milestone 1 ported code from Subvocal (`lib/subvocal/transport/cloudflare_sfu/`),
@@ -1152,3 +1181,30 @@ Findings:
   France? Answer in one word." became two turns: the second interrupted
   the first reply. Phase 3's turn rules, or Smart Turn, are where that
   belongs.
+
+### E8. Where a join spends its time
+
+Two joins of `examples/meet` (a browser and two agents, on a Mac), with
+the join telemetry and `Octoroom.Telemetry.attach_default_logger/1`.
+Times in ms:
+
+| Join   | Connected | Channel | getUserMedia | ICE gathering   | Publish | Connect | Agent output live | Hears someone |
+| ------ | --------- | ------- | ------------ | --------------- | ------- | ------- | ----------------- | ------------- |
+| First  | 3,486     | –       | –            | 2,012 (timeout) | 413     | 627     | 16,769            | 17,672        |
+| Second | 3,259     | 16      | 378          | 2,007 (timeout) | 387     | 466     | 23,907            | 24,141        |
+
+The first join republished after a resume, so its client didn't time the
+channel join or getUserMedia.
+
+Findings:
+
+- **ICE gathering never completed**; the 2 s timeout ended it each time
+  (fixed by [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate)).
+- **Hearing someone waits for an agent's first reply.** With only agents
+  in the room, nothing can be pulled until an agent speaks, because a
+  worker's output is `:pending` until its first packet. The first reply
+  then also waits for its pull and renegotiation. The second join's
+  reply was late because a TTS chunk timed out (17.8 s to audio).
+- **A quiet output can't be pulled.** One agent's output went live 57 s
+  in, after a short reply. The listener's pull failed five times with
+  `not_found_track_error` while the agent was quiet, and the room gave up.

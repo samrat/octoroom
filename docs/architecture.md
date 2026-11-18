@@ -470,7 +470,11 @@ model as follows.
   ([D8](decisions.md#d8-a-track-is-live-when-its-publisher-reports-connected));
   a worker output is live when its outlet sends its first packet.
 - Cloudflare is ICE-lite, and it takes a complete SDP with no trickle ICE.
-  Clients gather host candidates and send the full offer.
+  It needs none of a client's candidates, though: the client sends the
+  connectivity checks and Cloudflare learns its address from them. Clients
+  send their offer at the first candidate (or after 100 ms) and keep
+  gathering
+  ([D42](decisions.md#d42-clients-send-their-offer-at-the-first-ice-candidate)).
 - Only one offer/answer exchange can be in flight per session. Changes to a
   session are **serialized** and **batched**: several pulls go in one
   `tracks/new` call and need one renegotiation.
@@ -955,6 +959,18 @@ with the same id think it's recovering.
 pulls, room starts, stops and recoveries, participant joins, resumes and
 leaves, worker starts and exits, failures, room callback (policy) errors
 and janitor sweeps.
+
+Joins are timed step by step, to see where the time to a working call
+goes. `[:octoroom, :participant, :connected]` splits a join into what the
+server saw (before the publish arrived, creating the session and pushing,
+connecting) and, when the client sends them with `connected`, what the
+client measured (the channel join, getUserMedia, the wait for a first ICE
+candidate and whether it timed out, the publish round trip, ICE and DTLS).
+The browser client sends them and also emits them as a `timings` event.
+`[:octoroom, :participant, :first_pull]` marks when a participant first
+hears someone, and `[:octoroom, :outlet, :live]` when a worker's output
+first sends audio, before which nobody can pull it.
+`Octoroom.Telemetry.attach_default_logger/1` logs a line for each.
 
 ## Testing
 

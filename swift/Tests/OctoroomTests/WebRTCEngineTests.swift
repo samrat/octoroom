@@ -126,6 +126,23 @@ func until(_ what: String, timeout: Duration = .seconds(10), _ check: () -> Bool
     #expect(offer.contains("m=video 0 "))
   }
 
+  @Test func aFirstCandidateComesWithoutWaitingForGathering() async throws {
+    let a = try engine.makePeerConnection(iceServers: [])
+    defer { a.close() }
+    _ = try a.addTransceiver(kind: .audio)
+    try await a.setLocalDescription(.offer, sdp: try await a.createOffer())
+    #expect(await a.firstIceCandidate(timeout: .seconds(2)))
+    #expect(a.localSDP?.contains("a=candidate:") == true)
+  }
+
+  @Test func closingEndsTheWaitForAFirstCandidate() async throws {
+    let a = try engine.makePeerConnection(iceServers: [])
+    a.close()
+    let start = ContinuousClock.now
+    #expect(await a.firstIceCandidate(timeout: .seconds(5)) == false)
+    #expect(ContinuousClock.now - start < .seconds(2))
+  }
+
   @Test func closingEndsTheWaitForGathering() async throws {
     let a = try engine.makePeerConnection(iceServers: [])
     _ = try a.addTransceiver(kind: .video)

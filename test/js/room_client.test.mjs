@@ -104,12 +104,10 @@ describe("joining", () => {
     assert.deepEqual(pc.calls, ["createOffer", "setLocalDescription:offer", "setRemoteDescription:answer"])
     assert.deepEqual(pc.remoteDescription, {type: "answer", sdp: "cf-answer"})
     assert.deepEqual(
-      channel.pushes.map((p) => [p.event, p.payload]),
-      [
-        ["publish", {sdp: "offer-1", mids: {mic: "0"}}],
-        ["connected", {}],
-      ],
+      channel.pushes.map((p) => p.event),
+      ["publish", "connected"],
     )
+    assert.deepEqual(channel.pushed("publish"), [{sdp: "offer-1", mids: {mic: "0"}}])
 
     assert.equal(room.participantId, "p1")
     assert.deepEqual(emitted("state"), ["joining", "joined"])
@@ -239,7 +237,7 @@ describe("joining", () => {
     await failed
   })
 
-  test("sends the offer once its ICE candidates are gathered", async () => {
+  test("sends the offer at its first ICE candidate, without waiting for gathering to finish", async () => {
     FakePeerConnection.iceGatheringState = "gathering"
     const {room, socket} = client()
     const joining = room.join()
@@ -250,13 +248,60 @@ describe("joining", () => {
     assert.deepEqual(pc.calls, ["createOffer", "setLocalDescription:offer"])
     assert.deepEqual(channel.pushed("publish"), [])
 
-    pc.setIceGatheringState("complete")
+    pc.addCandidate()
+    const publish = await channel.next("publish")
+    assert.match(publish.payload.sdp, /^offer-1\r\na=candidate:1 /)
+    assert.equal(pc.iceGatheringState, "gathering")
+    publish.reply("ok", {sdp: "cf-answer"})
+    const connected = await channel.next("connected")
+    assert.equal(connected.payload.timings.ice_timed_out, false)
+    connected.reply("ok", {})
+    await joining
+  })
+
+  test("sends the offer once gathering finishes, even with no candidate", async () => {
+    FakePeerConnection.iceGatheringState = "gathering"
+    const {room, socket} = client()
+    const joining = room.join()
+    const channel = socket.channels[0]
+    channel.joinPush.reply("ok", joinReply())
+    await settle()
+
+    FakePeerConnection.last.setIceGatheringState("complete")
     ;(await channel.next("publish")).reply("ok", {sdp: "cf-answer"})
     ;(await channel.next("connected")).reply("ok", {})
     await joining
   })
 
-  test("sends the offer after 2 s if ICE gathering hasn't finished", async (t) => {
+  test("tells the server and the app how long each step of the join took", async () => {
+    const {room, socket} = client()
+    const timings = []
+    room.on("timings", (t) => timings.push(t))
+    const joining = room.join()
+    const channel = socket.channels[0]
+    channel.joinPush.reply("ok", joinReply())
+    ;(await channel.next("publish")).reply("ok", {sdp: "cf-answer"})
+    const connected = await channel.next("connected")
+    connected.reply("ok", {})
+    await joining
+
+    const sent = connected.payload.timings
+    assert.deepEqual(Object.keys(sent).sort(), [
+      "connect_ms",
+      "ice_ms",
+      "ice_timed_out",
+      "join_ms",
+      "media_ms",
+      "publish_ms",
+    ])
+    for (const [key, value] of Object.entries(sent)) {
+      if (key !== "ice_timed_out") assert.ok(Number.isInteger(value) && value >= 0, `${key}: ${value}`)
+    }
+    assert.equal(sent.ice_timed_out, false)
+    assert.deepEqual(timings, [sent])
+  })
+
+  test("sends the offer after 100 ms if no ICE candidate has come", async (t) => {
     t.mock.timers.enable({apis: ["setTimeout"]})
     FakePeerConnection.iceGatheringState = "gathering"
     const {room, socket} = client()
@@ -265,12 +310,14 @@ describe("joining", () => {
     channel.joinPush.reply("ok", joinReply())
     await settle()
 
-    t.mock.timers.tick(1_999)
+    t.mock.timers.tick(99)
     await settle()
     assert.deepEqual(channel.pushed("publish"), [])
     t.mock.timers.tick(1)
     ;(await channel.next("publish")).reply("ok", {sdp: "cf-answer"})
-    ;(await channel.next("connected")).reply("ok", {})
+    const connected = await channel.next("connected")
+    assert.equal(connected.payload.timings.ice_timed_out, true)
+    connected.reply("ok", {})
     await joining
   })
 })

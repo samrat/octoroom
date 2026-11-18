@@ -36,8 +36,16 @@
 // connection stays up the whole time, so audio keeps flowing. If there was
 // nothing to resume, the client publishes again on a new peer connection.
 // Events: "reconnecting", "reconnected" ({resumed}).
+//
+// Join timing: once connected, the "timings" event gives what each step
+// took, in ms: `join_ms` (the channel join), `media_ms` (getUserMedia,
+// including any permission prompt), `ice_ms` (waiting for a first ICE
+// candidate, with `ice_timed_out` when none came), `publish_ms` (the server creating the session and
+// pushing the tracks) and `connect_ms` (ICE and DTLS to Cloudflare). They go
+// to the server too, which reports them as telemetry (`Octoroom.Telemetry`).
 
-const ICE_GATHERING_TIMEOUT_MS = 2_000
+// How long the offer waits for a first ICE candidate. See connectMedia.
+const ICE_CANDIDATE_WAIT_MS = 100
 const CONNECT_TIMEOUT_MS = 15_000
 const PUSH_TIMEOUT_MS = 30_000
 
@@ -122,6 +130,7 @@ export class RoomClient {
       channel.onError(() => this.state === "joined" && this.emit("reconnecting"))
       channel.onClose(() => this.channel === channel && this.teardown("closed"))
 
+      const joinStarted = performance.now()
       const reply = await step(new Promise((resolve, reject) => {
         let joined = false
         channel
@@ -132,10 +141,11 @@ export class RoomClient {
           .receive("timeout", () => !joined && reject(new Error("join timed out")))
       }))
       this.onJoinReply(reply)
+      const mediaStarted = performance.now()
 
       await step(this.openLocalMedia(generation))
 
-      await step(this.connectMedia())
+      await step(this.connectMedia({join_ms: mediaStarted - joinStarted, media_ms: performance.now() - mediaStarted}))
       this.abortJoin = null
       // Closing the tab looks like a dropped connection, which the server
       // holds for a while in case it comes back: say goodbye instead.
@@ -196,7 +206,10 @@ export class RoomClient {
   }
 
   // A peer connection to Cloudflare with every local source published on it.
-  async connectMedia() {
+  // `timings` (ms) are what the join measured before this; with this
+  // function's own, they go to the server with `connected` and to the app as
+  // a "timings" event.
+  async connectMedia(timings = {}) {
     const pc = new RTCPeerConnection({iceServers: this.iceServers, bundlePolicy: "max-bundle"})
     this.pc = pc
     pc.onconnectionstatechange = () => {
@@ -207,15 +220,34 @@ export class RoomClient {
 
     const entries = [...this.local]
     for (const [, entry] of entries) entry.transceiver = addSender(pc, entry.track)
+    let mark = performance.now()
+    const lap = () => {
+      const now = performance.now()
+      const ms = Math.round(now - mark)
+      mark = now
+      return ms
+    }
     await pc.setLocalDescription(await pc.createOffer())
-    // Cloudflare takes no trickle ICE: send the offer with its candidates.
-    await iceGathered(pc, ICE_GATHERING_TIMEOUT_MS)
+    // Cloudflare is ICE-lite: this browser sends the connectivity checks,
+    // from whatever candidates it has, to the ones in Cloudflare's answer,
+    // and Cloudflare learns this browser's address from them. So the offer
+    // needn't carry every candidate (Cloudflare takes no trickle ICE, but
+    // needs none), and gathering carries on after it's sent: STUN and TURN
+    // candidates found later are still used. Waiting for gathering to finish
+    // cost the full timeout on every join, as some interface's STUN never
+    // answers. The offer waits only for a first candidate, briefly, in case
+    // one with none is refused.
+    const candidate = await firstCandidate(pc, ICE_CANDIDATE_WAIT_MS)
+    timings = {...roundAll(timings), ice_ms: lap(), ice_timed_out: !candidate}
 
     const mids = Object.fromEntries(entries.map(([source, entry]) => [source, entry.transceiver.mid]))
     const {sdp} = await this.push("publish", {sdp: pc.localDescription.sdp, mids})
+    timings.publish_ms = lap()
     await pc.setRemoteDescription({type: "answer", sdp})
     await peerConnected(pc, CONNECT_TIMEOUT_MS)
-    await this.push("connected", {})
+    timings.connect_ms = lap()
+    await this.push("connected", {timings})
+    this.emit("timings", timings)
     for (const [source, entry] of entries) {
       if (entry.muted) this.push("mute", {source, muted: true}).catch(() => {})
     }
@@ -528,18 +560,27 @@ function removeElement(element) {
   element.remove()
 }
 
-function iceGathered(pc, timeoutMs) {
-  if (pc.iceGatheringState === "complete") return Promise.resolve()
+function roundAll(timings) {
+  return Object.fromEntries(Object.entries(timings).map(([k, v]) => [k, Math.round(v)]))
+}
+
+// Resolves true once the local description has a candidate (or gathering
+// finished), false if `timeoutMs` passed first.
+function firstCandidate(pc, timeoutMs) {
+  const ready = () => pc.iceGatheringState === "complete" || /^a=candidate:/m.test(pc.localDescription?.sdp || "")
+  if (ready()) return Promise.resolve(true)
   return new Promise((resolve) => {
-    const timer = setTimeout(done, timeoutMs)
-    function done() {
+    const timer = setTimeout(() => done(false), timeoutMs)
+    function done(found) {
       clearTimeout(timer)
+      pc.removeEventListener("icecandidate", check)
       pc.removeEventListener("icegatheringstatechange", check)
-      resolve()
+      resolve(found)
     }
     function check() {
-      if (pc.iceGatheringState === "complete") done()
+      if (ready()) done(true)
     }
+    pc.addEventListener("icecandidate", check)
     pc.addEventListener("icegatheringstatechange", check)
   })
 }

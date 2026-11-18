@@ -169,9 +169,9 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       {:reply, :ok, socket}
     end
 
-    def __handle_in__("connected", _payload, socket) do
+    def __handle_in__("connected", payload, socket) do
       %{server: server, participant_id: id} = socket.assigns.octoroom
-      Server.connected(server, id)
+      Server.connected(server, id, timings(payload))
       {:reply, :ok, socket}
     end
 
@@ -193,6 +193,31 @@ if Code.ensure_loaded?(Phoenix.Channel) do
 
     def __handle_in__(_event, _payload, socket),
       do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+    # The client's measurements of its join, for telemetry: known keys
+    # only, durations as non-negative numbers. Anything else is dropped
+    # rather than refused, as the join itself went fine.
+    @timings %{
+      "join_ms" => :join_ms,
+      "media_ms" => :media_ms,
+      "ice_ms" => :ice_ms,
+      "publish_ms" => :publish_ms,
+      "connect_ms" => :connect_ms
+    }
+    defp timings(%{"timings" => timings}) when is_map(timings) do
+      durations =
+        for {k, v} <- timings, key = @timings[k], is_number(v), v >= 0, into: %{}, do: {key, v}
+
+      case timings do
+        %{"ice_timed_out" => flag} when is_boolean(flag) ->
+          Map.put(durations, :ice_timed_out, flag)
+
+        _ ->
+          durations
+      end
+    end
+
+    defp timings(_payload), do: %{}
 
     # Source => mid, both strings.
     defp mids?(mids),
