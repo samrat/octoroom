@@ -21,6 +21,10 @@ defmodule Octoroom.Agent.Frames do
   defframe(UserStoppedSpeaking, :system, fields: [:turn_id, :source])
   defframe(BotStartedSpeaking, :system)
   defframe(BotStoppedSpeaking, :system)
+  # The runner flushed the agent's output after an interruption:
+  # `dropped_ms` of the audio it had queued never played (nil: unknown).
+  # Tells `Octoroom.Agent.Processors.AssistantCollector` how much was heard.
+  defframe(AudioFlushed, :system, fields: [:dropped_ms])
 
   # data: delivered in order; dropped by an interruption unless uninterruptible
   defframe(InterimTranscription, :data, fields: [:text, :source])
@@ -57,6 +61,9 @@ defmodule Octoroom.Agent.Frames do
   )
 
   defframe(LLMText, :data, fields: [:text])
+  # A turn the app starts with `Octoroom.Agent.prompt/3`: not said by anyone
+  # on the call.
+  defframe(Prompt, :data, fields: [:text], uninterruptible: true)
   # Text to speak.
   defframe(Text, :data, fields: [:text])
   # Text actually sent to TTS.
@@ -68,6 +75,11 @@ defmodule Octoroom.Agent.Frames do
   defframe(ToolResults, :data, fields: [:messages], uninterruptible: true)
   defframe(AsyncToolResult, :data, fields: [:result], uninterruptible: true)
   defframe(LLMContext, :data, fields: [:messages, :tools])
+
+  # A finished reply whose audio is still playing: the LLM sees it in
+  # replies that start meanwhile. `AssistantMessage` replaces it once it's
+  # known how much was heard.
+  defframe(AssistantDraft, :data, fields: [:text], uninterruptible: true)
 
   defframe(AssistantMessage, :data,
     fields: [:text, interrupted?: false],

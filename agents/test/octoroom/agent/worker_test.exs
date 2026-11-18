@@ -46,6 +46,33 @@ defmodule Octoroom.Agent.WorkerTest do
       do: %Frames.Transcription{text: text, source: source, decision: decision}
   end
 
+  # An `Octoroom.Agent` module whose `ctx.args` are the worker args the
+  # other tests use, fakes included.
+  defmodule TestAgent do
+    use Octoroom.Agent
+
+    @impl true
+    def instructions(ctx), do: ctx.args.instructions
+
+    @impl true
+    def tools(_ctx) do
+      [
+        %Octoroom.Agent.Tool{
+          name: "whoami",
+          description: "Who is asking.",
+          parameters: %{type: "object", properties: %{}},
+          handler: {__MODULE__, :whoami}
+        }
+      ]
+    end
+
+    @impl true
+    def pipeline(ctx), do: {ctx.args.front_end, ctx.args.back_end}
+
+    def whoami(call, ctx),
+      do: %{id: call.id, name: call.name, response: %{speaker: ctx.speaker.meta.name}}
+  end
+
   defmodule AgentRoom do
     use Octoroom.Room
 
@@ -58,6 +85,17 @@ defmodule Octoroom.Agent.WorkerTest do
       case Enum.find(room.participants, &Map.has_key?(&1.meta, :args)) do
         nil ->
           []
+
+        %{meta: %{agent: opts}} = p ->
+          hears = Enum.map(room.participants, &mic/1)
+
+          [
+            Octoroom.Agent.agent(
+              "assistant",
+              TestAgent,
+              [hears: hears, args: p.meta.args] ++ opts
+            )
+          ]
 
         p ->
           [
@@ -92,14 +130,18 @@ defmodule Octoroom.Agent.WorkerTest do
 
   # `reply_ms` of 24 kHz audio per sentence the LLM says.
   defp args(test, reply_ms, extra \\ %{}) do
-    llm = fn opts, emit ->
-      send(test, {:llm, Enum.map(opts[:input], & &1.content)})
-      emit.({:text_delta, "Hello there."})
-      {:ok, %{text: "Hello there.", function_calls: [], continuation: []}}
-    end
+    {llm, extra} =
+      Map.pop_lazy(extra, :llm, fn ->
+        fn opts, emit ->
+          send(test, {:llm, Enum.map(opts[:input], & &1.content)})
+          emit.({:text_delta, "Hello there."})
+          {:ok, %{text: "Hello there.", function_calls: [], continuation: []}}
+        end
+      end)
 
-    tts = fn _text, on_audio ->
+    tts = fn text, on_audio ->
       send(test, :tts)
+      send(test, {:tts, text})
       on_audio.(:binary.copy(<<0, 0>>, div(24_000 * reply_ms, 1_000)))
       :ok
     end
@@ -138,7 +180,10 @@ defmodule Octoroom.Agent.WorkerTest do
   # heard her, it can talk.
   defp start(ctx, reply_ms \\ 200, extra \\ %{}) do
     Octoroom.subscribe(ctx.room_id)
-    alice = join(ctx, "alice", %{name: "Alice", args: args(self(), reply_ms, extra)})
+    {agent, extra} = Map.pop(extra, :agent)
+    meta = %{name: "Alice", args: args(self(), reply_ms, extra)}
+    meta = if agent, do: Map.put(meta, :agent, agent), else: meta
+    alice = join(ctx, "alice", meta)
     cf = agent_track(alice.mic)
     alice = hear(ctx, alice)
     %{alice: alice, mic: alice.mic, cf_track: cf}
@@ -200,7 +245,9 @@ defmodule Octoroom.Agent.WorkerTest do
                     {:worker_event, "assistant",
                      {:agent,
                       {:conversation,
-                       %{role: "assistant", text: "Hello there.", status: "completed"}}}}}
+                       %{role: "assistant", text: "Hello there.", status: "completed"}}}}},
+                   # Once its audio has played.
+                   1_000
 
     # The reply goes out on the agent's track as 20 ms room frames.
     assert_receive {:ingest, ^cf, frame}, 1_000
@@ -217,6 +264,49 @@ defmodule Octoroom.Agent.WorkerTest do
 
     say(ctx, alice, :speech_started)
     wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms == 0 end)
+  end
+
+  test "a reply cut off keeps only what was heard, and the LLM is told", ctx do
+    sentence = "One two three four five six seven eight nine ten."
+
+    test = self()
+
+    llm = fn opts, emit ->
+      send(test, {:llm, Enum.map(opts[:input], & &1.content)})
+      emit.({:text_delta, sentence})
+      {:ok, %{text: sentence, function_calls: [], continuation: []}}
+    end
+
+    # Alice's client never answers the room's offers; give it time to.
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :signal_timeout, 10_000)}
+
+    # The sentence is one chunk of 5 s of audio.
+    %{cf_track: cf, alice: alice} = start(ctx, 5_000, %{llm: llm})
+
+    say(ctx, alice, {:final, "Count to ten."})
+    assert_receive {:llm, _}
+    assert_receive {:ingest, ^cf, _}, 1_000
+
+    # About 1.5 s plays, then Alice talks over it.
+    Process.sleep(1_500)
+    say(ctx, alice, :speech_started)
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent,
+                      {:conversation, %{role: "assistant", status: "interrupted", text: heard}}}}},
+                   1_000
+
+    # Two to four of the ten words, by how much of the audio played.
+    words = String.split(heard)
+    assert length(words) in 2..4
+    assert String.starts_with?(sentence, heard)
+
+    # The next request has what was heard, marked as cut off.
+    say(ctx, alice, :speech_stopped)
+    say(ctx, alice, {:final, "Keep going."})
+    assert_receive {:llm, input}, 1_000
+    assert (heard <> "… [interrupted]") in input
   end
 
   test "with several people it hears everyone and answers when addressed", ctx do
@@ -245,7 +335,8 @@ defmodule Octoroom.Agent.WorkerTest do
 
     assert_receive {:octoroom, _,
                     {:worker_event, "assistant",
-                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}}
+                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}},
+                   1_000
 
     # Bob's follow-up window: 10 s from when the reply's 200 ms of audio ends.
     assert_receive {:octoroom, _,
@@ -253,7 +344,7 @@ defmodule Octoroom.Agent.WorkerTest do
                      {:agent, {:follow_up, %{speaker: "Bob", source: source, ms: ms}}}}}
 
     assert source == bob.mic
-    assert ms > 10_000 and ms <= 10_200
+    assert ms >= 10_000 and ms <= 10_200
 
     # Bob can follow up without the name; Alice can't.
     say(ctx, alice, {:final, "And where?"})
@@ -368,6 +459,137 @@ defmodule Octoroom.Agent.WorkerTest do
       say(ctx, alice, {:final, "Assistant, what time is it?"})
       assert %{outcome: :reply, why: :name} = event(:decision)
       assert_receive {:llm, _}
+    end
+  end
+
+  describe "an Octoroom.Agent module" do
+    test "replies on its own track, and its tools know who asked", ctx do
+      test = self()
+
+      llm = fn opts, emit ->
+        case Enum.find(opts[:input], &match?(%ReqLLM.Message{role: :tool}, &1)) do
+          nil ->
+            emit.({:tool_call_delta, %{}})
+            call = %{id: "c1", name: "whoami", args: %{}}
+            {:ok, %{text: "", function_calls: [call], continuation: []}}
+
+          result ->
+            send(test, {:tool_result, inspect(result.content)})
+            emit.({:text_delta, "You're Alice."})
+            {:ok, %{text: "You're Alice.", function_calls: [], continuation: []}}
+        end
+      end
+
+      %{cf_track: cf, alice: alice} = start(ctx, 200, %{agent: [], llm: llm})
+
+      say(ctx, alice, {:final, "Who am I?"})
+      assert_receive {:tool_result, result}, 1_000
+      assert result =~ "Alice"
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent, {:conversation, %{role: "assistant", text: "You're Alice."}}}}},
+                     1_000
+
+      assert_receive {:ingest, ^cf, _}, 1_000
+    end
+
+    test "say/3 speaks word for word, into the conversation", ctx do
+      %{cf_track: cf} = start(ctx, 200, %{agent: []})
+
+      assert Octoroom.Agent.say(ctx.room_id, "assistant", "Recording has started.") == :ok
+      assert_receive {:tts, "Recording has started."}
+      refute_received {:llm, _}
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent,
+                        {:conversation,
+                         %{role: "assistant", text: "Recording has started.", status: "completed"}}}}},
+                     1_000
+
+      assert_receive {:ingest, ^cf, _}, 1_000
+    end
+
+    test "say/3 cuts off what it was saying", ctx do
+      %{alice: alice} = start(ctx, 5_000, %{agent: []})
+      say(ctx, alice, {:final, "Tell me a story."})
+      assert_receive {:tts, "Hello there."}
+      wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms > 3_000 end)
+
+      # The story is flushed: without that, 5 s more would queue behind it.
+      Octoroom.Agent.say(ctx.room_id, "assistant", "Sorry, one moment.")
+      assert_receive {:tts, "Sorry, one moment."}
+      Process.sleep(50)
+      assert Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms <= 5_000
+    end
+
+    test "prompt/3 starts a reply to the app, not to anyone on the call", ctx do
+      start(ctx, 200, %{agent: []})
+
+      assert Octoroom.Agent.prompt(ctx.room_id, "assistant", "Summarize the call.") == :ok
+      assert_receive {:llm, input}
+
+      assert List.last(input) ==
+               "[From the app, not said by anyone on the call] Summarize the call."
+
+      assert_receive {:tts, "Hello there."}
+    end
+
+    test "interrupt/2 stops it", ctx do
+      %{alice: alice} = start(ctx, 5_000, %{agent: []})
+      say(ctx, alice, {:final, "Tell me a story."})
+      wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms > 3_000 end)
+
+      assert Octoroom.Agent.interrupt(ctx.room_id, "assistant") == :ok
+      wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, "assistant").queued_ms == 0 end)
+    end
+
+    test "the app's messages report a missing agent" do
+      assert Octoroom.Agent.say("no-room", "assistant", "Hi") == {:error, :no_worker}
+      assert Octoroom.Agent.prompt("no-room", "assistant", "Hi") == {:error, :no_worker}
+      assert Octoroom.Agent.interrupt("no-room", "assistant") == {:error, :no_worker}
+    end
+  end
+
+  describe "agent/3" do
+    import Octoroom.Room, only: [track: 1]
+
+    test "is a worker spec with one output named after it" do
+      spec =
+        Octoroom.Agent.agent("assistant", TestAgent,
+          hears: [track("a/mic"), "b/mic"],
+          respond: :addressed,
+          args: %{workspace: 1}
+        )
+
+      assert %{id: "assistant", module: Octoroom.Agent.Worker} = spec
+      assert spec.inputs == ["a/mic", "b/mic"]
+      assert spec.outputs == ["assistant"]
+
+      assert spec.args == %{
+               agent: TestAgent,
+               args: %{workspace: 1},
+               name: "assistant",
+               respond: :addressed,
+               voice: true
+             }
+    end
+
+    test "voice: false gives it no track" do
+      spec = Octoroom.Agent.agent("notes", TestAgent, hears: [], voice: false)
+      assert spec.outputs == []
+      assert spec.args.voice == false
+    end
+
+    test "refuses a missing hears: and unknown options" do
+      assert_raise ArgumentError, ~r/hears: is required/, fn ->
+        Octoroom.Agent.agent("a", TestAgent, [])
+      end
+
+      assert_raise ArgumentError, ~r/unknown options \[:interrupt\]/, fn ->
+        Octoroom.Agent.agent("a", TestAgent, hears: [], interrupt: :anyone)
+      end
     end
   end
 

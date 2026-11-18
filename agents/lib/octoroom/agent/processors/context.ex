@@ -13,9 +13,15 @@ defmodule Octoroom.Agent.Processors.Context do
       text, so later requests don't resend it
     * `ToolResults` (upstream) - the next tool round, up to
       `max_tool_rounds`; after that the LLM answers without tools
-    * `AssistantMessage` (upstream) - the reply, finished or interrupted
+    * `AssistantMessage` (upstream) - the reply, finished or interrupted.
+      It comes once its audio has played, so it takes the place in the
+      history that its turn reserved: turns heard while it played come
+      after it. An interrupted reply holds only what was heard, and ends in
+      `… [interrupted]` so the LLM knows it was cut off.
     * `AsyncToolResult` (upstream) - a non-blocking tool's result: noted
       silently, or a new turn about it
+    * `Prompt` - a turn from the app (`Octoroom.Agent.prompt/3`), marked as
+      not said by anyone on the call
     * `Start` - after `initial_delay_ms`, the agent's `initial_text` starts a
       turn
 
@@ -27,6 +33,10 @@ defmodule Octoroom.Agent.Processors.Context do
   """
 
   use Octoroom.Agent.Processor
+
+  # A reply's place in the history, until the reply comes back. Sent to the
+  # LLM only once it has a draft (the reply is playing).
+  @reply_pending %{role: "assistant", content: nil, reply_pending: true}
 
   require Logger
 
@@ -101,6 +111,12 @@ defmodule Octoroom.Agent.Processors.Context do
       else: {[], %{state | history: append(state.history, message, state)}}
   end
 
+  def handle_frame(%Frames.Prompt{text: text}, :downstream, state) when is_binary(text) do
+    message = %{role: "user", content: "[From the app, not said by anyone on the call] " <> text}
+    {effects, state} = start_turn(message, state)
+    {[{:notify, {:status, "Thinking"}} | effects], state}
+  end
+
   def handle_frame(%Frames.ToolResults{messages: messages}, :upstream, state) do
     input = state.input ++ messages
 
@@ -113,21 +129,47 @@ defmodule Octoroom.Agent.Processors.Context do
     end
   end
 
+  # The reply's text is done and its audio is playing: requests that start
+  # meanwhile include it, and the app sees it now, marked `playing`, in its
+  # place among the turns. Its `AssistantMessage` updates both.
+  def handle_frame(%Frames.AssistantDraft{text: text}, :upstream, state) do
+    case Enum.find_index(state.history, &(&1 == @reply_pending)) do
+      nil ->
+        {[], state}
+
+      index ->
+        {events, reservation} = ConversationEvents.reserve(state.events)
+
+        events =
+          ConversationEvents.update_reserved(events, :assistant, reservation, text, :playing)
+
+        draft = state.history |> Enum.at(index) |> Map.merge(%{content: text, event: reservation})
+        {[], %{state | events: events, history: List.replace_at(state.history, index, draft)}}
+    end
+  end
+
   def handle_frame(%Frames.AssistantMessage{} = message, :upstream, state) do
     status = if message.interrupted?, do: :interrupted, else: :completed
     text = message.text || ""
 
     state =
-      update_events(state, fn events ->
-        events
-        |> ConversationEvents.replace(:assistant, text)
-        |> ConversationEvents.commit(:assistant, status)
-      end)
+      case Enum.find(state.history, &pending?/1) do
+        %{event: reservation} ->
+          update_events(
+            state,
+            &ConversationEvents.update_reserved(&1, :assistant, reservation, text, status)
+          )
 
-    history =
-      if text == "",
-        do: state.history,
-        else: append(state.history, %{role: "assistant", content: text}, state)
+        _no_draft ->
+          update_events(state, fn events ->
+            events
+            |> ConversationEvents.replace(:assistant, text)
+            |> ConversationEvents.commit(:assistant, status)
+          end)
+      end
+
+    content = if message.interrupted?, do: interrupted(text), else: text
+    history = fill_reply(state.history, %{role: "assistant", content: content}, state)
 
     notices =
       cond do
@@ -184,20 +226,45 @@ defmodule Octoroom.Agent.Processors.Context do
 
   defp user_content(%Frames.Transcription{text: text}), do: text
 
+  # The reply's place in the history is reserved now, and filled when its
+  # `AssistantMessage` comes back.
   defp start_turn(message, state) do
     history = append(state.history, message, state)
     input = prompt_input(state.instructions, history)
+    history = append(history, @reply_pending, state)
     state = %{state | history: history, input: input, rounds_left: state.max_tool_rounds}
     {[context_frame(input, state.tools)], state}
   end
 
+  # Into the oldest reserved place (replies come back in order), or at the
+  # end if there's none; an empty reply just frees its place.
+  defp fill_reply(history, %{content: content} = message, state) do
+    case Enum.find_index(history, &pending?/1) do
+      nil when content == "" -> history
+      nil -> append(history, message, state)
+      index when content == "" -> List.delete_at(history, index)
+      index -> List.replace_at(history, index, message)
+    end
+  end
+
+  defp pending?(message), do: Map.get(message, :reply_pending, false)
+
+  defp interrupted(""), do: ""
+  defp interrupted(text), do: text <> "… [interrupted]"
+
   defp context_frame(input, tools),
     do: {:push, %Frames.LLMContext{messages: input, tools: tools}, :downstream}
 
-  defp prompt_input(instructions, history) when instructions in [nil, ""], do: history
+  defp prompt_input(instructions, history) when instructions in [nil, ""] do
+    Enum.flat_map(history, fn
+      %{reply_pending: true, content: nil} -> []
+      %{reply_pending: true} = draft -> [Map.drop(draft, [:reply_pending, :event])]
+      message -> [message]
+    end)
+  end
 
   defp prompt_input(instructions, history),
-    do: [%{role: "system", content: instructions} | history]
+    do: [%{role: "system", content: instructions} | prompt_input(nil, history)]
 
   defp append(history, message, state), do: Enum.take(history ++ [message], -state.max_history)
 

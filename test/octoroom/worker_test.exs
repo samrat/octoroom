@@ -28,6 +28,12 @@ defmodule Octoroom.WorkerTest do
     end
 
     def handle_info(:flush, s), do: {:ok, s, flush: :default}
+
+    def handle_info({:octoroom, :flushed, _output, _ms} = msg, {test, _} = s) do
+      send(test, {:worker_info, self(), msg})
+      {:ok, s}
+    end
+
     def handle_info({:play, pcm}, s), do: {:ok, s, play: {:default, pcm}}
     def handle_info({:emit, event}, s), do: {:ok, s, emit: event}
     def handle_info(_msg, s), do: {:ok, s}
@@ -334,7 +340,10 @@ defmodule Octoroom.WorkerTest do
 
     Octoroom.Outlet.play(ctx.room_id, echo, :binary.copy(<<0>>, 3_840 * 50))
     :ok = Octoroom.Worker.send(ctx.room_id, id, :flush)
-    wait_until(fn -> Octoroom.Outlet.stats(ctx.room_id, echo).queued_ms == 0 end)
+    # The worker hears how much was dropped: most of the second queued.
+    assert_receive {:worker_info, _, {:octoroom, :flushed, ^echo, dropped_ms}}
+    assert dropped_ms > 800 and dropped_ms <= 1_000
+    assert Octoroom.Outlet.stats(ctx.room_id, echo).queued_ms == 0
     assert Octoroom.Worker.send(ctx.room_id, "nobody", :flush) == {:error, :no_worker}
   end
 

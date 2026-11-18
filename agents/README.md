@@ -6,25 +6,42 @@ it and speaks on a track the policy routes like any other. Octoroom itself
 ships no AI ([D5](../docs/decisions.md#d5-octoroom-ships-no-ai)); this
 package is where it lives.
 
-Status: **phase 1** of [docs/proposal-agents.md](../docs/proposal-agents.md)
-plus part of phase 3: a cascaded agent (Silero VAD → Soniox → an LLM
+Status: phases 1 and 3 of [docs/proposal-agents.md](../docs/proposal-agents.md),
+and the start of phase 2: a cascaded agent (Silero VAD → Soniox → an LLM
 through ReqLLM → Inworld) that hears any number of people, each through
-their own VAD and speech-to-text, and answers when addressed by name.
-`use Octoroom.Agent`, `agent/3` and client APIs come in later phases.
+their own VAD and speech-to-text, and answers when addressed by name. An
+agent is a module, added to a room with `agent/3`:
 
 ```elixir
-def workers(%{participants: []}), do: []
+defmodule MyApp.Assistant do
+  use Octoroom.Agent
 
+  @impl true
+  def instructions(ctx), do: "You're on a team call for #{ctx.args.workspace}. Be brief."
+
+  @impl true
+  def tools(_ctx), do: [MyApp.Sheets.add_row()]
+end
+
+# in the room
 def workers(room) do
   [
-    worker("assistant", Octoroom.Agent.Worker,
-      inputs: Enum.map(room.participants, &mic/1),
-      outputs: ["assistant"],
-      args: %{name: "Assistant", instructions: "You help a team on a call. Be brief."}
+    agent("assistant", MyApp.Assistant,
+      hears: Enum.map(room.participants, &mic/1),
+      respond: :addressed,
+      args: %{workspace: room.assigns.workspace}
     )
   ]
 end
 ```
+
+Tool handlers get `speaker`, the participant who asked. From outside the
+room, `Octoroom.Agent.say/3`, `prompt/3` and `interrupt/2`. The history
+holds what people heard: an interrupted reply is cut where its audio
+stopped, using the outlet's flush report (see
+`Octoroom.Agent.Processors.AssistantCollector`). Still to come in phase 2:
+the outlet's `:drained` message, the history store, and the receptionist
+example.
 
 `examples/call` has an agent lab at `/lab/<room>` for trying it: switch
 between the cascaded and half-cascaded pipelines and between the name gate

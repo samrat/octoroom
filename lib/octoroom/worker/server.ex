@@ -109,7 +109,9 @@ defmodule Octoroom.Worker.Server do
 
   defp action({:flush, output}, state) do
     output = output!(output, state)
-    Outlet.flush(state.room_id, output)
+    dropped_ms = Outlet.flush(state.room_id, output)
+    # After the callback that asked for it, like any other message.
+    send(self(), {:octoroom, :flushed, output, dropped_ms})
     state
   end
 

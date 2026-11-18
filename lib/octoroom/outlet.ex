@@ -8,7 +8,8 @@ defmodule Octoroom.Outlet do
   Workers queue room PCM (48 kHz stereo s16le) with `play/3`. Every 20 ms
   the outlet sends the next whole frame and sends nothing when the queue is
   empty. `flush/2` empties the queue, so at most one frame plus the network
-  is already on its way. Audio played before the track is pushed and its
+  is already on its way, and says how much audio it dropped: what was
+  queued minus that is what listeners heard. Audio played before the track is pushed and its
   connection is up is dropped as it comes due, as a live stream would be.
 
   The first frame sent tells the room server the track is live, so
@@ -44,8 +45,19 @@ defmodule Octoroom.Outlet do
   @doc "Queues room PCM on an output track. A no-op if the outlet isn't running."
   def play(room_id, name, pcm) when is_binary(pcm), do: cast(room_id, name, {:play, pcm})
 
-  @doc "Drops an output track's queued, unplayed audio."
-  def flush(room_id, name), do: cast(room_id, name, :flush)
+  @doc """
+  Drops an output track's queued, unplayed audio. Returns how many ms of
+  audio it dropped, or nil if the outlet isn't running.
+  """
+  def flush(room_id, name) do
+    case whereis(room_id, name) do
+      nil -> nil
+      pid -> GenServer.call(pid, :flush)
+    end
+  catch
+    # The outlet stopped while flushing: nothing more will play.
+    :exit, _reason -> nil
+  end
 
   @doc """
   `%{queued_ms, sent, dropped, underruns, connected, live}` for an output
@@ -100,10 +112,12 @@ defmodule Octoroom.Outlet do
     {:noreply, if(state.next == nil and state.queued > 0, do: tick(state), else: state)}
   end
 
-  def handle_cast(:flush, state),
-    do: {:noreply, %{state | buffer: <<>>, queue: :queue.new(), queued: 0}}
-
   @impl true
+  def handle_call(:flush, _from, state) do
+    dropped_ms = state.queued * @frame_ms + div(byte_size(state.buffer) * @frame_ms, @frame_bytes)
+    {:reply, dropped_ms, %{state | buffer: <<>>, queue: :queue.new(), queued: 0}}
+  end
+
   def handle_call(:stats, _from, state) do
     stats = %{
       queued_ms: state.queued * @frame_ms,

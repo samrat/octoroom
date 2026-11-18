@@ -1,25 +1,30 @@
 defmodule Octoroom.Agent.Worker do
   @moduledoc ~S"""
   Runs an agent as an Octoroom worker: one process per agent, hearing any
-  number of people.
+  number of people. Usually started by `Octoroom.Agent.agent/3` from an
+  `Octoroom.Agent` module:
 
       def workers(%{participants: []}), do: []
 
       def workers(room) do
-        [
-          worker("assistant", Octoroom.Agent.Worker,
-            inputs: Enum.map(room.participants, &mic/1),
-            outputs: ["assistant"],
-            args: %{name: "Assistant", instructions: "You help a team on a call. Be brief."}
-          )
-        ]
+        [agent("assistant", MyApp.Assistant, hears: Enum.map(room.participants, &mic/1))]
       end
+
+  It can also be added with `worker/3` and the args below:
+
+      worker("assistant", Octoroom.Agent.Worker,
+        inputs: Enum.map(room.participants, &mic/1),
+        outputs: ["assistant"],
+        args: %{name: "Assistant", instructions: "You help a team on a call. Be brief."}
+      )
 
   ## Many speakers, one conversation
 
   Each input gets its own front end, so each person has their own VAD and
-  turn detection and nothing is mixed. Their finished turns go into one
-  back end, labelled with the speaker's name: the LLM sees
+  turn detection and nothing is mixed. The speaker is known from the input
+  a turn came in on, not from the voice, so it assumes one person per mic.
+  Their finished turns go into one back end, labelled with the speaker's
+  name: the LLM sees
   `[Priya] can you add Acme to the sheet`. People joining and leaving add
   and drop front ends without restarting the agent. Two pipelines (see
   `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`):
@@ -41,7 +46,8 @@ defmodule Octoroom.Agent.Worker do
       case; text turns only), and follow-ups: a turn from the person it
       last answered within `:follow_up_ms` after it stops talking, or
       before that reply is done. The default with several inputs, or with
-      the decision gate.
+      the decision gate. Half-cascaded turns are audio, so the name never
+      matches and only follow-ups reply: use `gate: :decision` there.
     * `:never` - none.
 
   With `gate: :decision`, each front end also asks a decision model about
@@ -66,6 +72,11 @@ defmodule Octoroom.Agent.Worker do
 
   ## Args (a map or keyword list)
 
+  `Octoroom.Agent.agent/3` builds these from an `Octoroom.Agent` module:
+  `:agent` (the module) and `:args` (its `ctx.args`), whose callbacks fill
+  in `:instructions`, `:tools`, `:backend`, `:initial_text` and the
+  pipelines. Given directly:
+
     * `:backend` - a `Octoroom.Agent.Backend.Cascaded` struct, or a map for
       `Octoroom.Agent.Backend.Cascaded.new/1` (default `%{}`: Soniox, Gemini
       through ReqLLM, Inworld). Its text-to-speech must produce 24 kHz.
@@ -77,8 +88,14 @@ defmodule Octoroom.Agent.Worker do
       `:decisions` (options for the decision stage) - see above
     * `:instructions`, `:initial_text`, `:tools` - read by the context and
       tools stages
-    * `:tool_context` - the map tool handlers receive (`room_id` and
-      `agent_id` are added)
+    * `:tool_context` - the map tool handlers receive (`room_id`,
+      `agent_id`, and `speaker`, the participant whose turn started the
+      reply, are added)
+    * `:voice` - `false` runs no text-to-speech
+
+  It also takes `{:octoroom_agent, :say, text}`,
+  `{:octoroom_agent, :prompt, text}` and `{:octoroom_agent, :interrupt}`
+  messages (see `Octoroom.Agent.say/3` and the others).
 
   Speakers are named from participants' `join/2` metadata (`:name`), or
   their id. Provider keys come from the environment: `SONIOX_API_KEY`,
@@ -91,9 +108,15 @@ defmodule Octoroom.Agent.Worker do
 
     * `{:agent, {:conversation, item}}` - a finished item (see
       `Octoroom.Agent.ConversationEvents`); user items carry `speaker` and
-      `source` (the input track)
+      `source` (the input track). A spoken reply comes twice with the same
+      `message_id`: `"playing"`, then `"completed"`, or `"interrupted"`
+      with only what was heard.
     * `{:agent, {:transcription, %{status, text, source, speaker}}}` -
-      partial and final transcripts of each input, for captions
+      cascaded only: partial and final transcripts of each input, for
+      captions. Half-cascaded sends `{:agent, {:transcription, %{status:
+      "final", text}}}` per turn from the transcriber, with no `source` or
+      `speaker` and usually after the reply has started; the matching
+      `:conversation` item has both.
     * `{:agent, {:follow_up, %{source, speaker, ms} | nil}}` - with
       `:addressed`, when a reply finishes: for the next `ms` (the rest of
       the reply's audio plus `:follow_up_ms`), `speaker` can carry on
@@ -105,9 +128,11 @@ defmodule Octoroom.Agent.Worker do
       `:never`), and `decision` is the model's answers or nil
     * `{:agent, {:waiting, %{source, speaker, ms} | nil}}` - a turn is held
       for `ms` to see if anyone else answers; `nil` when that's settled
-    * `{:agent, {:latency, map}}` - per reply, ms from the end of the
-      addressee's speech to the transcript, the first LLM text, and the
-      first audio handed to the outlet
+    * `{:agent, {:latency, %{transcript, llm, audio}}}` - per reply, ms from
+      `speech_end` (below) to the turn reaching the back end (`transcript`:
+      the final transcript when cascaded, the recorded turn when
+      half-cascaded), the first LLM text, and the first audio handed to the
+      outlet
     * `{:agent, event}` - the back end's other notifications, such as
       `{:status, "Thinking"}`
 
@@ -131,7 +156,7 @@ defmodule Octoroom.Agent.Worker do
 
   @impl true
   def init(args, ctx) do
-    args = Map.new(args)
+    args = args |> Map.new() |> from_agent(ctx)
 
     with {:ok, front_spec, back_spec, silence_ms} <- specs(args),
          {:ok, back_core} <- Core.new(back_spec, back_ctx(args, ctx)) do
@@ -146,7 +171,7 @@ defmodule Octoroom.Agent.Worker do
         },
         fronts: %{},
         front_spec: front_spec,
-        names: names(ctx.participants),
+        people: people(ctx.participants),
         name_pattern: ~r/\b#{Regex.escape(name)}\b/i,
         respond: Map.get(args, :respond),
         follow_up_ms: Map.get(args, :follow_up_ms, 10_000),
@@ -202,6 +227,40 @@ defmodule Octoroom.Agent.Worker do
   end
 
   def handle_info({:octoroom, :outputs, _outputs}, state), do: {:ok, state}
+
+  # From `Octoroom.Agent.say/3`: the words go straight to text-to-speech, as
+  # a reply of their own.
+  def handle_info({:octoroom_agent, :say, text}, state) do
+    {state, actions} = app_turn(state, [])
+    {state, actions} = push_back(state, %Frames.Interruption{}, actions)
+
+    {state, actions} =
+      Enum.reduce(
+        [%Frames.LLMResponseStart{}, %Frames.LLMText{text: text}, %Frames.LLMResponseEnd{}],
+        {state, actions},
+        fn frame, {state, actions} -> push_back(state, frame, actions) end
+      )
+
+    result(state, actions)
+  end
+
+  def handle_info({:octoroom_agent, :prompt, text}, state) do
+    {state, actions} = app_turn(state, [])
+    {state, actions} = push_back(state, %Frames.Prompt{text: text}, actions)
+    result(state, actions)
+  end
+
+  def handle_info({:octoroom_agent, :interrupt}, state) do
+    {state, actions} = push_back(state, %Frames.Interruption{}, [])
+    result(state, actions)
+  end
+
+  # After an interruption flushed the output: how much of the reply's audio
+  # never played, so the collector knows how much of it was heard.
+  def handle_info({:octoroom, :flushed, _output, dropped_ms}, state) do
+    {state, actions} = push_back(state, %Frames.AudioFlushed{dropped_ms: dropped_ms}, [])
+    result(state, actions)
+  end
 
   # Conversation items, sent by the context stage to its owner (this process).
   def handle_info({:voice_pipeline, _from, event}, state),
@@ -304,9 +363,65 @@ defmodule Octoroom.Agent.Worker do
 
   # -- Setup --
 
-  defp specs(%{front_end: %Spec{} = front, back_end: %Spec{} = back}), do: {:ok, front, back, 0}
+  # An `Octoroom.Agent` module's callbacks fill in the args they cover.
+  defp from_agent(%{agent: module} = args, ctx) when is_atom(module) do
+    agent_ctx = %{
+      room_id: ctx.room_id,
+      agent_id: ctx.id,
+      participants: ctx.participants,
+      resumed: ctx.resumed,
+      args: Map.get(args, :args, %{})
+    }
 
+    from_module = %{
+      instructions: module.instructions(agent_ctx),
+      tools: module.tools(agent_ctx),
+      backend: module.backend(agent_ctx),
+      initial_text: if(ctx.resumed, do: nil, else: module.initial_text(agent_ctx))
+    }
+
+    from_module =
+      case module.pipeline(agent_ctx) do
+        {%Spec{} = front, %Spec{} = back} ->
+          Map.merge(from_module, %{front_end: front, back_end: back})
+
+        nil ->
+          from_module
+      end
+
+    Map.merge(args, from_module)
+  end
+
+  defp from_agent(args, _ctx), do: args
+
+  # `voice: false`: no text-to-speech, so nothing to play, and the reply's
+  # text is what was said.
   defp specs(args) do
+    with {:ok, front, back, silence_ms} <- voiced_specs(args) do
+      back =
+        if Map.get(args, :voice, true) == false and :tts in Spec.names(back),
+          do: back |> Spec.remove(:tts) |> silent_collector(),
+          else: back
+
+      {:ok, front, back, silence_ms}
+    end
+  end
+
+  defp silent_collector(back) do
+    if :collector in Spec.names(back),
+      do:
+        Spec.replace(
+          back,
+          :collector,
+          Spec.processor(:collector, Octoroom.Agent.Processors.AssistantCollector, voice: false)
+        ),
+      else: back
+  end
+
+  defp voiced_specs(%{front_end: %Spec{} = front, back_end: %Spec{} = back}),
+    do: {:ok, front, back, 0}
+
+  defp voiced_specs(args) do
     backend =
       case Map.get(args, :backend, %{}) do
         %Cascaded{} = backend -> backend
@@ -343,7 +458,7 @@ defmodule Octoroom.Agent.Worker do
     tool_context =
       args
       |> Map.get(:tool_context, %{})
-      |> Map.merge(%{room_id: ctx.room_id, agent_id: ctx.id})
+      |> Map.merge(%{room_id: ctx.room_id, agent_id: ctx.id, speaker: nil})
 
     %{
       runner: self(),
@@ -515,7 +630,7 @@ defmodule Octoroom.Agent.Worker do
 
         # Any follow-up window is used up: a reply is on its way.
         closed = if mode(state) == :addressed, do: [emit: {:agent, {:follow_up, nil}}], else: []
-        {state, actions ++ closed}
+        tell_speaker(state, input, actions ++ closed)
       else
         {state, actions}
       end
@@ -593,43 +708,66 @@ defmodule Octoroom.Agent.Worker do
 
   defp may_interrupt?(input, state), do: mode(state) == :always or input == state.addressee
 
-  # -- Speaker names --
+  # -- Speakers --
 
-  defp names(participants) do
-    Map.new(participants, fn p ->
-      name =
-        case p.meta do
-          %{name: name} when is_binary(name) -> name
-          %{"name" => name} when is_binary(name) -> name
-          _ -> p.id
-        end
+  defp people(participants), do: Map.new(participants, &{&1.id, &1})
 
-      {p.id, name}
-    end)
-  end
+  defp display_name(%{meta: %{name: name}}) when is_binary(name), do: name
+  defp display_name(%{meta: %{"name" => name}}) when is_binary(name), do: name
+  defp display_name(%{id: id}), do: id
 
-  # Inputs are `<participant id>/<source>`. A participant who joined after
-  # the agent started is looked up in the room once.
+  # Inputs are `<participant id>/<source>`.
+  defp participant_id(input), do: input |> String.split("/") |> hd()
+
+  # A participant who joined after the agent started is looked up in the
+  # room once.
   defp speaker(input, state) do
-    id = input |> String.split("/") |> hd()
+    id = participant_id(input)
 
-    case state.names do
-      %{^id => name} ->
-        {name, state}
+    state =
+      if Map.has_key?(state.people, id),
+        do: state,
+        else: %{state | people: Map.merge(state.people, current_people(state.room_id))}
 
-      names ->
-        names = Map.merge(names, current_names(state.room_id))
-        {Map.get(names, id, input), %{state | names: names}}
+    case state.people do
+      %{^id => person} -> {display_name(person), state}
+      _ -> {input, state}
     end
   end
 
-  defp current_names(room_id) do
+  defp current_people(room_id) do
     case Octoroom.Room.state(room_id) do
-      %{participants: participants} -> names(participants)
+      %{participants: participants} -> people(participants)
       _ -> %{}
     end
   catch
     :exit, _ -> %{}
+  end
+
+  # Before a reply, the tools stage learns who asked. Metadata can change
+  # during a call (`update_meta/3`), and tools authorize against it, so it's
+  # read fresh from the room.
+  defp tell_speaker(state, input, actions) do
+    id = participant_id(input)
+    state = %{state | people: Map.merge(state.people, current_people(state.room_id))}
+    tell_back(state, {:octoroom_agent_speaker, Map.get(state.people, id)}, actions)
+  end
+
+  # A reply the app started: nobody on the call asked, so nobody has the
+  # floor to follow up or interrupt.
+  defp app_turn(state, actions) do
+    closed =
+      if mode(state) == :addressed and state.addressee,
+        do: [emit: {:agent, {:follow_up, nil}}],
+        else: []
+
+    state = %{state | addressee: nil, addressee_name: nil, last_reply: nil, turn: nil}
+    tell_back(state, {:octoroom_agent_speaker, nil}, actions ++ closed)
+  end
+
+  defp tell_back(state, message, actions) do
+    {commands, core} = Core.info(state.back.core, :broadcast, message)
+    back_commands(commands, put_in(state.back.core, core), actions)
   end
 
   # -- Back end --

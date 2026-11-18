@@ -4,13 +4,15 @@ defmodule Octoroom.Agent.Processors.STTTurns do
 
   The user's turn ends with each non-empty final `Transcription` from the
   STT stage, which this stage replaces with one carrying a `turn_id`, after
-  `UserStoppedSpeaking`. Barge-in happens on `VADUserStartedSpeaking`, or,
-  with `vad: false`, on the first interim transcript.
+  `UserStoppedSpeaking`. Barge-in happens once per stretch of speech, on
+  whichever comes first: `VADUserStartedSpeaking` or an interim transcript
+  (the VAD can miss speech that the STT provider hears). Without a VAD, a
+  stretch lasts until the turn's final transcript.
 
-  Options: `:vad` (default `true`), and `:interrupt` (default `true`):
-  `false` leaves out the `Interruption` and pushes only `UserStartedSpeaking`,
-  for an agent's per-speaker front ends, where the agent decides who may
-  interrupt.
+  Options: `:interrupt` (default `true`): `false` leaves out the
+  `Interruption` and pushes only `UserStartedSpeaking`, for an agent's
+  per-speaker front ends, where the agent decides who may interrupt.
+  `:vad` is accepted and changes nothing.
   """
 
   use Octoroom.Agent.Processor
@@ -22,7 +24,6 @@ defmodule Octoroom.Agent.Processors.STTTurns do
     do:
       {:ok,
        %{
-         vad?: Keyword.get(opts, :vad, true),
          interrupt?: Keyword.get(opts, :interrupt, true),
          barged_in?: false,
          turn_id: 0
@@ -32,13 +33,21 @@ defmodule Octoroom.Agent.Processors.STTTurns do
   def handle_frame(%Frames.VADUserStartedSpeaking{} = frame, :downstream, state),
     do: barge_in([{:push, frame, :downstream}], frame.source, state)
 
+  # Each stretch of speech can barge in. Without this, a sound that never
+  # becomes a transcript (a breath, a click) would leave `barged_in?` set,
+  # and the next real interruption would be ignored until a transcript came.
+  def handle_frame(%Frames.VADUserStoppedSpeaking{} = frame, :downstream, state),
+    do: {[{:push, frame, :downstream}], %{state | barged_in?: false}}
+
   def handle_frame(%Frames.InterimTranscription{text: text} = frame, :downstream, state) do
     effects = [
       {:push, frame, :downstream},
       {:notify, {:transcription, %{status: "partial", text: text}}}
     ]
 
-    if state.vad?, do: {effects, state}, else: barge_in(effects, frame.source, state)
+    # Also with a VAD: speech the VAD misses (it can, with the agent's voice
+    # in the room) still barges in once the transcript shows it.
+    barge_in(effects, frame.source, state)
   end
 
   def handle_frame(%Frames.Transcription{turn_id: nil, text: ""}, :downstream, state),

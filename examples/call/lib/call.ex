@@ -78,10 +78,11 @@ defmodule Call.Room do
         do: [
           # Settings come from the agent lab (`Call.LabLive`); changing them
           # changes the args, which restarts the assistant.
-          worker("assistant", Octoroom.Agent.Worker,
-            inputs: Enum.map(room.participants, &mic/1),
-            outputs: ["assistant"],
-            args: room.assigns |> Call.Agent.config() |> Call.Agent.args()
+          Octoroom.Agent.agent(
+            "assistant",
+            Call.Assistant,
+            [hears: Enum.map(room.participants, &mic/1)] ++
+              (room.assigns |> Call.Agent.config() |> Call.Agent.opts())
           )
         ],
         else: []

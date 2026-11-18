@@ -21,7 +21,9 @@ defmodule Octoroom.Agent.Processors.Tools do
   with the states `:idle`, `:user_speaking` and `:responding`).
 
   Options (default to the host context's values): `:tools`, `:context`
-  (the tools' context map). Handlers run in the agent's process
+  (the tools' context map). The agent worker sets the context's `:speaker`
+  before each reply with an `{:octoroom_agent_speaker, participant}`
+  message. Handlers run in the agent's process
   (`Octoroom.Agent.ToolExecutor`).
   """
 
@@ -143,6 +145,11 @@ defmodule Octoroom.Agent.Processors.Tools do
       do:
         {:keep_state, %{data | progress_message: nil},
          [{:push, %Frames.LLMText{text: " " <> message}, :downstream}]}
+
+  # The participant whose turn starts the next reply (nil for one the app
+  # started), for handlers to authorize against.
+  def handle_event({:info, {:octoroom_agent_speaker, speaker}}, _state, data),
+    do: {:keep_state, %{data | context: Map.put(data.context, :speaker, speaker)}}
 
   def handle_event({:info, {:octoroom_agent_async_tool_result, result}}, state, data) do
     event = if result[:event], do: [{:notify, {:control, result.event}}], else: []
