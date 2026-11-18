@@ -124,4 +124,52 @@ defmodule Octoroom.Agent.TTS.InworldTest do
     assert_receive {:audio, <<1, 2, 3>>}
     assert_receive {:audio, <<4, 5, 6>>}
   end
+
+  describe "websocket transport" do
+    test "speaks a context on the connection it is given" do
+      parent = self()
+
+      socket =
+        spawn(fn ->
+          receive do
+            {:"$websockex_cast", {:speak, caller, ref, text, config}} ->
+              send(parent, {:speak, text, config})
+              send(caller, {ref, {:audio, <<9, 9>>}})
+              send(caller, {ref, :done})
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      assert :ok =
+               Inworld.stream("Hello", &send(parent, {:audio, &1}),
+                 api_key: "key",
+                 transport: :websocket,
+                 connection: socket,
+                 voice: "Dennis",
+                 delivery_mode: "STABLE"
+               )
+
+      assert_receive {:speak, "Hello", config}
+
+      assert config == %{
+               voiceId: "Dennis",
+               modelId: "inworld-tts-2",
+               audioConfig: %{audioEncoding: "LINEAR16", sampleRateHertz: 24_000},
+               deliveryMode: "STABLE"
+             }
+
+      assert_receive {:audio, <<9, 9>>}
+    end
+
+    test "connect/1 leaves HTTP options alone" do
+      opts = [api_key: "key", transport: :http]
+      assert {:ok, ^opts} = Inworld.connect(opts)
+    end
+
+    test "connect/1 needs an API key for a websocket" do
+      assert {:error, {:missing_env, "INWORLD_API_KEY"}} =
+               Inworld.connect(transport: :websocket, api_key: "")
+    end
+  end
 end

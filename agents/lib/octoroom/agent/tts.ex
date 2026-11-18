@@ -54,7 +54,14 @@ defmodule Octoroom.Agent.TTS do
   @doc "Options used when the caller doesn't give them, such as `:model` and `:voice`."
   @callback default_options() :: keyword()
 
-  @optional_callbacks stream: 3, synthesize: 2, default_options: 0
+  @doc """
+  Opens what the provider keeps between calls, such as a WebSocket, tied to
+  the calling process. Returns the options that use it. Whoever speaks many
+  times (the TTS processor) calls it once first.
+  """
+  @callback connect(opts :: keyword()) :: {:ok, keyword()} | {:error, term()}
+
+  @optional_callbacks stream: 3, synthesize: 2, default_options: 0, connect: 1
 
   @providers %{
     inworld: Octoroom.Agent.TTS.Inworld,
@@ -76,6 +83,11 @@ defmodule Octoroom.Agent.TTS do
       {:ok, _module, opts} -> opts
       {:error, _reason} -> []
     end
+  end
+
+  @doc "`connect/1` of `module`, or `opts` unchanged when it has none."
+  def connect(module, opts) do
+    if function_exported?(module, :connect, 1), do: module.connect(opts), else: {:ok, opts}
   end
 
   @doc "Speaks `text` with `provider`, streaming audio to `on_audio`."

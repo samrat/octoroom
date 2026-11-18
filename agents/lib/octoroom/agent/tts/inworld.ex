@@ -3,14 +3,22 @@ defmodule Octoroom.Agent.TTS.Inworld do
   Inworld text-to-speech.
 
   Reads `INWORLD_API_KEY` (the Base64 key Inworld's dashboard shows). Besides
-  `Octoroom.Agent.TTS`'s options it takes `:stream` (`true`, the default,
-  uses the streaming endpoint; `false` makes one plain request), `:audio_encoding`,
-  `:delivery_mode` and `:timestamp_transport_strategy`.
+  `Octoroom.Agent.TTS`'s options it takes `:audio_encoding`, `:delivery_mode`,
+  `:timestamp_transport_strategy`, `:receive_timeout` and:
+
+    * `:transport` - `:http` (the default) or `:websocket`. Over HTTP each
+      call is a request; `:stream` (`true`, the default) uses the streaming
+      endpoint and `false` makes one plain request. Over `:websocket` each
+      call is a context on Inworld's bidirectional stream, on the connection
+      `connect/1` opened (the TTS processor opens one per agent), so replies
+      after the first skip the connection setup. Without one, a call opens
+      its own connection and closes it after.
   """
 
   @behaviour Octoroom.Agent.TTS
 
   alias Octoroom.Agent.SpeechProvider
+  alias Octoroom.Agent.TTS.Inworld.Socket
 
   @speech_url "https://api.inworld.ai/tts/v1/voice"
   @speech_stream_url "https://api.inworld.ai/tts/v1/voice:stream"
@@ -23,19 +31,43 @@ defmodule Octoroom.Agent.TTS.Inworld do
       voice: "Ashley",
       audio_encoding: "LINEAR16",
       sample_rate: 24_000,
-      stream: true
+      stream: true,
+      transport: :http
     ]
+  end
+
+  @doc """
+  Opens the WebSocket that `:websocket` calls share, closed when the calling
+  process exits. Returns the options with it as `:connection`. Does nothing
+  over HTTP.
+  """
+  @impl true
+  def connect(opts) do
+    with :websocket <- transport(opts),
+         nil <- Keyword.get(opts, :connection),
+         {:ok, token} <- SpeechProvider.api_key(opts, "INWORLD_API_KEY"),
+         {:ok, socket} <- Socket.start(token, socket_opts(opts)) do
+      {:ok, Keyword.put(opts, :connection, socket)}
+    else
+      {:error, reason} -> {:error, reason}
+      _http_or_connected -> {:ok, opts}
+    end
   end
 
   @impl true
   def stream(text, on_audio, opts) do
-    if Keyword.get(opts, :stream, true) do
-      stream_speech(text, on_audio, opts)
-    else
-      with {:ok, audio} <- synthesize(text, opts) do
-        on_audio.(audio)
-        :ok
-      end
+    cond do
+      transport(opts) == :websocket ->
+        websocket_speech(text, on_audio, opts)
+
+      Keyword.get(opts, :stream, true) ->
+        stream_speech(text, on_audio, opts)
+
+      true ->
+        with {:ok, audio} <- synthesize(text, opts) do
+          on_audio.(audio)
+          :ok
+        end
     end
   end
 
@@ -70,8 +102,8 @@ defmodule Octoroom.Agent.TTS.Inworld do
          ) do
       {:ok, %{status: status, body: %{"audioContent" => audio}}}
       when status in 200..299 and is_binary(audio) ->
-        case Base.decode64(audio) do
-          {:ok, decoded} -> {:ok, strip_wav_header(decoded)}
+        case Socket.decode_audio(audio) do
+          {:ok, decoded} -> {:ok, decoded}
           :error -> {:error, :invalid_inworld_audio_content}
         end
 
@@ -124,6 +156,43 @@ defmodule Octoroom.Agent.TTS.Inworld do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp websocket_speech(text, on_audio, opts) do
+    with {:ok, token} <- SpeechProvider.api_key(opts, "INWORLD_API_KEY") do
+      timeout = Keyword.get(opts, :receive_timeout, 60_000)
+      config = Map.delete(stream_payload(text, opts), :text)
+
+      case Keyword.get(opts, :connection) do
+        socket when is_pid(socket) ->
+          if Process.alive?(socket),
+            do: Socket.speak(socket, text, config, on_audio, timeout),
+            else: one_shot(token, text, config, on_audio, timeout, opts)
+
+        nil ->
+          one_shot(token, text, config, on_audio, timeout, opts)
+      end
+    end
+  end
+
+  # No shared connection, or it gave up reconnecting: one just for this call.
+  defp one_shot(token, text, config, on_audio, timeout, opts) do
+    with {:ok, socket} <- Socket.start(token, socket_opts(opts)) do
+      try do
+        Socket.speak(socket, text, config, on_audio, timeout)
+      after
+        Socket.stop(socket)
+      end
+    end
+  end
+
+  defp socket_opts(opts), do: Keyword.take(opts, [:url])
+
+  defp transport(opts) do
+    case Keyword.get(opts, :transport, :http) do
+      transport when transport in [:websocket, "websocket"] -> :websocket
+      _http -> :http
     end
   end
 
@@ -194,24 +263,11 @@ defmodule Octoroom.Agent.TTS.Inworld do
   defp audio_from_event(_event), do: :skip
 
   defp decode_audio(audio) do
-    case Base.decode64(audio) do
-      {:ok, decoded} -> {:ok, strip_wav_header(decoded)}
+    case Socket.decode_audio(audio) do
+      {:ok, decoded} -> {:ok, decoded}
       :error -> :skip
     end
   end
-
-  defp strip_wav_header(<<"RIFF", _rest::binary>> = audio) do
-    case :binary.match(audio, "data") do
-      {index, 4} when byte_size(audio) >= index + 8 ->
-        data_start = index + 8
-        binary_part(audio, data_start, byte_size(audio) - data_start)
-
-      _no_data_chunk ->
-        audio
-    end
-  end
-
-  defp strip_wav_header(audio), do: audio
 
   defp auth_headers(token) do
     [
