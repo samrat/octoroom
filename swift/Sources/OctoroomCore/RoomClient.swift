@@ -13,6 +13,13 @@ import Observation
 // asks for an offer (`push`) when it's this session's turn. Signaling is
 // serialized: one exchange at a time.
 //
+// Workers (server-side participants, such as AI agents) this client is
+// subscribed to are in `workers`, with `.workers` events when the list
+// changes; their events come as `.workerEvent`. `send(to:_:)` messages
+// one, and throws `OctoroomError.rejected` with the server's reason:
+// "not_allowed" (it doesn't hear this client, or the room said no),
+// "no_worker", "too_large" or "rate_limited".
+//
 // Reconnecting: the server hands out a resume token (refreshed with
 // `resume_token`). When the socket reconnects, the channel rejoins with it
 // and the server takes this client back as the same participant with the
@@ -33,6 +40,9 @@ public final class RoomClient {
     case state(State)
     case participants([Participant])
     case roomEvent(RoomEvent)
+    /// The workers this client sees changed: the whole list.
+    case workers([Worker])
+    case workerEvent(WorkerEvent)
     /// The remote tracks changed: read `tracks`.
     case tracks
     /// What this client publishes changed: read `localTracks`.
@@ -54,6 +64,8 @@ public final class RoomClient {
   public private(set) var state: State = .idle
   public private(set) var participantId: String?
   public private(set) var participants: [Participant] = []
+  /// The workers this client sees, in the order it learned of them.
+  public private(set) var workers: [Worker] = []
   /// Tracks this client receives, in the order they arrived.
   public private(set) var tracks: [RemoteTrack] = []
   /// What this client publishes.
@@ -226,6 +238,13 @@ public final class RoomClient {
       self?.setGain(mid: mid, gain: gain)
     }
     channel.on("room_event") { [weak self] p in self?.onRoomEvent(p) }
+    channel.on("worker") { [weak self] p in self?.onWorker(p) }
+    channel.on("worker_event") { [weak self] p in
+      guard let worker = p["worker"]?.stringValue, let type = p["type"]?.stringValue else { return }
+      let event = WorkerEvent(
+        worker: worker, output: p["output"]?.stringValue ?? "", type: type, data: p["data"] ?? [:])
+      self?.emit(.workerEvent(event))
+    }
     channel.on("resume_token") { [weak self] p in
       if let token = p["token"]?.stringValue { self?.resumeToken = token }
     }
@@ -244,7 +263,9 @@ public final class RoomClient {
     participants = (try? reply["participants"]?.decode([Participant].self)) ?? []
     iceServers = (try? reply["ice_servers"]?.decode([IceServer].self)) ?? []
     resumeToken = reply["resume_token"]?.stringValue
+    workers = (try? reply["workers"]?.decode([Worker].self)) ?? []
     emit(.participants(participants))
+    emit(.workers(workers))
   }
 
   private func onRejoined(_ reply: JSONValue) {
@@ -379,10 +400,12 @@ public final class RoomClient {
     self.channel = nil
     if reason != .closed { channel?.leave() }
     participants = []
+    workers = []
     participantId = nil
     resumeToken = nil
     isMuted = false
     emit(.participants([]))
+    emit(.workers([]))
     emit(.left(reason))
     if reason == .closed { emit(.error(OctoroomError.removed)) }
     setState(.idle)
@@ -611,6 +634,32 @@ public final class RoomClient {
     }
     emit(.roomEvent(RoomEvent(type: type, participant: participant)))
     emit(.participants(participants))
+  }
+
+  // A worker this client now sees, no longer sees, or whose presence
+  // changed. An "added" for one it already has replaces it; an "updated"
+  // for one it doesn't is ignored.
+  private func onWorker(_ p: JSONValue) {
+    guard let op = p["op"]?.stringValue, let id = p["worker"]?["id"]?.stringValue else { return }
+    let index = workers.firstIndex { $0.id == id }
+    switch (op, index) {
+    case ("removed", .some(let i)):
+      workers.remove(at: i)
+    case ("removed", nil), ("updated", nil):
+      return
+    default:
+      guard let worker = try? p["worker"]?.decode(Worker.self) else { return }
+      if let i = index { workers[i] = worker } else { workers.append(worker) }
+    }
+    emit(.workers(workers))
+  }
+
+  /// Sends `payload` (an object) to worker `workerId`'s `handle_info/2`.
+  /// Returns once the worker has it; throws `OctoroomError.rejected` with
+  /// the server's reason.
+  @discardableResult
+  public func send(to workerId: String, _ payload: JSONValue) async throws -> JSONValue {
+    try await push("worker_message", ["worker": .string(workerId), "payload": payload])
   }
 
   private func push(_ event: String, _ payload: JSONValue = [:]) async throws -> JSONValue {

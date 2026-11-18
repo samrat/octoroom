@@ -59,6 +59,57 @@ public struct RoomEvent: Sendable, Hashable {
   public var participant: Participant
 }
 
+/// A server-side participant (an AI agent, a recorder) this client sees:
+/// it's subscribed to one of the worker's outputs. `state` and
+/// `attributes` are whatever the worker set as its presence.
+public struct Worker: Codable, Sendable, Hashable, Identifiable {
+  public var id: String
+  /// Its audio outputs' track names.
+  public var outputs: [String]
+  /// Its data-only outputs' names.
+  public var data: [String]
+  public var state: String?
+  public var attributes: JSONValue
+
+  public init(
+    id: String, outputs: [String] = [], data: [String] = [], state: String? = nil,
+    attributes: JSONValue = [:]
+  ) {
+    self.id = id
+    self.outputs = outputs
+    self.data = data
+    self.state = state
+    self.attributes = attributes
+  }
+
+  enum CodingKeys: CodingKey { case id, outputs, data, state, attributes }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    outputs = try c.decodeIfPresent([String].self, forKey: .outputs) ?? []
+    data = try c.decodeIfPresent([String].self, forKey: .data) ?? []
+    state = try c.decodeIfPresent(String.self, forKey: .state)
+    attributes = try c.decodeIfPresent(JSONValue.self, forKey: .attributes) ?? [:]
+  }
+}
+
+/// An event from a worker's `notify:`, on one of its outputs this client
+/// is subscribed to.
+public struct WorkerEvent: Sendable, Hashable {
+  public var worker: String
+  public var output: String
+  public var type: String
+  public var data: JSONValue
+
+  public init(worker: String, output: String, type: String, data: JSONValue) {
+    self.worker = worker
+    self.output = output
+    self.type = type
+    self.data = data
+  }
+}
+
 /// What the server says about a track it pulled into this session.
 public struct TrackInfo: Codable, Sendable, Hashable {
   public var mid: String

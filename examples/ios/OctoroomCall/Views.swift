@@ -1,4 +1,5 @@
 import Octoroom
+import OctoroomAgents
 import SwiftUI
 
 struct JoinView: View {
@@ -52,6 +53,9 @@ struct CallView: View {
         VStack(alignment: .leading, spacing: 16) {
           videoGrid
           participantList
+          if let agents = call.agents, !agents.agents.isEmpty {
+            AgentsSection(call: call, agents: agents)
+          }
           if let error = call.error {
             Text(error).font(.footnote).foregroundStyle(.red)
           }
@@ -178,5 +182,79 @@ struct CallView: View {
       .background(active ? tint : tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
     }
     .buttonStyle(.plain)
+  }
+}
+
+/// The agents this client sees: each one's state, the chosen one's
+/// transcript, and a field to type to it.
+struct AgentsSection: View {
+  @Bindable var call: CallModel
+  let agents: Agents
+
+  private var chosen: Agents.Agent? {
+    agents.agents.first { $0.id == call.sayTo } ?? agents.agents.first
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text("Agents").font(.headline)
+      ForEach(agents.agents) { agent in
+        Button {
+          call.sayTo = agent.id
+        } label: {
+          HStack {
+            Image(systemName: agent.id == chosen?.id ? "largecircle.fill.circle" : "circle")
+              .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading) {
+              Text(agent.name)
+              if let description = agent.description {
+                Text(description).font(.caption).foregroundStyle(.secondary)
+              }
+            }
+            Spacer()
+            stateChip(agent.state)
+          }
+        }
+        .buttonStyle(.plain)
+      }
+
+      if let chosen {
+        ForEach(agents.transcript(chosen.id).suffix(6)) { item in
+          VStack(alignment: .leading, spacing: 2) {
+            Text(item.role == "assistant" ? chosen.name : (item.speaker ?? "Someone"))
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(item.role == "assistant" ? Color.accentColor : .primary)
+            Text(item.text + (item.status == "interrupted" ? " …" : "")).font(.callout)
+          }
+        }
+
+        HStack {
+          TextField("Type to \(chosen.name)", text: $call.message)
+            .textFieldStyle(.roundedBorder)
+            .onSubmit { Task { await call.say() } }
+          Button {
+            Task { await call.say() }
+          } label: {
+            Image(systemName: "paperplane.fill")
+          }
+          .disabled(call.message.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+      }
+    }
+  }
+
+  private func stateChip(_ state: Agents.State?) -> some View {
+    let (label, color): (String, Color) =
+      switch state {
+      case .thinking: ("Thinking…", .blue)
+      case .speaking: ("Speaking", .accentColor)
+      case .waiting: ("Waiting", .orange)
+      case .listening, nil: ("Listening", .secondary)
+      }
+    return Text(label)
+      .font(.caption2.weight(.medium))
+      .padding(.horizontal, 8).padding(.vertical, 3)
+      .foregroundStyle(color)
+      .background(color.opacity(0.12), in: Capsule())
   }
 }

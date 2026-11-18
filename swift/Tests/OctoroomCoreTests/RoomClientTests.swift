@@ -42,12 +42,19 @@ final class Harness {
   ]
 
   /// Joins and answers the whole handshake the way the server does.
-  func join() async throws {
+  func join(_ reply: JSONValue = Harness.joinReply) async throws {
     let joining = Task { try await room.join() }
     let join = try await server.next("phx_join")
-    server.reply(join, Self.joinReply)
+    server.reply(join, reply)
     try await publishMedia()
     try await joining.value
+  }
+
+  /// The join reply with `workers` this client sees.
+  static func joinReply(workers: JSONValue) -> JSONValue {
+    guard case .object(var o) = joinReply else { return joinReply }
+    o["workers"] = workers
+    return .object(o)
   }
 
   /// Answers a `publish`: Cloudflare's answer, the connection, `connected`.
