@@ -38,7 +38,8 @@ defmodule Octoroom.MixProject do
       # ship with a precompiled libopus.
       {:membrane_opus_plugin, "~> 0.20"},
       {:phoenix, "~> 1.7", optional: true},
-      {:stream_data, "~> 1.1", only: :test}
+      {:stream_data, "~> 1.1", only: :test},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 end

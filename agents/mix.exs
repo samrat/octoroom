@@ -34,7 +34,8 @@ defmodule OctoroomAgents.MixProject do
       {:req_llm, github: "agentjido/req_llm", ref: "d711c4ab9ea75d3243643c68452825aa4cfaebe1"},
       {:websockex, "~> 0.5.1"},
       # Silero VAD runs on ONNX Runtime. Needs a Rust toolchain to build.
-      {:ortex, "~> 0.1.10"}
+      {:ortex, "~> 0.1.10"},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 end

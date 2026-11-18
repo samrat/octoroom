@@ -257,12 +257,10 @@ defmodule Octoroom.Agent.Pipeline.Spec do
 
   defp processor_modules(stages) do
     Enum.find_value(stages, :ok, fn %Stage{name: name, module: module, opts: opts} ->
-      cond do
-        not (Code.ensure_loaded?(module) and function_exported?(module, :handle_frame, 3)) ->
-          {:error, {:not_a_processor, name, module}}
-
-        true ->
-          validate_options(name, module, opts)
+      if Code.ensure_loaded?(module) and function_exported?(module, :handle_frame, 3) do
+        validate_options(name, module, opts)
+      else
+        {:error, {:not_a_processor, name, module}}
       end
     end)
   end
