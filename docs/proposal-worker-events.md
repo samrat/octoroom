@@ -148,7 +148,8 @@ Octoroom.subscribe(room_id, scope: {:participant, id}) # what that participant's
   `{:octoroom, room_id, event}` with the same events the channel pushes,
   as Elixir terms: room events,
   `{:worker, :added | :updated | :removed, presence}`, and
-  `{:worker_event, worker_id, output, type, data}`. It also receives them
+  `{:worker_notify, worker_id, output, type, data}` (not `:worker_event`,
+  which stays the 3-tuple `emit` sends to `scope: :room`). It also receives them
   while the participant is disconnected. The participant id in `scope:`
   is trusted (server code can pass any id), and the docs say so.
 - `subscribe/1` is removed. Callers: meet's `room_live.ex`, the `call`
@@ -245,7 +246,12 @@ Each step is one commit, with tests passing.
    join and resume replies. Tests: the coach example (the customer gets
    neither presence nor events from the coach worker); per-output scoping
    with two outputs; resume carries presence; a worker restart keeps
-   attributes.
+   attributes. (Done 2026-11-18. As built: visibility is recomputed at the
+   end of each reconcile into `state.seen`; `scope: :room` subscribers get
+   untargeted `notify`s and `{:worker, :updated, _}` but no `:added` or
+   `:removed`, which are per participant; `notify` and `presence` payloads
+   are checked as JSON in the worker, which crashes on a bad one rather
+   than the channel.)
 4. **Messages.** The `worker_message` channel event, the permission check,
    `message/3`, size and rate limits. Tests: each error reason; an allowed
    message arrives with the sender's id.
@@ -277,6 +283,13 @@ helper.
 - **Events during `:opening`.** An audio subscription that's still
   opening doesn't see the worker yet, so events in that window are lost.
   The snapshot covers transcripts. Is anything else affected?
+- **Room crash recovery.** A recovered room starts with no `seen`, so a
+  client re-gets `added` for what it still sees, but never `removed` for a
+  worker it saw before the crash and no longer does. The channel could
+  push the full list after its own resume (`room_down/3`).
+- **Changed outputs.** A worker whose outputs or data outputs change while
+  a participant keeps seeing it sends no `updated`, so the client's
+  `outputs` and `data` go stale until the next presence change.
 - **Clustering.** Both scopes use the local Registry, so subscribers must
   be on the room's node. Moving events to Phoenix PubSub (roadmap) means a
   topic per room plus one per participant.

@@ -17,7 +17,14 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     Client → server: `publish`, `publish_tracks`, `push_offer`, `unpublish`,
     `mute`, `connected`, `answer`, `close_offer`.
     Server → client: `renegotiate`, `close`, `push`, `tracks`, `gain`,
-    `room_event`, `resume_token`, `republish`.
+    `room_event`, `resume_token`, `republish`, `worker` and `worker_event`.
+
+    `worker` is `{op: "added" | "updated" | "removed", worker}`, where
+    `worker` is `{id, outputs, data, state, attributes}` (just `{id}` when
+    removed): a worker this participant now sees, or no longer sees, or
+    whose presence changed. The join reply's `workers` lists the ones it
+    sees at that moment. `worker_event` is `{worker, output, type, data}`,
+    from a worker's `notify:` (see `Octoroom.Worker`).
 
     A known event whose body has the wrong shape is refused with
     `{reason: "bad_payload"}`, an unknown event with `unknown_event`.
@@ -247,7 +254,16 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     def __handle_info__({:octoroom_signal, kind, payload}, socket)
-        when kind in [:renegotiate, :close, :push, :tracks, :gain, :republish] do
+        when kind in [
+               :renegotiate,
+               :close,
+               :push,
+               :tracks,
+               :gain,
+               :republish,
+               :worker,
+               :worker_event
+             ] do
       push(socket, Atom.to_string(kind), payload)
       {:noreply, socket}
     end

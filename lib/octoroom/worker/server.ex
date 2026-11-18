@@ -5,8 +5,10 @@ defmodule Octoroom.Worker.Server do
   # format as `{:octoroom_input, input, pcm, format}`; it calls
   # `handle_audio/3`, and carries out the returned actions: converting
   # played audio back to room PCM for the output's outlet, flushing, and
-  # emitting events. The room server sends `{:octoroom_io, inputs, outputs}`
-  # when the worker's spec changes without a restart.
+  # emitting events. `notify` and `presence` go to the room server, which
+  # knows who may see them. The room server sends
+  # `{:octoroom_io, inputs, outputs, data}` when the worker's spec changes
+  # without a restart.
 
   use GenServer, restart: :temporary
 
@@ -41,6 +43,7 @@ defmodule Octoroom.Worker.Server do
 
     state = %{
       room_id: room_id,
+      server: Map.get(opts, :server),
       id: spec.id,
       module: module,
       store: store,
@@ -50,6 +53,7 @@ defmodule Octoroom.Worker.Server do
       out_channels: out_channels,
       inputs: spec.inputs,
       outputs: spec.outputs,
+      data: Map.get(spec, :data, []),
       prev: %{},
       user: nil
     }
@@ -69,9 +73,9 @@ defmodule Octoroom.Worker.Server do
   # told the inlet the new format, and the next frames will be in it.
   def handle_info({:octoroom_input, _input, _pcm, _format}, state), do: {:noreply, state}
 
-  def handle_info({:octoroom_io, inputs, outputs}, state) do
+  def handle_info({:octoroom_io, inputs, outputs, data}, state) do
     old = state
-    state = %{state | inputs: inputs, outputs: outputs}
+    state = %{state | inputs: inputs, outputs: outputs, data: data}
 
     state =
       if inputs != old.inputs, do: user_info({:octoroom, :inputs, inputs}, state), else: state
@@ -79,6 +83,7 @@ defmodule Octoroom.Worker.Server do
     state =
       if outputs != old.outputs, do: user_info({:octoroom, :outputs, outputs}, state), else: state
 
+    state = if data != old.data, do: user_info({:octoroom, :data, data}, state), else: state
     {:noreply, state}
   end
 
@@ -120,6 +125,25 @@ defmodule Octoroom.Worker.Server do
     state
   end
 
+  defp action({:notify, {output, type, data}}, state), do: notify(output, type, data, nil, state)
+
+  defp action({:notify, {output, type, data, to}}, state) when is_binary(to),
+    do: notify(output, type, data, to, state)
+
+  defp action({:presence, presence}, state) when is_map(presence) do
+    status = Map.get(presence, :state)
+    attributes = Map.get(presence, :attributes, %{})
+
+    unless is_nil(status) or is_binary(status),
+      do: raise(ArgumentError, "presence state must be a string or nil, got #{inspect(status)}")
+
+    unless is_map(attributes),
+      do: raise(ArgumentError, "presence attributes must be a map, got #{inspect(attributes)}")
+
+    json!(attributes, "presence attributes")
+    tell_room(state, {:presence, status, attributes})
+  end
+
   defp action({:save, data}, state) do
     Store.put(state.store, :workers, {state.room_id, state.id}, data)
     state
@@ -127,6 +151,49 @@ defmodule Octoroom.Worker.Server do
 
   defp action(other, state),
     do: raise(ArgumentError, "#{inspect(state.module)} returned unknown action #{inspect(other)}")
+
+  # Events go to the room server, which delivers them to whoever sees the
+  # output; it's checked here, in the worker, that clients can decode them.
+  defp notify(output, type, data, to, state) do
+    output = notify_output!(output, state)
+
+    unless is_binary(type),
+      do: raise(ArgumentError, "notify type must be a string, got #{inspect(type)}")
+
+    unless is_map(data),
+      do: raise(ArgumentError, "notify data must be a map, got #{inspect(data)}")
+
+    json!(data, "notify data")
+    tell_room(state, {:notify, output, type, data, to})
+  end
+
+  defp tell_room(%{server: nil} = state, _message), do: state
+
+  defp tell_room(state, message) do
+    send(state.server, {:octoroom_worker, self(), state.id, message})
+    state
+  end
+
+  defp json!(term, what) do
+    case Jason.encode(term) do
+      {:ok, _} -> :ok
+      {:error, error} -> raise ArgumentError, "#{what} isn't JSON: #{Exception.message(error)}"
+    end
+  end
+
+  # Any output, audio or data. `:default` is the first.
+  defp notify_output!(:default, state) do
+    case state.outputs ++ state.data do
+      [first | _] -> first
+      [] -> raise ArgumentError, "worker #{inspect(state.id)} has no outputs to notify on"
+    end
+  end
+
+  defp notify_output!(name, state) do
+    if name in state.outputs or name in state.data,
+      do: name,
+      else: raise(ArgumentError, "worker #{inspect(state.id)} has no output #{inspect(name)}")
+  end
 
   defp output!(:default, %{outputs: [first | _]}), do: first
 

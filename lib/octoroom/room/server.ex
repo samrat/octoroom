@@ -218,6 +218,12 @@ defmodule Octoroom.Room.Server do
        participants: %{},
        worker_specs: [],
        workers: %{},
+       # worker id => %{state, attributes}, what it last set with `presence:`.
+       presence: %{},
+       # participant id => %{output name => worker id}: the worker outputs,
+       # audio (pull open) or data, each participant receives, as of the
+       # last reconcile.
+       seen: %{},
        # worker id => its peer
        peers: %{},
        outlets: %{},
@@ -353,6 +359,8 @@ defmodule Octoroom.Room.Server do
           |> Map.take([:id, :module, :inputs, :outputs, :data])
           |> Map.merge(%{
             running: running != nil,
+            state: get_in(state.presence, [spec.id, :state]),
+            attributes: get_in(state.presence, [spec.id, :attributes]) || %{},
             connected:
               for({{id, input}, %{status: :connected}} <- state.inlets, id == spec.id, do: input)
               |> Enum.sort(),
@@ -729,6 +737,15 @@ defmodule Octoroom.Room.Server do
 
   # Exits are trapped for `terminate/2`; the parent's is handled by
   # GenServer, and nothing else is linked.
+  # From a worker's `notify:` and `presence:` actions. Ignored from a
+  # process that's no longer the worker's, such as one that was restarted.
+  def handle_info({:octoroom_worker, pid, id, message}, state) do
+    case state.workers[id] do
+      %{pid: ^pid} -> {:noreply, worker_message(state, id, message)}
+      _ -> {:noreply, state}
+    end
+  end
+
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -1047,7 +1064,7 @@ defmodule Octoroom.Room.Server do
         apply_ops(state, state.participants[id], Map.get(ops, id, []))
       end)
 
-    schedule_retry(state)
+    state |> sync_seen() |> schedule_retry()
   end
 
   defp apply_ops(state, p, ops) do
@@ -1292,6 +1309,138 @@ defmodule Octoroom.Room.Server do
       end)
   end
 
+  ## Worker presence and events
+
+  defp worker_message(state, id, {:notify, output, type, data, to}) do
+    viewers =
+      for {pid, outputs} <- state.seen,
+          Map.get(outputs, output) == id,
+          to == nil or pid == to,
+          do: pid
+
+    payload = %{worker: id, output: output, type: type, data: data}
+    for pid <- viewers, do: signal(state.participants[pid], :worker_event, payload)
+
+    event = {:worker_notify, id, output, type, data}
+    Octoroom.deliver(state.id, viewers, event)
+    if to == nil, do: Octoroom.broadcast(state.id, event)
+    state
+  end
+
+  defp worker_message(state, id, {:presence, status, attributes}) do
+    presence = %{state: status, attributes: attributes}
+
+    if state.presence[id] == presence,
+      do: state,
+      else: presence_changed(put_in(state.presence[id], presence), id)
+  end
+
+  # A worker (re)started: its state is unknown until it sets it again.
+  defp restarted_presence(state, id) do
+    case state.presence[id] do
+      %{state: nil} -> state
+      nil -> state
+      presence -> presence_changed(put_in(state.presence[id], %{presence | state: nil}), id)
+    end
+  end
+
+  defp presence_changed(state, id) do
+    payload = worker_presence(state, id)
+    viewers = for {pid, outputs} <- state.seen, id in Map.values(outputs), do: pid
+
+    for pid <- viewers,
+        do: signal(state.participants[pid], :worker, %{op: :updated, worker: payload})
+
+    Octoroom.deliver(state.id, viewers, {:worker, :updated, payload})
+    Octoroom.broadcast(state.id, {:worker, :updated, payload})
+    state
+  end
+
+  # What clients are told about a worker.
+  defp worker_presence(state, id) do
+    spec = Enum.find(state.worker_specs, &(&1.id == id)) || %{outputs: [], data: []}
+    presence = Map.get(state.presence, id, %{state: nil, attributes: %{}})
+
+    %{
+      id: id,
+      outputs: spec.outputs,
+      data: Map.get(spec, :data, []),
+      state: presence.state,
+      attributes: presence.attributes
+    }
+  end
+
+  # Output name => worker id, for every worker output, audio or data.
+  defp worker_outputs(state) do
+    audio =
+      for spec <- Enum.reverse(state.worker_specs),
+          name <- spec.outputs,
+          into: %{},
+          do: {name, spec.id}
+
+    Map.merge(audio, data_outputs(state))
+  end
+
+  # Who receives which worker outputs, against the last pass: workers hear
+  # about participants subscribing and unsubscribing, and clients about
+  # workers they can now see or no longer see. Presence of workers that
+  # are gone is dropped.
+  defp sync_seen(state) do
+    owners = worker_outputs(state)
+
+    now =
+      Map.new(state.participants, fn {pid, p} ->
+        audio = for {name, %{status: :open}} <- p.subs, Map.has_key?(owners, name), do: name
+        data = Enum.filter(p.data_subs, &Map.has_key?(owners, &1))
+        {pid, Map.new(audio ++ data, &{&1, owners[&1]})}
+      end)
+
+    for pid <- Enum.uniq(Map.keys(state.seen) ++ Map.keys(now)) do
+      before = Map.get(state.seen, pid, %{})
+      after_ = Map.get(now, pid, %{})
+
+      for {name, wid} <- before,
+          after_[name] != wid,
+          %{pid: worker} <- [state.workers[wid]],
+          do: send(worker, {:octoroom, :unsubscribed, pid, name})
+
+      for {name, wid} <- after_,
+          before[name] != wid,
+          %{pid: worker} <- [state.workers[wid]],
+          do: send(worker, {:octoroom, :subscribed, pid, name})
+
+      # A participant that left isn't told anything.
+      if p = state.participants[pid] do
+        was = before |> Map.values() |> MapSet.new()
+        is = after_ |> Map.values() |> MapSet.new()
+
+        for wid <- MapSet.difference(is, was) |> Enum.sort() do
+          payload = worker_presence(state, wid)
+          signal(p, :worker, %{op: :added, worker: payload})
+          Octoroom.deliver(state.id, [pid], {:worker, :added, payload})
+        end
+
+        for wid <- MapSet.difference(was, is) |> Enum.sort() do
+          signal(p, :worker, %{op: :removed, worker: %{id: wid}})
+          Octoroom.deliver(state.id, [pid], {:worker, :removed, %{id: wid}})
+        end
+      end
+    end
+
+    specs = MapSet.new(state.worker_specs, & &1.id)
+    %{state | seen: now, presence: Map.filter(state.presence, fn {id, _} -> id in specs end)}
+  end
+
+  # The workers participant `pid` sees, as clients are told about them.
+  defp seen_workers(state, pid) do
+    state.seen
+    |> Map.get(pid, %{})
+    |> Map.values()
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.map(&worker_presence(state, &1))
+  end
+
   # Data output name => the id of the worker it belongs to. If two workers
   # name the same one, the first in the specs has it, as with outputs.
   defp data_outputs(state) do
@@ -1397,7 +1546,7 @@ defmodule Octoroom.Room.Server do
 
   defp apply_worker_op({:update_worker, spec}, state) do
     w = state.workers[spec.id]
-    send(w.pid, {:octoroom_io, spec.inputs, spec.outputs})
+    send(w.pid, {:octoroom_io, spec.inputs, spec.outputs, Map.get(spec, :data, [])})
     put_in(state.workers[spec.id].spec, spec)
   end
 
@@ -1587,6 +1736,7 @@ defmodule Octoroom.Room.Server do
     if may_retry?(state, :worker, spec.id) do
       opts = %{
         room_id: state.id,
+        server: self(),
         spec: spec,
         participants: Enum.map(participants(state), &public/1),
         resumed: state.recovering,
@@ -1616,7 +1766,15 @@ defmodule Octoroom.Room.Server do
               id == spec.id,
               do: send(inlet, {:octoroom_format, format})
 
-          put_in(state.workers[spec.id], w)
+          # A restart: whoever already sees it is subscribed to the new
+          # process too, and its state starts over.
+          for {participant_id, outputs} <- state.seen,
+              {name, worker_id} <- outputs,
+              worker_id == spec.id,
+              do: send(pid, {:octoroom, :subscribed, participant_id, name})
+
+          state = put_in(state.workers[spec.id], w)
+          restarted_presence(state, spec.id)
 
         {:error, reason} ->
           Logger.warning("Octoroom couldn't start worker #{spec.id}: #{inspect(reason)}")
@@ -1848,6 +2006,8 @@ defmodule Octoroom.Room.Server do
       participant_id: p.id,
       participants: Enum.map(participants(state), &public/1),
       ice_servers: Octoroom.ice_servers(),
+      # The workers it sees; updates come as `worker` signals.
+      workers: seen_workers(state, p.id),
       resumed: resumed,
       # The channel turns this into the client's resume token.
       resume: resume_data(p)

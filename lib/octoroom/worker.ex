@@ -43,7 +43,24 @@ defmodule Octoroom.Worker do
       output's outlet wasn't running), so what it queued minus `dropped_ms`
       is what listeners heard, give or take the frame on its way.
     * `emit: event`: broadcast `{:worker_event, worker_id, event}` to the
-      room's `scope: :room` subscribers (see `Octoroom.subscribe/2`).
+      room's `scope: :room` subscribers (see `Octoroom.subscribe/2`). Any
+      term; it never reaches clients.
+    * `notify: {output, type, data}`: an event for clients. It goes to the
+      participants subscribed to `output` (an audio or data output;
+      `:default` is the first of either): to their clients as a
+      `worker_event` and to their `scope: {:participant, id}` subscribers
+      as `{:worker_notify, worker_id, output, type, data}`, and to
+      `scope: :room` subscribers. `type` is a string and `data` a map that
+      encodes as JSON; anything else raises.
+    * `notify: {output, type, data, participant_id}`: the same, for one
+      participant only, and not to `scope: :room` subscribers. Dropped if
+      that participant isn't subscribed to `output`. For catching up a
+      participant that just subscribed.
+    * `presence: %{state: string | nil, attributes: map}`: what clients
+      show for this worker, replacing what it set before (missing keys
+      reset). It goes to everyone subscribed to any of its outputs, now
+      and as they subscribe. After a restart, `state` is nil until the
+      worker sets it again; `attributes` are kept.
     * `save: term`: keep `term` in the store (`Octoroom.Store`) as what
       this worker would need to carry on, such as its conversation so far.
       Each save replaces the last. The worker's next start in the same room
@@ -53,9 +70,17 @@ defmodule Octoroom.Worker do
       because its last participant left. Keep it small: it's written on
       every save.
 
-  `handle_info/2` also receives `{:octoroom, :inputs, names}` and
-  `{:octoroom, :outputs, names}` when the room changes the worker's inputs or
-  outputs; the worker keeps running. A change of module or args restarts it.
+  `handle_info/2` also receives:
+
+    * `{:octoroom, :inputs, names}`, `{:octoroom, :outputs, names}` and
+      `{:octoroom, :data, names}` when the room changes the worker's
+      inputs, outputs or data outputs; the worker keeps running. A change
+      of module or args restarts it.
+    * `{:octoroom, :subscribed, participant_id, output}` and
+      `{:octoroom, :unsubscribed, participant_id, output}` as participants
+      start and stop receiving one of its outputs (an audio subscription
+      counts once its pull is open). After a restart, the worker gets
+      `:subscribed` for everyone already subscribed.
 
   A worker that crashes is restarted by its room, with backoff. Its output
   tracks stay published while it restarts, so listeners hear a gap rather
@@ -69,6 +94,10 @@ defmodule Octoroom.Worker do
           play: {String.t() | :default, binary},
           flush: String.t() | :default,
           emit: term,
+          notify:
+            {String.t() | :default, String.t(), map}
+            | {String.t() | :default, String.t(), map, String.t()},
+          presence: %{optional(:state) => String.t() | nil, optional(:attributes) => map},
           save: term
         ]
   @type result :: {:ok, state} | {:ok, state, actions}

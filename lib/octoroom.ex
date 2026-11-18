@@ -27,9 +27,17 @@ defmodule Octoroom do
       publishes was muted, unmuted or unpublished (see its `tracks`)
     * `{:published, participant}`: a source it publishes (mic, camera,
       screen) is live at Cloudflare
+    * `{:worker, :added | :updated | :removed, presence}`: a worker it now
+      sees (it's subscribed to one of the worker's outputs), whose presence
+      changed, or that it no longer sees. `presence` is `%{id, outputs,
+      data, state, attributes}`, or just `%{id}` when removed.
+    * `{:worker_notify, worker_id, output, type, data}`: a worker's
+      `notify:` on an output it's subscribed to
 
   With `scope: :room`, those (including the participant's own joins and
-  leaves) plus:
+  leaves, every `notify:` except those sent to one participant, and
+  `{:worker, :updated, presence}` for every presence change, but no
+  `:added` or `:removed`) plus:
 
     * `{:subscriptions, participant_id, track_names}`: what it now hears
     * `{:disconnected, participant}`: its connection dropped; it's kept
