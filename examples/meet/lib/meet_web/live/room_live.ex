@@ -4,7 +4,11 @@ defmodule MeetWeb.RoomLive do
   assets/js/call.js) carries the audio and video; this LiveView renders
   what the room server knows (who's here, what each person publishes) and
   what the assistants hear and decide, as a transcript: one entry per turn,
-  with a row of tags for each assistant's decision.
+  with a row of tags for each assistant's decision. Each assistant's tile
+  shows the state it reports itself (its presence: listening, thinking,
+  speaking, waiting), and anyone in the call can type to an assistant
+  from the box under the transcript (the `Call` hook sends it with the
+  browser client's `room.send/2`).
 
   The assistants save their conversations, so the transcript is rebuilt
   from them when the call appears: after the server restarts (LiveView
@@ -31,8 +35,11 @@ defmodule MeetWeb.RoomLive do
         joining: false,
         form: to_form(%{"name" => "", "camera" => "true"}),
         assistants: Meet.Room.assistants(),
-        # Each assistant: :listening, :thinking, :waiting or :speaking
+        # Each assistant's presence: :listening, :thinking, :waiting or
+        # :speaking
         states: %{},
+        # Who the type box sends to, so a re-render keeps the choice
+        say_to: nil,
         # Who each assistant is waiting on: %{id => speaker}
         waiting: %{},
         # Words still arriving, by mic: %{source => %{speaker, text}}
@@ -113,6 +120,15 @@ defmodule MeetWeb.RoomLive do
   def handle_info({:octoroom, _room, {:worker_event, id, {:agent, event}}}, socket),
     do: {:noreply, assistant_event(socket, id, event)}
 
+  # An assistant says what it's doing (its `presence:`).
+  def handle_info({:octoroom, _room, {:worker, :updated, %{id: id, state: state}}}, socket),
+    do: {:noreply, put_state(socket, id, presence_state(state))}
+
+  # The same transcript the assistants send clients: this page builds its
+  # own from their events, with decisions.
+  def handle_info({:octoroom, _room, {:worker_notify, _id, _output, _type, _data}}, socket),
+    do: {:noreply, socket}
+
   def handle_info({:octoroom, _room, _event}, socket), do: {:noreply, load(socket)}
 
   # From the assistant's set_theme tool. The root layout's theme script
@@ -131,7 +147,8 @@ defmodule MeetWeb.RoomLive do
 
     assign(socket,
       participants: participants,
-      present: Enum.filter(socket.assigns.assistants, &MapSet.member?(running, &1.id))
+      present: Enum.filter(socket.assigns.assistants, &MapSet.member?(running, &1.id)),
+      states: Map.new(workers, &{&1.id, presence_state(&1[:state])})
     )
   end
 
@@ -160,6 +177,20 @@ defmodule MeetWeb.RoomLive do
     {:noreply, socket |> assign(me: me, joining: state == "joining") |> load()}
   end
 
+  def handle_event("say_to", %{"to" => to}, socket), do: {:noreply, assign(socket, say_to: to)}
+
+  # The Call hook couldn't send a typed message: the room said no.
+  def handle_event("say_failed", %{"to" => id, "reason" => reason}, socket) do
+    message =
+      case reason do
+        "rate_limited" -> "Slow down: too many messages to #{assistant_name(socket, id)}."
+        "not_allowed" -> "#{assistant_name(socket, id)} can't hear you, so it won't read that."
+        _ -> "Couldn't send that to #{assistant_name(socket, id)} (#{reason})."
+      end
+
+    {:noreply, put_flash(socket, :error, message)}
+  end
+
   def handle_event("saved_name", %{"name" => name}, socket) when is_binary(name),
     do: {:noreply, assign(socket, form: to_form(%{socket.assigns.form.params | "name" => name}))}
 
@@ -173,6 +204,33 @@ defmodule MeetWeb.RoomLive do
   # (the primary); the others' decisions join the latest of its turns from
   # that mic, or wait a few seconds for it. With the primary not in the
   # call, the others make their own entries.
+  # Typed to one assistant: only that one decides, so it's an entry of its
+  # own, whichever assistant it is.
+  defp assistant_event(socket, id, {:decision, %{why: :typed} = d}) do
+    verdict = %{
+      id: id,
+      name: assistant_name(socket, id),
+      outcome: :reply,
+      why: :typed,
+      decision: nil
+    }
+
+    n = socket.assigns.turns + 1
+
+    entry = %{
+      id: "turn-#{n}",
+      kind: :turn,
+      typed: true,
+      speaker: d.speaker,
+      text: d.text,
+      at: now(),
+      at_ms: System.monotonic_time(:millisecond),
+      verdicts: [verdict]
+    }
+
+    socket |> assign(turns: n) |> stream_insert(:transcript, entry)
+  end
+
   defp assistant_event(socket, id, {:decision, d}) do
     verdict = %{
       id: id,
@@ -182,9 +240,6 @@ defmodule MeetWeb.RoomLive do
       decision: d.decision,
       at_ms: System.monotonic_time(:millisecond)
     }
-
-    state = if d.outcome == :reply, do: :thinking, else: state(socket, id)
-    socket = put_state(socket, id, state)
 
     if id == primary(socket) or primary_absent?(socket),
       do: add_turn(socket, d, verdict),
@@ -204,11 +259,9 @@ defmodule MeetWeb.RoomLive do
   defp assistant_event(socket, id, {:conversation, %{role: "assistant"} = item}) do
     dom_id = "reply-#{id}-#{item[:message_id] || System.unique_integer([:positive])}"
     at = socket.assigns.reply_times[dom_id] || now()
-    state = if item.status == "playing", do: :speaking, else: :listening
 
     socket
     |> assign(reply_times: Map.put(socket.assigns.reply_times, dom_id, at))
-    |> put_state(id, state)
     |> stream_insert(:transcript, %{
       id: dom_id,
       kind: :reply,
@@ -220,16 +273,11 @@ defmodule MeetWeb.RoomLive do
     })
   end
 
-  defp assistant_event(socket, id, {:waiting, nil}) do
-    socket = update(socket, :waiting, &Map.delete(&1, id))
-    if state(socket, id) == :waiting, do: put_state(socket, id, :listening), else: socket
-  end
+  defp assistant_event(socket, id, {:waiting, nil}),
+    do: update(socket, :waiting, &Map.delete(&1, id))
 
-  defp assistant_event(socket, id, {:waiting, %{speaker: speaker}}) do
-    socket
-    |> update(:waiting, &Map.put(&1, id, speaker))
-    |> put_state(id, :waiting)
-  end
+  defp assistant_event(socket, id, {:waiting, %{speaker: speaker}}),
+    do: update(socket, :waiting, &Map.put(&1, id, speaker))
 
   defp assistant_event(socket, _id, _event), do: socket
 
@@ -298,8 +346,12 @@ defmodule MeetWeb.RoomLive do
   defp primary_absent?(%{assigns: %{present: present}} = socket),
     do: present != [] and not Enum.any?(present, &(&1.id == primary(socket)))
 
-  defp state(socket, id), do: Map.get(socket.assigns.states, id, :listening)
   defp put_state(socket, id, state), do: update(socket, :states, &Map.put(&1, id, state))
+
+  defp presence_state("thinking"), do: :thinking
+  defp presence_state("speaking"), do: :speaking
+  defp presence_state("waiting"), do: :waiting
+  defp presence_state(_listening_or_unknown), do: :listening
 
   defp assistant_name(socket, id) do
     case Enum.find(socket.assigns.assistants, &(&1.id == id)) do
@@ -349,6 +401,7 @@ defmodule MeetWeb.RoomLive do
           assistants={@present}
           names={Map.new(@assistants, &{&1.id, &1.name})}
           states={@states}
+          say_to={@say_to}
           waiting={@waiting}
           partials={@partials}
           transcript={@streams.transcript}
@@ -430,6 +483,8 @@ defmodule MeetWeb.RoomLive do
         partials={@partials}
         waiting={@waiting}
         names={@names}
+        assistants={@assistants}
+        say_to={@say_to}
       />
     </div>
     """
@@ -662,6 +717,8 @@ defmodule MeetWeb.RoomLive do
   attr :partials, :map, required: true
   attr :waiting, :map, required: true
   attr :names, :map, required: true, doc: "assistant id => name"
+  attr :assistants, :list, required: true, doc: "the assistants in the call"
+  attr :say_to, :string, default: nil
 
   defp transcript_panel(assigns) do
     ~H"""
@@ -705,6 +762,33 @@ defmodule MeetWeb.RoomLive do
         {Map.get(@names, id, id)} is waiting to see if anyone answers {speaker}…
       </div>
 
+      <form
+        :if={@assistants != []}
+        id="say-form"
+        class="flex gap-2 border-t border-base-300 p-3"
+        autocomplete="off"
+      >
+        <select
+          name="to"
+          phx-change="say_to"
+          class="select select-sm w-28 shrink-0"
+          aria-label="To"
+        >
+          <option :for={a <- @assistants} value={a.id} selected={a.id == @say_to}>{a.name}</option>
+        </select>
+        <input
+          name="text"
+          type="text"
+          maxlength="1000"
+          placeholder="Type to an assistant…"
+          class="input input-sm min-w-0 flex-1"
+          aria-label="Message"
+        />
+        <button class="btn btn-primary btn-sm btn-square" title="Send">
+          <.icon name="hero-paper-airplane" class="size-4" />
+        </button>
+      </form>
+
       <script :type={Phoenix.LiveView.ColocatedHook} name=".ScrollToBottom">
         export default {
           mounted() {
@@ -727,6 +811,9 @@ defmodule MeetWeb.RoomLive do
       <div class="flex items-baseline gap-2">
         <span class="text-sm font-semibold">{@entry.speaker}</span>
         <span class="text-xs opacity-50">{@entry.at}</span>
+        <span :if={@entry[:typed]} class="badge badge-xs badge-ghost" title="Typed, not spoken">
+          <.icon name="hero-chat-bubble-left-ellipsis" class="size-3" /> typed
+        </span>
       </div>
       <p class="text-sm">{@entry.text || "…"}</p>
       <div
@@ -785,6 +872,7 @@ defmodule MeetWeb.RoomLive do
   defp why(:named_other), do: "named someone else"
   defp why(:not_about_capitals), do: "not about capitals"
   defp why(:decided), do: "its own rule"
+  defp why(:typed), do: "typed to it"
   defp why(other), do: other |> to_string() |> String.replace("_", " ")
 
   # The decision model's answers, as tags: every question it was asked,

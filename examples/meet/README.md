@@ -21,12 +21,17 @@ What Octoroom adds:
 - [lib/meet_web/channels](lib/meet_web/channels): a channel for signaling
   (`use Octoroom.Phoenix.Channel`) and the socket it's on.
 - [assets/js/call.js](assets/js/call.js): the `Call` hook, which joins with
-  Octoroom's browser client, and the `Video` hook for each tile.
+  Octoroom's browser client and sends what you type to an assistant
+  (`room.send/2`), and the `Video` hook for each tile.
 - [lib/meet_web/live/room_live.ex](lib/meet_web/live/room_live.ex): the page.
   Tiles, the control bar and the transcript are rendered from the room
-  server's state and the assistants' events. Each turn in the transcript
-  has a row per assistant: what it decided (replied, waited, listened), why,
-  and every answer from the decision model, Atlas's own question included.
+  server's state and the assistants' events. Each assistant's tile shows
+  what it says it's doing (its presence: listening, thinking, speaking,
+  waiting). Each turn in the transcript has a row per assistant: what it
+  decided (replied, waited, listened), why, and every answer from the
+  decision model, Atlas's own question included. The box under the
+  transcript types to one assistant: it always answers, and the turn is
+  marked "typed".
 
 ## Run it
 
