@@ -90,6 +90,18 @@ defmodule Octoroom do
   end
 
   @doc false
+  # Limits on clients' messages to workers, from `config :octoroom,
+  # worker_messages: [...]` and then `overrides`: `max_bytes` per message
+  # (as JSON), and a bucket per participant per worker that refills at
+  # `per_second` up to `burst`.
+  def worker_message_limits(overrides \\ []) do
+    [max_bytes: 16_384, per_second: 10, burst: 20]
+    |> Keyword.merge(Application.get_env(:octoroom, :worker_messages, []))
+    |> Keyword.merge(overrides)
+    |> Map.new()
+  end
+
+  @doc false
   def ice_servers,
     do: Application.get_env(:octoroom, :ice_servers, [%{urls: "stun:stun.cloudflare.com:3478"}])
 end

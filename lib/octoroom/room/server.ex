@@ -116,6 +116,18 @@ defmodule Octoroom.Room.Server do
   def unpublish(server, participant_id, source, tag),
     do: GenServer.cast(server, {:unpublish, participant_id, source, tag})
 
+  @doc """
+  A message from the participant's client to worker `worker_id`, which
+  gets `{:octoroom, :message, participant_id, payload}`. Allowed only if
+  the worker hears the participant and the room's `message/3` (if any)
+  agrees, at most `worker_messages: [per_second:, burst:]` (see
+  `Octoroom.worker_message_limits/1`). Replies `%{}`, or an error:
+  `:no_worker` (none running with that id), `:not_allowed` or
+  `:rate_limited`.
+  """
+  def worker_message(server, participant_id, worker_id, payload, tag),
+    do: GenServer.cast(server, {:worker_message, participant_id, worker_id, payload, tag})
+
   @doc "Marks a published source muted or not. Nothing renegotiates."
   def mute(server, participant_id, source, muted),
     do: GenServer.cast(server, {:mute, participant_id, source, muted})
@@ -211,6 +223,10 @@ defmodule Octoroom.Room.Server do
        heartbeat_ms: heartbeat_ms,
        cloudflare: cf,
        signal_timeout: Keyword.get(opts, :signal_timeout, @signal_timeout),
+       message_limits: Octoroom.worker_message_limits(Keyword.get(opts, :worker_messages, [])),
+       # {participant id, worker id} => {tokens, at_ms}: clients' messages
+       # to workers.
+       buckets: %{},
        # Failures back off retry_base_ms * 2^n: 0.5 s, 1 s, 2 s, ...
        retry_base_ms: Keyword.get(opts, :retry_base_ms, 250),
        # The peer connection under workers' peers (`Octoroom.Peer.Media`).
@@ -411,6 +427,9 @@ defmodule Octoroom.Room.Server do
   defp well_formed?({kind, _, op_id, sdp, _}) when kind in [:answer, :close_offer],
     do: is_binary(op_id) and is_binary(sdp)
 
+  defp well_formed?({:worker_message, _, worker_id, payload, _}),
+    do: is_binary(worker_id) and is_map(payload)
+
   defp well_formed?(_request), do: true
 
   # Source names are strings from a browser; atoms are accepted from Elixir
@@ -424,6 +443,22 @@ defmodule Octoroom.Room.Server do
   # `mute` has no reply.
   defp request_tag({:mute, _, _, _}), do: nil
   defp request_tag(request), do: elem(request, tuple_size(request) - 1)
+
+  defp cast({:worker_message, id, worker_id, payload, tag}, state) do
+    with_participant(state, id, fn p ->
+      with %{pid: worker} = w <- state.workers[worker_id] || {:error, :no_worker},
+           :ok <- may_message(state, p, w.spec),
+           {:ok, state} <- take_token(state, {id, worker_id}) do
+        send(worker, {:octoroom, :message, id, payload})
+        reply(p, tag, {:ok, %{}})
+        state
+      else
+        {:error, reason} ->
+          reply(p, tag, {:error, reason})
+          state
+      end
+    end)
+  end
 
   defp cast({:publish, id, sdp, mids, tag}, state) do
     with_participant(state, id, fn
@@ -1309,6 +1344,50 @@ defmodule Octoroom.Room.Server do
       end)
   end
 
+  ## Messages to workers
+
+  # The worker hears it (one of its inputs is the participant's), and the
+  # room's `message/3`, if it has one, agrees.
+  defp may_message(state, p, spec) do
+    heard = Enum.any?(spec.inputs, &String.starts_with?(&1, p.id <> "/"))
+
+    cond do
+      not heard ->
+        {:error, :not_allowed}
+
+      not function_exported?(state.module, :message, 3) ->
+        :ok
+
+      true ->
+        room = room(state)
+        ask = fn -> state.module.message(public(p), spec.id, room) end
+
+        case call_room(ask, &is_boolean/1, "true or false") do
+          {:ok, true} ->
+            :ok
+
+          {:ok, false} ->
+            {:error, :not_allowed}
+
+          {:error, {_reason, formatted}} ->
+            Logger.warning("#{inspect(state.module)}.message/3 failed: #{formatted}")
+            {:error, :not_allowed}
+        end
+    end
+  end
+
+  # A token bucket per participant and worker.
+  defp take_token(state, key) do
+    %{per_second: rate, burst: burst} = state.message_limits
+    now = now_ms()
+    {tokens, at} = Map.get(state.buckets, key, {burst, now})
+    tokens = min(burst, tokens + (now - at) * rate / 1000)
+
+    if tokens >= 1,
+      do: {:ok, put_in(state.buckets[key], {tokens - 1, now})},
+      else: {:error, :rate_limited}
+  end
+
   ## Worker presence and events
 
   defp worker_message(state, id, {:notify, output, type, data, to}) do
@@ -1878,7 +1957,8 @@ defmodule Octoroom.Room.Server do
           state
           | participants: participants,
             order: List.delete(state.order, id),
-            failures: Map.reject(state.failures, fn {{pid, _}, _} -> pid == id end)
+            failures: Map.reject(state.failures, fn {{pid, _}, _} -> pid == id end),
+            buckets: Map.reject(state.buckets, fn {{pid, _}, _} -> pid == id end)
         }
 
         event(state, {:left, public(p)})

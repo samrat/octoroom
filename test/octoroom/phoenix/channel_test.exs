@@ -32,7 +32,10 @@ defmodule Octoroom.Phoenix.ChannelTest do
     {"unpublish", %{"source" => %{}}},
     {"mute", %{"source" => "mic", "muted" => "yes"}},
     {"answer", %{"sdp" => "answer", "op_id" => nil}},
-    {"close_offer", %{"sdp" => %{}, "op_id" => "op"}}
+    {"close_offer", %{"sdp" => %{}, "op_id" => "op"}},
+    {"worker_message", %{"worker" => 1, "payload" => %{}}},
+    {"worker_message", %{"worker" => "assistant", "payload" => "hi"}},
+    {"worker_message", %{"worker" => "assistant"}}
   ]
 
   test "a known event with a malformed body is refused before it reaches the room", ctx do
@@ -70,6 +73,30 @@ defmodule Octoroom.Phoenix.ChannelTest do
     payload = %{"source" => "mic", "muted" => true}
     assert {:reply, :ok, _} = Channel.__handle_in__("mute", payload, ctx.socket)
     assert_received {:"$gen_cast", {:mute, "p", "mic", true}}
+  end
+
+  test "a message to a worker is forwarded, unless it's too large", ctx do
+    payload = %{"text" => "hi"}
+
+    assert {:noreply, _} =
+             Channel.__handle_in__(
+               "worker_message",
+               %{"worker" => "assistant", "payload" => payload},
+               ctx.socket
+             )
+
+    assert_received {:"$gen_cast", {:worker_message, "p", "assistant", ^payload, _ref}}
+
+    big = %{"text" => String.duplicate("a", 16_384)}
+
+    assert {:reply, {:error, %{reason: "too_large"}}, _} =
+             Channel.__handle_in__(
+               "worker_message",
+               %{"worker" => "assistant", "payload" => big},
+               ctx.socket
+             )
+
+    refute_received {:"$gen_cast", _}
   end
 
   test "connected forwards the client's join timings, keeping only known numbers", ctx do
