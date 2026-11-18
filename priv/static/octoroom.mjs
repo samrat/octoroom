@@ -29,6 +29,20 @@
 // <video>'s srcObject. Whether a participant's camera is muted is in
 // `participants`: `participant.tracks.camera.muted`.
 //
+// Workers (server-side participants, such as AI agents) this client is
+// subscribed to are in `workers`, and the "workers" event gives the list
+// when it changes: each is {id, outputs, data, state, attributes}, where
+// `state` and `attributes` are whatever the worker set. Its events come as
+// "worker_event" ({worker, output, type, data}). To message one:
+//
+//   room.on("workers", (list) => render(list))
+//   room.on("worker_event", ({worker, type, data}) => ...)
+//   await room.send("assistant", {text: "add Acme to the sheet"})
+//
+// send() rejects with the server's reason: "not_allowed" (the worker
+// doesn't hear this client, or the room said no), "no_worker",
+// "too_large" or "rate_limited".
+//
 // Reconnecting: the server hands out a resume token (refreshed with
 // `resume_token`). When the Phoenix socket reconnects, the channel rejoins
 // with it and the server takes this client back as the same participant
@@ -69,6 +83,7 @@ export class RoomClient {
     this.videoConstraints = video
     this.listeners = {}
     this.participants = []
+    this.workers = []
     this.participantId = null
     this.remote = new Map() // mid => {mid, track, kind, source, participant_id, gain, stream, element}
     // What this client publishes: source => {track, owned, muted, transceiver, ready}.
@@ -125,6 +140,8 @@ export class RoomClient {
       channel.on("tracks", (p) => this.serially(() => this.onTracks(p)))
       channel.on("gain", ({mid, gain}) => this.setGain(mid, gain))
       channel.on("room_event", (event) => this.onRoomEvent(event))
+      channel.on("worker", (event) => this.onWorker(event))
+      channel.on("worker_event", (event) => this.emit("worker_event", event))
       channel.on("resume_token", ({token}) => (this.resumeToken = token))
       channel.on("republish", () => this.serially(() => this.restartMedia()))
       channel.onError(() => this.state === "joined" && this.emit("reconnecting"))
@@ -170,7 +187,9 @@ export class RoomClient {
     this.participants = reply.participants
     this.iceServers = reply.ice_servers
     this.resumeToken = reply.resume_token
+    this.workers = reply.workers || []
     this.emit("participants", this.participants)
+    this.emit("workers", this.workers)
   }
 
   // The mic (and the camera, with `video`) from the provided stream or
@@ -517,6 +536,31 @@ export class RoomClient {
     this.emit("participants", this.participants)
   }
 
+  // A worker this client now sees, no longer sees, or whose presence
+  // changed. An "added" for one it already has replaces it.
+  onWorker({op, worker}) {
+    const others = this.workers.filter((w) => w.id !== worker.id)
+    if (op === "removed") {
+      this.workers = others
+    } else if (op === "updated" && others.length === this.workers.length) {
+      return
+    } else {
+      const at = this.workers.findIndex((w) => w.id === worker.id)
+      this.workers = at === -1 ? [...this.workers, worker] : this.workers.map((w, i) => (i === at ? worker : w))
+    }
+    this.emit("workers", this.workers)
+  }
+
+  /**
+   * Sends `payload` (an object) to worker `workerId`. Resolves once the
+   * worker has it; rejects with the server's reason.
+   * @param {string} workerId
+   * @param {object} payload
+   */
+  send(workerId, payload) {
+    return this.push("worker_message", {worker: workerId, payload})
+  }
+
   push(event, payload) {
     if (!this.channel) return Promise.reject(new Error(`${event}: not in a room`))
     return new Promise((resolve, reject) => {
@@ -548,9 +592,11 @@ export class RoomClient {
     this.channel = null
     if (reason !== "closed") channel?.leave()
     this.participants = []
+    this.workers = []
     this.resumeToken = null
     this.queue = Promise.resolve()
     this.emit("participants", [])
+    this.emit("workers", [])
     // "left": leave() was called; "closed": the server removed this client;
     // "failed": join() failed. Either way the client can join again.
     this.emit("left", reason)
