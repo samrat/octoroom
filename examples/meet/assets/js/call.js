@@ -1,6 +1,7 @@
 // The browser side of the call: Octoroom's client publishes your mic (and
 // camera, and screen) to Cloudflare and plays what the server subscribes you
-// to. The LiveView renders everything else from the room server's state.
+// to, and sends what you type to an assistant. The LiveView renders
+// everything else from the room server's state.
 import {RoomClient} from "../../../../priv/static/octoroom.mjs"
 import {Socket} from "phoenix"
 
@@ -53,6 +54,28 @@ export const Call = {
     this.el.addEventListener("meet:camera", () => this.toggleCamera())
     this.el.addEventListener("meet:screen", () => this.toggleScreen())
     this.el.addEventListener("meet:leave", () => room?.leave())
+    // The box under the transcript: typed straight to an assistant through
+    // the room's channel. The room only takes it from someone the
+    // assistant hears; what it says back comes through the transcript.
+    this.el.addEventListener("submit", (event) => {
+      if (event.target.id !== "say-form") return
+      event.preventDefault()
+      this.say(event.target)
+    })
+  },
+
+  async say(form) {
+    const to = form.elements.to.value
+    const input = form.elements.text
+    const text = input.value.trim()
+    if (!room || !text) return
+    input.value = ""
+    try {
+      await room.send(to, {text})
+    } catch (error) {
+      input.value = text
+      this.pushEvent("say_failed", {to, reason: error.message})
+    }
   },
 
   async join(name, camera) {
