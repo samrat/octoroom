@@ -11,7 +11,8 @@ Names (`notify:`, `presence:`, `data:`, `worker_message`) are proposals.
 ## Decisions
 
 Settled in discussion on 2026-11-18. When this is built, they go into
-decisions.md as one entry (D42).
+decisions.md as one entry
+([D44](decisions.md#d44-workers-reach-clients-through-their-outputs)).
 
 1. **Scope follows subscriptions.** A worker's events reach only the
    participants subscribed to the output they're tagged with. The coach's
@@ -279,8 +280,10 @@ Each step is one commit, with tests passing.
    both assistants listed with their state, and typing to Atlas gets a
    spoken, transcribed answer.)
 8. **Docs.** architecture.md (the worker contract, the channel protocol),
-   the D42 entry in decisions.md, and the roadmap's "Worker events to
-   clients" gap removed.
+   the D44 entry in decisions.md, and the roadmap's "Worker events to
+   clients" gap removed. (Done 2026-11-18, with a "Workers and clients"
+   section in architecture.md and a "Clients" section in the agents
+   README.)
 
 Steps 5 and 7 depend only on the protocol from steps 3 and 4. Step 6
 depends on steps 3 and 4 for the server side, and on step 5 for the JS
