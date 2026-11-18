@@ -239,7 +239,7 @@ Each step is one commit, with tests passing.
    (`worker_spec?`), `p.data_subs`, `default_subscriptions/2`, and
    `Room.state/1` showing them. Tests: a data name in `subscriptions/2`
    never reaches Cloudflare (the fake sees no pull) and is recorded for a
-   participant whose media isn't up.
+   participant whose media isn't up. (Done 2026-11-18.)
 3. **Presence and scoped events.** The `presence:` and `notify:` actions,
    visibility tracking, `:subscribed` and `:unsubscribed`, channel pushes,
    join and resume replies. Tests: the coach example (the customer gets

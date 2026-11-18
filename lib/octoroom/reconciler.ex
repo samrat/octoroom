@@ -101,8 +101,8 @@ defmodule Octoroom.Reconciler do
        worker.
     3. `{:stop_worker, id}`: no longer in the specs.
     4. `{:start_worker, spec}`, `{:restart_worker, spec}` (its module or args
-       changed) and `{:update_worker, spec}` (only its inputs or outputs
-       changed: the worker keeps running).
+       changed) and `{:update_worker, spec}` (only its inputs, outputs or
+       data outputs changed: the worker keeps running).
     5. `{:start_outlet, name, worker_id}`: an output with no outlet of this
        worker's. If two workers name the same output, the first one in the
        specs has it.
@@ -160,9 +160,15 @@ defmodule Octoroom.Reconciler do
 
   defp worker_op(spec, old) do
     cond do
-      old.module != spec.module or old.args != spec.args -> {:restart_worker, spec}
-      old.inputs != spec.inputs or old.outputs != spec.outputs -> {:update_worker, spec}
-      true -> nil
+      old.module != spec.module or old.args != spec.args ->
+        {:restart_worker, spec}
+
+      old.inputs != spec.inputs or old.outputs != spec.outputs or
+          Map.get(old, :data, []) != Map.get(spec, :data, []) ->
+        {:update_worker, spec}
+
+      true ->
+        nil
     end
   end
 
