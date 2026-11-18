@@ -1,25 +1,25 @@
 defmodule Octoroom.Agent.Processors.STT do
   @moduledoc """
-  Streaming speech-to-text over Soniox's real-time WebSocket.
+  Streaming speech-to-text through an `Octoroom.Agent.STT` provider.
 
   `InputAudio` passes through and is sent to the provider in 100 ms chunks.
   Transcripts come back as `InterimTranscription` and `Transcription`
   frames. A `FinalizeTranscript` frame moving upstream asks the provider to
-  finalize what it has heard now.
+  finalize what it has heard now. A failed session is replaced after a
+  backoff.
 
-  Options: `:provider` (`:soniox`, the only one so far), `:api_key`
-  (defaults to `SONIOX_API_KEY`), `:sample_rate`, plus the
-  provider settings of `Octoroom.Agent.Backend.Cascaded`'s `speech_to_text`. The
-  socket starts only under a host (`ctx.runner`); in `Octoroom.Agent.Pipeline.Test`, feed
-  provider events with `Test.info/3` (for example `{:soniox_socket, event}`).
+  Options are `Octoroom.Agent.STT`'s: `:provider` (default `:soniox`),
+  `:model`, `:api_key`, `:sample_rate` and the provider's own, as in
+  `Octoroom.Agent.Backend.Cascaded`'s `speech_to_text`. The session starts
+  only under a host (`ctx.runner`); in `Octoroom.Agent.Pipeline.Test`, feed
+  provider events with `Test.info/3` (for example `{:stt, {:final, "Hi"}}`).
   """
 
   use Octoroom.Agent.Processor
 
   require Logger
 
-  alias Octoroom.Agent.Cascaded.SonioxSocket
-  alias Octoroom.Agent.Frames
+  alias Octoroom.Agent.{Frames, STT}
 
   @min_chunk_ms 50
   @target_chunk_ms 100
@@ -29,72 +29,50 @@ defmodule Octoroom.Agent.Processors.STT do
 
   @impl true
   def init(opts, ctx) do
-    config = Map.new(opts)
-    provider = Map.get(config, :provider, :soniox)
-    sample_rate = Map.get(config, :sample_rate, 16_000)
+    with {:ok, module, provider_opts} <- STT.resolve(Keyword.put_new(opts, :provider, :soniox)) do
+      sample_rate = Keyword.fetch!(provider_opts, :sample_rate)
 
-    state = %{
-      provider: provider,
-      socket_module: socket_module(provider),
-      socket: nil,
-      connected?: false,
-      failed?: false,
-      buffer: <<>>,
-      # The input the audio came from; transcripts carry it. One socket hears
-      # one source.
-      source: nil,
-      min_chunk_bytes: div(sample_rate * 2 * @min_chunk_ms, 1_000),
-      target_chunk_bytes: div(sample_rate * 2 * @target_chunk_ms, 1_000),
-      max_buffer_bytes: div(sample_rate * 2 * @max_buffer_ms, 1_000),
-      # For reconnecting: the host, the config and key, which attempt this is,
-      # and a ref that tells this stage's reconnect messages from others'.
-      runner: nil,
-      config: config,
-      api_key: nil,
-      attempt: 0,
-      ref: make_ref()
-    }
+      state = %{
+        provider: provider_name(module),
+        module: module,
+        provider_opts: provider_opts,
+        socket: nil,
+        connected?: false,
+        failed?: false,
+        buffer: <<>>,
+        # The input the audio came from; transcripts carry it. One session
+        # hears one source.
+        source: nil,
+        min_chunk_bytes: div(sample_rate * 2 * @min_chunk_ms, 1_000),
+        target_chunk_bytes: div(sample_rate * 2 * @target_chunk_ms, 1_000),
+        max_buffer_bytes: div(sample_rate * 2 * @max_buffer_ms, 1_000),
+        # For reconnecting: the host, which attempt this is, and a ref that
+        # tells this stage's reconnect messages from others'.
+        runner: nil,
+        attempt: 0,
+        ref: make_ref()
+      }
 
-    case ctx do
-      %{runner: runner} when is_pid(runner) ->
-        with {:ok, api_key} <- api_key(provider, config),
-             {:ok, socket} <- start_socket(provider, config, api_key, runner) do
-          {:ok, %{state | socket: socket, runner: runner, api_key: api_key}}
-        end
+      case ctx do
+        %{runner: runner} when is_pid(runner) ->
+          state = %{state | runner: runner}
+          with {:ok, socket} <- start_socket(state), do: {:ok, %{state | socket: socket}}
 
-      _no_runner ->
-        {:ok, state}
+        _no_runner ->
+          {:ok, state}
+      end
     end
   end
 
-  # More providers come over from Subvocal as they're wanted.
-  defp socket_module(:soniox), do: SonioxSocket
+  # Events go to the host, which hands unaddressed messages to every
+  # processor.
+  defp start_socket(state),
+    do: state.module.start_link(Keyword.put(state.provider_opts, :owner, state.runner))
 
-  defp api_key(:soniox, config) do
-    env = "SONIOX_API_KEY"
-
-    case Map.get(config, :api_key) || System.get_env(env) do
-      key when is_binary(key) and key != "" -> {:ok, key}
-      _missing -> {:error, {:missing_env, env}}
-    end
-  end
-
-  # Socket events go to the host, which hands unaddressed messages to
-  # every processor.
-  defp start_socket(:soniox, config, api_key, parent) do
-    SonioxSocket.start_link(
-      api_key: api_key,
-      parent: parent,
-      model: Map.get(config, :model, "stt-rt-v5"),
-      audio_format: Map.get(config, :audio_format, "pcm_s16le"),
-      sample_rate: Map.get(config, :sample_rate, 16_000),
-      num_channels: Map.get(config, :num_channels, 1),
-      language_hints: Map.get(config, :language_hints),
-      enable_endpoint_detection: Map.get(config, :enable_endpoint_detection, true),
-      endpoint_latency_adjustment_level: Map.get(config, :endpoint_latency_adjustment_level),
-      endpoint_sensitivity: Map.get(config, :endpoint_sensitivity),
-      max_endpoint_delay_ms: Map.get(config, :max_endpoint_delay_ms)
-    )
+  defp provider_name(module) do
+    Enum.find_value(STT.providers(), inspect(module), fn {name, provider} ->
+      if provider == module, do: name
+    end)
   end
 
   @impl true
@@ -102,7 +80,7 @@ defmodule Octoroom.Agent.Processors.STT do
     do: {[{:push, frame, :downstream}], send_audio(%{state | source: frame.source}, audio)}
 
   def handle_frame(%Frames.FinalizeTranscript{}, :upstream, state) do
-    if state.connected?, do: state.socket_module.finalize(state.socket)
+    if state.connected?, do: STT.finalize(state.module, state.socket)
     {[], state}
   end
 
@@ -113,17 +91,17 @@ defmodule Octoroom.Agent.Processors.STT do
   def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
 
   @impl true
-  # Events from this stage's own socket: an agent with several inputs runs
-  # one STT stage, and one socket, per input in the same process.
-  def handle_info({:soniox_socket, socket, event}, %{socket: socket} = state),
+  # Events from this stage's own session: an agent with several inputs runs
+  # one STT stage, and one session, per input in the same process.
+  def handle_info({:stt, socket, event}, %{socket: socket} = state) when is_pid(socket),
     do: event(event, state)
 
-  # Without a socket (`Pipeline.Test`), tests send events with no pid.
-  def handle_info({:soniox_socket, event}, %{socket: nil, runner: nil} = state),
+  # Without a session (`Pipeline.Test`), tests send events with no pid.
+  def handle_info({:stt, event}, %{socket: nil, runner: nil} = state),
     do: event(event, state)
 
   def handle_info({:octoroom_agent_stt_reconnect, ref}, %{ref: ref, failed?: true} = state) do
-    case start_socket(state.provider, state.config, state.api_key, state.runner) do
+    case start_socket(state) do
       {:ok, socket} ->
         {[], %{state | socket: socket, failed?: false, connected?: false}}
 
@@ -148,12 +126,12 @@ defmodule Octoroom.Agent.Processors.STT do
     {[{:notify, {:status, "Listening"}}], state}
   end
 
-  defp event({:transcription_final, text}, state) do
+  defp event({:final, text}, state) do
     text = String.trim(text || "")
     {[{:push, %Frames.Transcription{text: text, source: state.source}, :downstream}], state}
   end
 
-  defp event({:transcription_partial, text}, state) do
+  defp event({:partial, text}, state) do
     case String.trim(text || "") do
       "" ->
         {[], state}
@@ -164,16 +142,16 @@ defmodule Octoroom.Agent.Processors.STT do
     end
   end
 
-  defp event({:decode_error, reason}, state) do
-    Logger.warning("STT decode error provider=#{state.provider} reason=#{inspect(reason)}")
+  defp event({:warning, reason}, state) do
+    Logger.warning("STT warning provider=#{state.provider} reason=#{inspect(reason)}")
     {[{:notify, {:status, "Voice issue"}}], state}
   end
 
-  defp event({:error, event}, state) do
-    Logger.warning("STT error provider=#{state.provider} event=#{inspect(event)}")
+  defp event({:error, reason}, state) do
+    Logger.warning("STT error provider=#{state.provider} reason=#{inspect(reason)}")
 
     {[
-       {:notify, {:transcription, %{status: "error", text: error_text(event)}}},
+       {:notify, {:transcription, %{status: "error", text: STT.error_message(reason)}}},
        {:notify, {:status, "Voice issue"}}
      ], failed(state)}
   end
@@ -189,7 +167,6 @@ defmodule Octoroom.Agent.Processors.STT do
   end
 
   defp event({:disconnected, reason, _info}, state), do: disconnected(reason, state)
-  defp event({:disconnected, reason}, state), do: disconnected(reason, state)
   defp event(_other, state), do: {[], state}
 
   defp disconnected(reason, state) do
@@ -213,10 +190,6 @@ defmodule Octoroom.Agent.Processors.STT do
     %{state | attempt: state.attempt + 1}
   end
 
-  defp error_text(%{"error_message" => message}) when is_binary(message), do: message
-  defp error_text(%{"error_code" => code}) when not is_nil(code), do: "STT error #{code}"
-  defp error_text(_event), do: "STT error"
-
   # Audio is held until the socket connects, then sent in 100 ms chunks.
   # While waiting to reconnect, it's dropped.
   defp send_audio(%{failed?: true} = state, _audio), do: state
@@ -230,15 +203,15 @@ defmodule Octoroom.Agent.Processors.STT do
 
   defp send_audio(state, audio) do
     {chunks, rest} = split(state.buffer <> audio, state.target_chunk_bytes)
-    Enum.each(chunks, &state.socket_module.send_audio(state.socket, &1))
+    Enum.each(chunks, &state.module.send_audio(state.socket, &1))
     %{state | buffer: rest}
   end
 
   defp end_session(%{connected?: true} = state) do
     {chunks, rest} = split(state.buffer, state.target_chunk_bytes)
     chunks = if byte_size(rest) >= state.min_chunk_bytes, do: chunks ++ [rest], else: chunks
-    Enum.each(chunks, &state.socket_module.send_audio(state.socket, &1))
-    state.socket_module.terminate_session(state.socket)
+    Enum.each(chunks, &state.module.send_audio(state.socket, &1))
+    state.module.close(state.socket)
     %{state | buffer: <<>>}
   end
 

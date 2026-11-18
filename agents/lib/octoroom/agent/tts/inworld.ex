@@ -1,13 +1,52 @@
-defmodule Octoroom.Agent.Cascaded.Inworld do
-  @moduledoc false
+defmodule Octoroom.Agent.TTS.Inworld do
+  @moduledoc """
+  Inworld text-to-speech.
+
+  Reads `INWORLD_API_KEY` (the Base64 key Inworld's dashboard shows). Besides
+  `Octoroom.Agent.TTS`'s options it takes `:stream` (`true`, the default,
+  uses the streaming endpoint; `false` makes one plain request), `:audio_encoding`,
+  `:delivery_mode` and `:timestamp_transport_strategy`.
+  """
+
+  @behaviour Octoroom.Agent.TTS
+
+  alias Octoroom.Agent.SpeechProvider
 
   @speech_url "https://api.inworld.ai/tts/v1/voice"
   @speech_stream_url "https://api.inworld.ai/tts/v1/voice:stream"
   @stream_buffer_key :octoroom_agent_inworld_stream_buffer
 
-  def speech(opts) do
-    token = Keyword.fetch!(opts, :token)
-    input = Keyword.fetch!(opts, :input)
+  @impl true
+  def default_options do
+    [
+      model: "inworld-tts-2",
+      voice: "Ashley",
+      audio_encoding: "LINEAR16",
+      sample_rate: 24_000,
+      stream: true
+    ]
+  end
+
+  @impl true
+  def stream(text, on_audio, opts) do
+    if Keyword.get(opts, :stream, true) do
+      stream_speech(text, on_audio, opts)
+    else
+      with {:ok, audio} <- synthesize(text, opts) do
+        on_audio.(audio)
+        :ok
+      end
+    end
+  end
+
+  @impl true
+  def synthesize(input, opts) do
+    with {:ok, token} <- SpeechProvider.api_key(opts, "INWORLD_API_KEY") do
+      speech(input, token, opts)
+    end
+  end
+
+  defp speech(input, token, opts) do
     model = value(opts, :model, "inworld-tts-2")
     voice = value(opts, :voice, "Ashley")
     audio_encoding = value(opts, :audio_encoding, "LINEAR16")
@@ -44,10 +83,13 @@ defmodule Octoroom.Agent.Cascaded.Inworld do
     end
   end
 
-  def stream_speech(opts) do
-    token = Keyword.fetch!(opts, :token)
-    input = Keyword.fetch!(opts, :input)
-    on_audio = Keyword.get(opts, :on_audio, fn _audio -> :ok end)
+  defp stream_speech(input, on_audio, opts) do
+    with {:ok, token} <- SpeechProvider.api_key(opts, "INWORLD_API_KEY") do
+      stream_speech(input, on_audio, token, opts)
+    end
+  end
+
+  defp stream_speech(input, on_audio, token, opts) do
     request_fun = Keyword.get(opts, :request_fun, &Req.post/2)
 
     payload = stream_payload(input, opts)

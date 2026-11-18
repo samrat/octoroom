@@ -3,7 +3,14 @@ defmodule Octoroom.Agent.Backend.Cascaded do
   Configuration for a cascaded agent: speech-to-text, an LLM and
   text-to-speech, with a local VAD for barge-in. `new/1` fills in defaults:
   Soniox, Gemini through ReqLLM, and Inworld.
+
+  `speech_to_text` and `text_to_speech` take the options of
+  `Octoroom.Agent.STT` and `Octoroom.Agent.TTS`, or just a
+  `"provider:model"` string: `%{stt: "soniox:stt-rt-v5", tts: "inworld"}`.
+  The provider's own defaults fill in the rest.
   """
+
+  alias Octoroom.Agent.{SpeechProvider, STT, TTS}
 
   defstruct speech_to_text: %{
               provider: :soniox,
@@ -18,11 +25,7 @@ defmodule Octoroom.Agent.Backend.Cascaded do
             },
             text_to_speech: %{
               provider: :inworld,
-              model: "inworld-tts-2",
-              voice: "Ashley",
-              audio_encoding: "LINEAR16",
-              output_sample_rate: 24_000,
-              stream: true
+              output_sample_rate: 24_000
             },
             vad: %{
               enabled: true,
@@ -64,7 +67,6 @@ defmodule Octoroom.Agent.Backend.Cascaded do
   }
 
   def new(opts \\ %{}) do
-    tts = value(opts, :text_to_speech, value(opts, :tts, %{}))
     speech_to_text = speech_to_text_config(opts)
 
     %__MODULE__{
@@ -72,7 +74,7 @@ defmodule Octoroom.Agent.Backend.Cascaded do
       llm:
         value(opts, :llm, %{})
         |> then(&merge_defaults(&1, llm_defaults(&1))),
-      text_to_speech: merge_defaults(tts, text_to_speech_defaults(tts)),
+      text_to_speech: text_to_speech_config(value(opts, :text_to_speech, value(opts, :tts, %{}))),
       vad: vad_config(opts) |> require_vad(speech_to_text),
       turn_detection: turn_detection_config(opts)
     }
@@ -98,9 +100,15 @@ defmodule Octoroom.Agent.Backend.Cascaded do
       none when none in [false, :none, "none"] ->
         @audio_input_defaults
 
+      spec when is_binary(spec) or (is_atom(spec) and spec not in [nil, true]) ->
+        speech_to_text_config(%{stt: Map.new(SpeechProvider.with_provider(spec, []))})
+
       map when is_map(map) ->
         config =
-          merge_defaults(map, %{provider: :soniox, sample_rate: 16_000, format_turns: false})
+          map
+          |> known_keys()
+          |> speech_provider(STT.providers())
+          |> merge_defaults(%{provider: :soniox, sample_rate: 16_000, format_turns: false})
 
         if config.provider == :none,
           do: Map.merge(@audio_input_defaults, Map.delete(config, :format_turns)),
@@ -238,43 +246,45 @@ defmodule Octoroom.Agent.Backend.Cascaded do
     end
   end
 
-  defp text_to_speech_defaults(opts) do
-    case normalize_provider_value(value(opts, :provider, :inworld)) do
-      :openai ->
-        %{
-          provider: :openai,
-          model: "tts-1",
-          voice: "alloy",
-          output_sample_rate: 24_000
-        }
+  # The provider's own defaults (model, voice, ...) are filled in here so the
+  # config shows them; its `sample_rate` is the agent's `output_sample_rate`.
+  defp text_to_speech_config(spec) when is_binary(spec) or (is_atom(spec) and not is_nil(spec)),
+    do: text_to_speech_config(Map.new(SpeechProvider.with_provider(spec, [])))
 
-      # Underdog Woof runs locally through Pythonx; no API key needed.
-      :woof ->
-        %{
-          provider: :woof,
-          voice: "juno",
-          output_sample_rate: 24_000
-        }
+  defp text_to_speech_config(opts) do
+    config =
+      if(is_map(opts), do: known_keys(opts), else: %{})
+      |> speech_provider(TTS.providers())
+      |> Map.put_new(:provider, :inworld)
 
-      _provider ->
-        %{
-          provider: :inworld,
-          model: "inworld-tts-2",
-          voice: "Ashley",
-          audio_encoding: "LINEAR16",
-          output_sample_rate: 24_000,
-          stream: true
-        }
+    {rate, defaults} =
+      TTS.default_options(provider: config.provider) |> Map.new() |> Map.pop(:sample_rate)
+
+    defaults
+    |> Map.put(:output_sample_rate, rate || 24_000)
+    |> Map.merge(config)
+  end
+
+  # `%{model: "soniox:stt-rt-v5"}` names the provider; `"soniox"` becomes
+  # `:soniox`.
+  defp speech_provider(config, registry) do
+    config = SpeechProvider.split_model(config, registry)
+
+    case config do
+      %{provider: provider} -> %{config | provider: SpeechProvider.name(provider, registry)}
+      config -> config
     end
   end
 
   # String keys accepted from JSON config. Anything else is dropped rather than
   # turned into a new atom.
   @string_config_keys ~w(audio_encoding audio_format delivery_mode enable_endpoint_detection
-                         endpoint_latency_adjustment_level endpoint_sensitivity format_turns
-                         language_hints max_tokens max_endpoint_delay_ms model model_path
-                         num_channels output_sample_rate provider reasoning_effort sample_rate
-                         stream transcription_model timestamp_transport_strategy voice)a
+                         end_of_turn_confidence_threshold endpoint_latency_adjustment_level
+                         endpoint_sensitivity format_turns instructions language_hints max_tokens
+                         max_endpoint_delay_ms max_turn_silence
+                         min_end_of_turn_silence_when_confident model model_path num_channels
+                         output_sample_rate provider reasoning_effort sample_rate speed stream
+                         transcription_model timestamp_transport_strategy voice)a
 
   @key_aliases %{
     "deliveryMode" => :delivery_mode,

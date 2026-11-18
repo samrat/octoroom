@@ -1,9 +1,20 @@
-defmodule Octoroom.Agent.Cascaded.SonioxSocket do
-  @moduledoc false
+defmodule Octoroom.Agent.STT.Soniox do
+  @moduledoc """
+  Soniox real-time speech-to-text over its WebSocket API.
+
+  Reads `SONIOX_API_KEY`. Besides `Octoroom.Agent.STT`'s options it takes
+  Soniox's `:audio_format`, `:num_channels`, `:enable_endpoint_detection`,
+  `:endpoint_latency_adjustment_level`, `:endpoint_sensitivity` and
+  `:max_endpoint_delay_ms`.
+  """
+
+  @behaviour Octoroom.Agent.STT
 
   use WebSockex
 
   require Logger
+
+  alias Octoroom.Agent.{SpeechProvider, STT}
 
   @endpoint "wss://stt-rt.soniox.com/transcribe-websocket"
 
@@ -12,40 +23,53 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
   # stream would time out: send a keepalive after this long without audio.
   @keepalive_ms 5_000
 
-  def start_link(opts) do
-    api_key = Keyword.fetch!(opts, :api_key)
-    parent = Keyword.fetch!(opts, :parent)
-    config = config(api_key, opts)
-
-    WebSockex.start_link(
-      @endpoint,
-      __MODULE__,
-      %{
-        parent: parent,
-        final_tokens: [],
-        config: config,
-        terminating?: false,
-        last_audio: System.monotonic_time(:millisecond)
-      },
-      async: true,
-      handle_initial_conn_failure: true,
-      extra_headers: [{"Authorization", "Bearer #{api_key}"}]
-    )
+  @impl STT
+  def default_options do
+    [
+      model: "stt-rt-v5",
+      sample_rate: 16_000,
+      audio_format: "pcm_s16le",
+      num_channels: 1,
+      enable_endpoint_detection: true
+    ]
   end
 
+  @impl STT
+  def start_link(opts) do
+    with {:ok, api_key} <- SpeechProvider.api_key(opts, "SONIOX_API_KEY") do
+      WebSockex.start_link(
+        @endpoint,
+        __MODULE__,
+        %{
+          owner: Keyword.get(opts, :owner, self()),
+          final_tokens: [],
+          config: config(api_key, opts),
+          terminating?: false,
+          last_audio: System.monotonic_time(:millisecond)
+        },
+        async: true,
+        handle_initial_conn_failure: true,
+        extra_headers: [{"Authorization", "Bearer #{api_key}"}]
+      )
+    end
+  end
+
+  @impl STT
   def send_audio(pid, audio) when is_binary(audio) do
     WebSockex.cast(pid, {:send_audio, audio})
   end
 
-  def terminate_session(pid) do
+  @impl STT
+  def close(pid) do
     WebSockex.cast(pid, :terminate_session)
   end
 
   @doc """
   Finalizes all audio sent so far instead of waiting for Soniox's endpointing.
   Soniox answers with a `<fin>` token, which always produces a
-  `{:transcription_final, text}` event, with empty text if nothing was pending.
+  `{:final, text}` event, with empty text if nothing was pending.
   """
+  @impl STT
   def finalize(pid) do
     WebSockex.cast(pid, :finalize)
   end
@@ -63,7 +87,7 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
   end
 
   def handle_info(:notify_connected, state) do
-    send(state.parent, {:soniox_socket, self(), :connected})
+    STT.notify(state.owner, :connected)
     Process.send_after(self(), :keepalive, @keepalive_ms)
     {:ok, state}
   end
@@ -81,7 +105,7 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
   def handle_frame({:text, frame}, state) do
     case Jason.decode(frame) do
       {:ok, event} -> dispatch_event(event, state)
-      {:error, reason} -> {:ok, notify(state, {:decode_error, reason})}
+      {:error, reason} -> {:ok, notify(state, {:warning, {:decode_error, reason}})}
     end
   end
 
@@ -109,7 +133,7 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
   end
 
   defp dispatch_event(%{"error_code" => code} = event, state) when not is_nil(code) do
-    {:ok, notify(state, {:error, event})}
+    {:ok, notify(state, {:error, %{code: code, message: event["error_message"]}})}
   end
 
   defp dispatch_event(%{"tokens" => tokens} = event, state) when is_list(tokens) do
@@ -117,7 +141,7 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
 
     cond do
       final_text != "" or manual_finalize?(tokens) ->
-        notify(state, {:transcription_final, final_text})
+        notify(state, {:final, final_text})
         {:ok, %{state | final_tokens: []}}
 
       Map.get(event, "finished") ->
@@ -164,7 +188,7 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
     text = render_final_tokens(state)
 
     if text != "" do
-      notify(state, {:transcription_final, text})
+      notify(state, {:final, text})
     end
 
     %{state | final_tokens: []}
@@ -183,14 +207,14 @@ defmodule Octoroom.Agent.Cascaded.SonioxSocket do
       |> String.trim()
 
     if text != "" do
-      notify(state, {:transcription_partial, text})
+      notify(state, {:partial, text})
     end
   end
 
   defp render_final_tokens(state), do: state.final_tokens |> Enum.join("") |> String.trim()
 
   defp notify(state, event) do
-    send(state.parent, {:soniox_socket, self(), event})
+    STT.notify(state.owner, event)
     state
   end
 

@@ -64,8 +64,8 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
       spec(backend, self())
       |> Harness.start!(ctx: ctx())
       |> Harness.push(%Frames.VADUserStartedSpeaking{})
-      |> Harness.info(:stt, {:soniox_socket, {:transcription_partial, "what's the"}})
-      |> Harness.info(:stt, {:soniox_socket, {:transcription_final, "What's the weather?"}})
+      |> Harness.info(:stt, {:stt, {:partial, "what's the"}})
+      |> Harness.info(:stt, {:stt, {:final, "What's the weather?"}})
 
     assert Harness.interrupted?(harness)
 
@@ -109,7 +109,7 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     harness =
       spec(backend, self())
       |> Harness.start!(ctx: ctx(), async: :manual)
-      |> Harness.info(:stt, {:soniox_socket, {:transcription_final, "Tell me a story."}})
+      |> Harness.info(:stt, {:stt, {:final, "Tell me a story."}})
 
     # The reply streams a little, then the user talks over it.
     [{:llm, :reply}] = Harness.pending_tasks(harness)
@@ -151,7 +151,7 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
       spec(backend, self())
       |> replace(:llm, processor(:llm, Processors.LLM, request: plain_llm))
       |> Harness.start!(ctx: %{ctx() | tools: []}, async: :manual)
-      |> Harness.info(:stt, {:soniox_socket, {:transcription_final, "Plan my trip."}})
+      |> Harness.info(:stt, {:stt, {:final, "Plan my trip."}})
 
     result = %{
       call_id: "t1",

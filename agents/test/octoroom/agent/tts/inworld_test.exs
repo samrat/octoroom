@@ -1,7 +1,7 @@
-defmodule Octoroom.Agent.Cascaded.InworldTest do
+defmodule Octoroom.Agent.TTS.InworldTest do
   use ExUnit.Case, async: true
 
-  alias Octoroom.Agent.Cascaded.Inworld
+  alias Octoroom.Agent.TTS.Inworld
 
   test "sends an Inworld TTS request and decodes returned audio content" do
     request_fun = fn url, opts ->
@@ -24,9 +24,8 @@ defmodule Octoroom.Agent.Cascaded.InworldTest do
     end
 
     assert {:ok, <<1, 2, 3>>} =
-             Inworld.speech(
-               token: "base64-key",
-               input: "Hello",
+             Inworld.synthesize("Hello",
+               api_key: "base64-key",
                voice: "Dennis",
                model: "inworld-tts-2",
                request_fun: request_fun
@@ -37,14 +36,14 @@ defmodule Octoroom.Agent.Cascaded.InworldTest do
     request_fun = fn _url, _opts -> {:ok, %{status: 401, body: %{"error" => "bad auth"}}} end
 
     assert {:error, {:inworld_speech_failed, 401, %{"error" => "bad auth"}}} =
-             Inworld.speech(token: "bad-key", input: "Hello", request_fun: request_fun)
+             Inworld.synthesize("Hello", api_key: "bad-key", request_fun: request_fun)
   end
 
   test "returns a tagged error for invalid audio content" do
     request_fun = fn _url, _opts -> {:ok, %{status: 200, body: %{"audioContent" => "%%%"}}} end
 
     assert {:error, :invalid_inworld_audio_content} =
-             Inworld.speech(token: "key", input: "Hello", request_fun: request_fun)
+             Inworld.synthesize("Hello", api_key: "key", request_fun: request_fun)
   end
 
   test "strips the wav header from non-streaming speech responses" do
@@ -59,7 +58,7 @@ defmodule Octoroom.Agent.Cascaded.InworldTest do
       {:ok, %{status: 200, body: %{"audioContent" => Base.encode64(wav)}}}
     end
 
-    assert {:ok, ^pcm} = Inworld.speech(token: "key", input: "Hello", request_fun: request_fun)
+    assert {:ok, ^pcm} = Inworld.synthesize("Hello", api_key: "key", request_fun: request_fun)
   end
 
   test "keeps audio that looks like a truncated wav header" do
@@ -69,7 +68,7 @@ defmodule Octoroom.Agent.Cascaded.InworldTest do
       {:ok, %{status: 200, body: %{"audioContent" => Base.encode64(audio)}}}
     end
 
-    assert {:ok, ^audio} = Inworld.speech(token: "key", input: "Hello", request_fun: request_fun)
+    assert {:ok, ^audio} = Inworld.synthesize("Hello", api_key: "key", request_fun: request_fun)
   end
 
   test "streams Inworld audio chunks and strips wav headers" do
@@ -114,13 +113,12 @@ defmodule Octoroom.Agent.Cascaded.InworldTest do
     end
 
     assert :ok =
-             Inworld.stream_speech(
-               token: "base64-key",
-               input: "Hello",
+             Inworld.stream("Hello", fn audio -> send(parent, {:audio, audio}) end,
+               api_key: "base64-key",
                voice: "Dennis",
                model: "inworld-tts-2",
-               request_fun: request_fun,
-               on_audio: fn audio -> send(parent, {:audio, audio}) end
+               stream: true,
+               request_fun: request_fun
              )
 
     assert_receive {:audio, <<1, 2, 3>>}
