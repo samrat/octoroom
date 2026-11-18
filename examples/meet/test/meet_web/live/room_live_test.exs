@@ -1,0 +1,163 @@
+defmodule MeetWeb.RoomLiveTest do
+  use MeetWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest
+
+  defp assistant(view, event, id \\ "assistant"),
+    do: send(view.pid, {:octoroom, "test", {:worker_event, id, {:agent, event}}})
+
+  test "shows the lobby until the browser has joined", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/r/test")
+    assert has_element?(view, "#join-form")
+
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+    refute has_element?(view, "#join-form")
+    assert has_element?(view, "#transcript-panel")
+  end
+
+  test "the transcript tags each turn with the decision", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/r/test")
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+
+    assistant(
+      view,
+      {:transcription, %{status: "partial", text: "what's the", source: "p1/mic", speaker: "Ada"}}
+    )
+
+    assert has_element?(view, "#partial-p1\\/mic", "what's the")
+
+    assistant(view, {
+      :decision,
+      %{
+        source: "p1/mic",
+        speaker: "Ada",
+        text: "What's the capital of Peru?",
+        outcome: :reply,
+        why: :addressed,
+        decision: %{
+          addressee: "assistant",
+          confidence: 0.92,
+          probabilities: %{"assistant" => 0.92},
+          answerable: 0.97,
+          latency_ms: 410,
+          audio_ms: 1800
+        }
+      }
+    })
+
+    refute has_element?(view, "#partial-p1\\/mic")
+    assert has_element?(view, "#transcript-turn-1", "What's the capital of Peru?")
+    assert has_element?(view, "#transcript-turn-1-assistant .badge", "replied")
+    assert has_element?(view, "#transcript-turn-1 .badge", "talking to it")
+    assert has_element?(view, "#transcript-turn-1 .badge", "to assistant 92%")
+    assert has_element?(view, "#transcript-turn-1 .badge", "answerable 97%")
+
+    assistant(
+      view,
+      {:conversation, %{role: "assistant", message_id: "m1", text: "Lima.", status: "playing"}}
+    )
+
+    assert has_element?(view, "#transcript-reply-assistant-m1 .badge", "speaking")
+
+    assistant(
+      view,
+      {:conversation, %{role: "assistant", message_id: "m1", text: "Lima.", status: "completed"}}
+    )
+
+    assert has_element?(view, "#transcript-reply-assistant-m1", "Lima.")
+    refute has_element?(view, "#transcript-reply-assistant-m1 .badge")
+  end
+
+  test "each assistant's decision on a turn joins the same entry, with its own answers", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, ~p"/r/test")
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+
+    turn = fn outcome, why, answers ->
+      {:decision,
+       %{
+         source: "p1/mic",
+         speaker: "Ada",
+         text: "What's the capital of Peru?",
+         outcome: outcome,
+         why: why,
+         decision: %{answers: answers, latency_ms: 500}
+       }}
+    end
+
+    addressee = %{"choice" => "group", "confidence" => 0.81}
+
+    assistant(
+      view,
+      turn.(:listen, :not_addressed, %{
+        "addressee" => addressee,
+        "answerable_assistant" => %{"probability" => 0.3},
+        "answerable_atlas" => %{"probability" => 0.94}
+      })
+    )
+
+    assistant(
+      view,
+      turn.(:wait, :open_question, %{
+        "addressee" => addressee,
+        "capital" => %{"probability" => 0.97}
+      }),
+      "atlas"
+    )
+
+    assert has_element?(view, "#transcript-turn-1-assistant .badge", "listened")
+    assert has_element?(view, "#transcript-turn-1-assistant .badge", "atlas could answer 94%")
+    assert has_element?(view, "#transcript-turn-1-atlas .badge", "waited")
+    assert has_element?(view, "#transcript-turn-1-atlas .badge", "capital 97%")
+    refute has_element?(view, "#transcript-turn-2")
+
+    assistant(view, {:waiting, %{speaker: "Ada", ms: 2500}}, "atlas")
+    assert has_element?(view, "#waiting-atlas", "Atlas is waiting to see if anyone answers Ada")
+  end
+
+  test "one entry per turn even when the assistants split speech differently", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/r/test")
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+
+    turn = fn text, outcome ->
+      {:decision,
+       %{
+         source: "p1/mic",
+         speaker: "Ada",
+         text: text,
+         outcome: outcome,
+         why: :not_addressed,
+         decision: nil
+       }}
+    end
+
+    # Atlas hears it as one turn, and decides first.
+    assistant(view, turn.("I can't hear either of you. Can you hear me?", :listen), "atlas")
+    refute has_element?(view, "#transcript-turn-1")
+
+    # The assistant hears two turns; Atlas's decision joins the first.
+    assistant(view, turn.("I can't hear either of you.", :listen))
+    assistant(view, turn.("Can you hear me?", :listen))
+
+    assert has_element?(view, "#transcript-turn-1", "I can't hear either of you.")
+    assert has_element?(view, "#transcript-turn-1-atlas")
+    assert has_element?(view, "#transcript-turn-2", "Can you hear me?")
+    refute has_element?(view, "#transcript-turn-3")
+    refute render(view) =~ "I can't hear either of you. Can you hear me?"
+  end
+
+  test "the assistant's set_theme tool switches every page in the room", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/r/themes")
+
+    call = %{id: "c1", name: "set_theme", args: %{"theme" => "dark"}}
+
+    assert %{response: %{result: "ok", theme: "dark"}} =
+             Meet.Assistant.set_theme(call, %{room_id: "themes"})
+
+    assert_push_event(view, "set-theme", %{theme: "dark"})
+
+    assert %{response: %{result: "error"}} =
+             Meet.Assistant.set_theme(%{call | args: %{"theme" => "purple"}}, %{room_id: "themes"})
+  end
+end
