@@ -32,6 +32,7 @@ architecture.md in the same change.
 | Video steps 1–2              | Publications per source; cameras, screen shares and mute in browsers.                            | `5acfc60` |
 | Swift client                 | A port of the browser client for iOS and macOS.                                                  | `7871b60` |
 | Agents phase 1               | `agents/` (`octoroom_agents`): Subvocal's cascaded pipeline as a worker. Separate output rates in core. | uncommitted |
+| Worker events                | Workers' presence, events and messages reach clients by subscription; agents, meet, JS and Swift use them (D44). | `bb20857`–`9504213` |
 
 ## Index
 
@@ -45,7 +46,7 @@ architecture.md in the same change.
 | [D6](#d6-gain-is-applied-in-the-listeners-client)                    | Gain is applied in the listener's client                  | Current               |
 | [D7](#d7-closing-a-subscription-is-client-offered)                   | Closing a subscription is client-offered                  | Current               |
 | [D8](#d8-a-track-is-live-when-its-publisher-reports-connected)       | A track is live when its publisher reports connected      | Current               |
-| [D9](#d9-events-go-through-a-registry)                               | Events go through a Registry                              | Current               |
+| [D9](#d9-events-go-through-a-registry)                               | Events go through a Registry                              | Current, amended by D44 |
 | [D10](#d10-workers-connect-through-websocket-adapters)               | Workers connect through WebSocket adapters                | Superseded by D24     |
 | [D11](#d11-worker-media-lives-apart-from-the-worker)                 | Worker media lives apart from the worker                  | Current               |
 | [D12](#d12-the-room-server-restarts-crashed-workers)                 | The room server restarts crashed workers                  | Current               |
@@ -80,6 +81,7 @@ architecture.md in the same change.
 | [D41](#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room) | The app asks the decision model its own questions, and several agents share a room | Current |
 | [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate) | Clients send their offer at the first ICE candidate | Current |
 | [D43](#d43-inlets-decode-to-the-workers-format) | Inlets decode to the worker's format | Current |
+| [D44](#d44-workers-reach-clients-through-their-outputs) | Workers reach clients through their outputs | Current |
 
 ## Removed code
 
@@ -247,7 +249,8 @@ silence as soon as it has its sink, and goes live then.
 
 #### D9. Events go through a Registry
 
-**Status:** Current. The draft said Phoenix PubSub.
+**Status:** Current, amended by D44: `subscribe/2` takes a scope. The draft
+said Phoenix PubSub.
 
 **Decision.** `Octoroom.subscribe/1` registers in a duplicate-key `Registry`
 (`Octoroom.Events`), and events are dispatched to it.
@@ -1066,6 +1069,66 @@ already decoded in the old format are dropped by the worker.
 
 **Open.** Encoding is now the largest cost. The Opus NIF doesn't expose
 encoder complexity, which would be the next lever.
+
+#### D44. Workers reach clients through their outputs
+
+**Status:** Current. Commits `bb20857` to `9504213`; the plan is
+[proposal-worker-events.md](proposal-worker-events.md).
+
+**Context.** Agents could only be seen through the server: `emit` went to
+`Octoroom.subscribe/1` subscribers, so a LiveView could show an agent's
+state and transcript but the JS and Swift clients couldn't, and no client
+could type to one. Pipecat's RTVI is the model for what clients want
+(state, transcripts, messages back), but it assumes one bot and one user per
+connection.
+
+**Decision.** Core knows workers, not agents
+([D5](#d5-octoroom-ships-no-ai) holds):
+
+- A worker's `notify:` events go to the participants subscribed to the
+  output they name, and its `presence:` (`state`, `attributes`) to those
+  subscribed to any of its outputs. Who sees a worker is decided by
+  `subscriptions/2`, the same policy as audio: the coach's words reach the
+  agent's browser and never the customer's, with no second policy to
+  write.
+- Workers can declare data-only outputs (`data:`), listed in
+  `subscriptions/2` like tracks, for workers with nothing to play. They
+  never touch Cloudflare: events and presence go over the Phoenix channel
+  each client already has, which survives media reconnecting.
+- Clients may message a worker only if it hears them (one of its inputs is
+  their track), narrowed by the room's optional `message/3`, with a size
+  cap and a rate limit in core.
+- A late joiner gets each worker's latest presence; events are
+  fire-and-forget. The worker hears `:subscribed` and sends a snapshot if
+  it wants one.
+- `Octoroom.subscribe/2` takes a required scope: `{:participant, id}` gets
+  exactly what that participant's client gets, `:room` everything. Every
+  caller chooses, so unscoped access is never the default.
+- `octoroom_agents` defines the agent shapes (state, `transcript`,
+  `transcript_snapshot`, `error`, typed `{text}` messages, always
+  answered) and ships the client helpers for JS and Swift.
+
+**Why not agent shapes in core.** They change often (the decision gate's
+events arrived over a few commits), and a shape compiled into a shipped iOS
+app can't change with the server. Recorders, captioners and phone bridges
+want the same pipe.
+
+**Why not Cloudflare data channels.** Workers run on the app server, which
+already has a socket to every client; a data channel would add a pull and a
+renegotiation per subscription, and events would stop while media
+reconnects. They may suit media-timed data later (avatar lip sync).
+
+**Evidence.** meet in Chromium and the iOS simulator against real
+Cloudflare and providers: assistant tiles follow presence (speaking until
+the reply's audio has played), and a typed question to Atlas is answered
+aloud and in the transcript.
+
+**Open.** A recovered room starts with no record of what clients saw, so a
+client never hears `removed` for a worker it stopped seeing during a crash.
+A worker whose outputs change while seen sends no `updated`. A text-only
+agent with no inputs can't be messaged, since `message/3` only narrows.
+Meet's LiveView stays on `scope: :room`, because it shows decisions and
+latency, which stay server-side.
 
 ## Where the code came from
 

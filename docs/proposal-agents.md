@@ -511,7 +511,9 @@ superseded.
    collaboration call work.
 4. **Clients.** Presence, scoped events, client messages, and the JS and
    Swift APIs. A demo LiveView with a shared sheet, a transcript pane and an
-   agent tile.
+   agent tile. (Built as worker events in core,
+   [D44](decisions.md#d44-workers-reach-clients-through-their-outputs); the
+   demo is `examples/meet`, without the shared sheet.)
 5. **Decisions.** `Processors.Decisions`, the model-based addressing gate,
    and the mood example.
 6. **Later.** Mixed mode with Gemini Live, an Ecto history store, vision

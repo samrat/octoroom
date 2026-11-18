@@ -383,8 +383,11 @@ const room = new RoomClient({
   params: { lang: "ja" },
 });
 room.on("participants", (list) => render(list));
+room.on("workers", (list) => render(list)); // workers it's subscribed to, e.g. agents
+room.on("worker_event", ({ worker, type, data }) => show(worker, type, data));
 await room.join(); // asks for the mic, publishes it, plays what the policy subscribes
 room.setMuted(true);
+await room.send("assistant", { text: "add Acme to the sheet" }); // to a worker that hears it
 await room.leave();
 ```
 
@@ -398,10 +401,19 @@ is a port of the browser client and speaks the same channel protocol.
 
 ### Room events
 
-`Octoroom.subscribe(room_id)` sends the subscribing process
-`{:octoroom, room_id, event}` messages. Events go through a `Registry`
-(`Octoroom.Events`), so they reach processes on this node
-([D9](decisions.md#d9-events-go-through-a-registry)).
+`Octoroom.subscribe(room_id, scope: scope)` sends the subscribing process
+`{:octoroom, room_id, event}` messages
+([D44](decisions.md#d44-workers-reach-clients-through-their-outputs)):
+
+- `scope: {:participant, id}`: what that participant's client is sent, as
+  Elixir terms. For a process that renders the room for one user, such as
+  a LiveView. The id isn't checked; pass the one your code authenticated.
+- `scope: :room`: every event below, for trusted code that acts for no
+  user (a recorder, analytics, an admin view).
+
+Both go through a `Registry` (`Octoroom.Events`), so they reach processes
+on this node ([D9](decisions.md#d9-events-go-through-a-registry)), survive
+the room server restarting, and may be made before the room exists.
 
 | Event                                        | When                                                                               |
 | -------------------------------------------- | ---------------------------------------------------------------------------------- |
@@ -411,13 +423,17 @@ is a port of the browser client and speaks the same channel protocol.
 | `{:disconnected, participant}`               | Its connection dropped; it is kept for the grace period.                           |
 | `{:subscriptions, participant_id, track_names}` | What it now receives.                                                           |
 | `{:output_live, track_name}`                 | A worker output sent its first packet.                                             |
-| `{:worker_event, worker_id, event}`          | Whatever a worker `emit`s, e.g. captions.                                          |
+| `{:worker_event, worker_id, event}`          | Whatever a worker `emit`s. `scope: :room` only.                                    |
+| `{:worker, op, presence}`                    | A worker this participant now sees (`:added`), whose presence changed (`:updated`), or that it no longer sees (`:removed`). `scope: :room` gets `:updated` only. |
+| `{:worker_notify, worker_id, output, type, data}` | A worker's `notify:` on an output the participant is subscribed to. `scope: :room` gets those not sent to one participant. |
 | `{:worker_down, worker_id, reason}`          | A worker crashed (the room restarts it).                                           |
 | `{:error, what, reason}`                     | The room gave up on something after five tries (see [Failure and cleanup](#failure-and-cleanup)). |
 
-Clients receive the first four as `room_event` channel messages. Worker
-events don't go to clients; an app forwards them itself, for example through
-a LiveView.
+`{:disconnected, _}`, `{:subscriptions, _, _}`, `{:output_live, _}`,
+`{:worker_event, _, _}`, `{:worker_down, _, _}` and `{:error, _, _}` are
+`scope: :room` only. Clients receive the first four as `room_event` channel
+messages, and the two worker events as `worker` and `worker_event` (see
+[Workers and clients](#workers-and-clients)).
 
 ## Concepts
 
@@ -636,7 +652,7 @@ what each transceiver is.
 | Direction       | Message          | Payload                                                                                                             |
 | --------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------- |
 | client → server | join             | The app's params, plus `resume_token` after a reconnect.                                                            |
-| join reply      |                  | `{participant_id, participants, ice_servers, resumed, resume_token}`                                                |
+| join reply      |                  | `{participant_id, participants, workers, ice_servers, resumed, resume_token}`; `workers` are those it sees now.     |
 | client → server | `publish`        | `{sdp: offer, mids: {mic: "0", camera: "1"}}`: creates the session. The reply is `{sdp: answer}`.                   |
 | client → server | `connected`      | `{}` once the peer connection is up (and again after each `push`), so what it published is flowing and can be pulled. |
 | client → server | `publish_tracks` | `{sources: ["camera"]}` once the session exists; replied to once Cloudflare has the tracks.                         |
@@ -653,6 +669,9 @@ what each transceiver is.
 | server → client | `room_event`     | `{type, participant}` for joined, left, updated and published.                                                      |
 | server → client | `resume_token`   | `{token}`: a fresh token when the session is created or the metadata changes.                                       |
 | server → client | `republish`      | `{reason}`: the client's Cloudflare session is gone, so it starts its media over and publishes again.               |
+| server → client | `worker`         | `{op: "added" \| "updated" \| "removed", worker: {id, outputs, data, state, attributes}}` (just `{id}` when removed). |
+| server → client | `worker_event`   | `{worker, output, type, data}`, from the worker's `notify:`.                                                        |
+| client → server | `worker_message` | `{worker, payload}`, `payload` an object. Refused with `too_large`, `no_worker`, `not_allowed` or `rate_limited`.   |
 
 `op_id` ties an answer to the operation that asked for it, so a late answer
 after a reconnect is rejected instead of applied to the wrong state. The
@@ -685,7 +704,10 @@ forwards each track unchanged.
 play: {output, pcm}      # queued on the outlet, paced to real time; :default is the first output
 flush: output            # drop queued, unplayed audio (barge-in); the worker then gets
                          # {:octoroom, :flushed, output, dropped_ms} in handle_info/2
-emit: event              # broadcast {:worker_event, worker_id, event} to the room's subscribers
+emit: event              # broadcast {:worker_event, worker_id, event} to scope: :room subscribers
+notify: {output, type, data}   # an event for the clients subscribed to output (audio or data);
+                               # with a participant id as a 4th element, for that one only
+presence: %{state: s, attributes: a}   # what clients show for this worker
 ```
 
 - `use Octoroom.Worker, audio: [rate: 16_000, channels: 1]` picks the PCM
@@ -699,11 +721,47 @@ emit: event              # broadcast {:worker_event, worker_id, event} to the ro
   `Octoroom.Room.state/1` for anything newer.
 - `Octoroom.Worker.send(room_id, id, message)` reaches a worker's
   `handle_info/2` from outside, for example to flush from a LiveView.
+- `worker(id, module, data: ["notes"])` gives a worker data-only outputs:
+  names that `subscriptions/2` lists like tracks but that carry no media,
+  for a worker with something to tell clients and nothing to play.
 - Workers are plain processes, so a worker can delegate its media to
   anything: a Membrane pipeline, a Pythonx model, or a voice-agent library's
   session. That's how AI integrations plug in. What Octoroom guarantees them
   without knowing about AI: real-time pacing, `flush` for barge-in, per-input
   streams labelled by participant, and `emit` for captions and transcripts.
+
+### Workers and clients
+
+A worker reaches clients through its outputs
+([D44](decisions.md#d44-workers-reach-clients-through-their-outputs)). A
+participant sees an output once it's subscribed to it: an audio output when
+its pull is open, a data output as soon as `subscriptions/2` lists it
+(before its media is up, with no call to Cloudflare). After each reconcile
+the room server compares what each participant sees with the last pass:
+
+- the worker gets `{:octoroom, :subscribed | :unsubscribed, participant_id,
+  output}` in `handle_info/2` (and `:subscribed` for everyone again after a
+  restart), so it can catch a new subscriber up with a `notify:` to them;
+- the client gets `worker` `added` or `removed`, and the latest presence of
+  every worker it sees in its join and resume replies.
+
+`notify:` events go to the subscribers of their output (the first, by
+default); `presence:` goes to the subscribers of any of the worker's
+outputs. Payloads are checked as JSON in the worker, which crashes on a bad
+one rather than a client's channel. A restarted worker's `state` is nil
+until it sets it again; its `attributes` are kept.
+
+A client may message a worker (`worker_message`, `room.send/2`) only if one
+of the worker's inputs is its track, and the room's optional `message/3`
+callback agrees. Payloads over `worker_messages: [max_bytes:]` (16 KB) are
+refused in the channel; each participant has a token bucket per worker
+(`per_second: 10`, `burst: 20`). The worker gets `{:octoroom, :message,
+participant_id, payload}`.
+
+`octoroom_agents` builds on this: agents set their state as presence, send
+`transcript`, `transcript_snapshot` and `error` events, and answer typed
+`{text}` messages. `agents/priv/static/octoroom_agents.mjs` and the Swift
+`OctoroomAgents` product decode them.
 
 ### Worker media transport
 
@@ -1026,3 +1084,4 @@ first sends audio, before which nobody can pull it.
 | `swift/`                           | The Swift client.                                                              |
 | `examples/call`                    | A LiveView group call with video, a private echo, a metronome, a recorder and captions. |
 | `examples/ios`                     | An iOS app that joins the same rooms.                                          |
+| `examples/meet`                    | A LiveView video call with two agents, their state and a box to type to them.  |

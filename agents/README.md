@@ -56,6 +56,26 @@ environment: `SONIOX_API_KEY`, `GOOGLE_API_KEY` (Gemini, the default LLM)
 and `INWORLD_API_KEY`. See `Octoroom.Agent.Worker` for the args, what it
 emits, and how it reports latency.
 
+## Clients
+
+Agents show up in clients through Octoroom's worker events
+([D44](../docs/decisions.md#d44-workers-reach-clients-through-their-outputs)):
+each one's state (listening, thinking, speaking, waiting), its transcript,
+and a box to type to it. `priv/static/octoroom_agents.mjs` does it in the
+browser, and the Swift package's `OctoroomAgents` product on iOS and macOS:
+
+```js
+import {agents} from "octoroom_agents"
+
+const ai = agents(room) // a RoomClient
+ai.on("agents", (list) => render(list)) // [{id, name, description, state}]
+ai.on("transcript", ({agent, items}) => render(agent, items))
+await ai.say("assistant", "add Acme to the sheet")
+```
+
+A typed message is always answered, whatever `respond:` and the gate say.
+`examples/meet` and `examples/ios` show both.
+
 ## Speech providers
 
 Speech-to-text and text-to-speech go through two small behaviours,

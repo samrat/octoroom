@@ -38,8 +38,6 @@ Things the first draft promised that the code doesn't do:
 - **Events over Phoenix PubSub.** Events go through a local `Registry`
   ([D9](decisions.md#d9-events-go-through-a-registry)), so subscribers must
   be on the room's node.
-- **Worker events to clients.** `emit` reaches `Octoroom.subscribe/1`
-  subscribers, not browsers over the channel.
 - **Store implementations.** Only `Octoroom.Store.ETS` exists. Ecto
   (Postgres) and Redis stores, for deploys that replace the machine or for
   clusters, were planned.
