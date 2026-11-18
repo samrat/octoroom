@@ -56,6 +56,29 @@ The pipeline (frames, processors, the pure `Pipeline.Core`, providers,
 tools) is copied from Subvocal, an earlier experiment, and renamed under
 `Octoroom.Agent`. Each phase copies what it needs and changes it freely;
 nothing goes back. The list is in
+## Speech providers
+
+Speech-to-text and text-to-speech go through two small behaviours,
+`Octoroom.Agent.STT` (a streaming session process that sends
+`{:stt, pid, event}` to its owner) and `Octoroom.Agent.TTS` (`stream/3` or
+`synthesize/2`). A backend names a provider and model in one string, and
+the provider fills in its own defaults:
+
+```elixir
+def backend(_ctx), do: %{stt: "soniox:stt-rt-v5", tts: "inworld:inworld-tts-2"}
+```
+
+Built in: STT from Soniox (`soniox`, the default) and AssemblyAI
+(`assembly_ai`), and TTS from Inworld (`inworld`, the default) and OpenAI
+(`openai`). Keys come from `SONIOX_API_KEY`, `ASSEMBLY_AI_API_KEY`,
+`INWORLD_API_KEY` and `OPENAI_API_KEY`. To
+add one, implement the behaviour and register it, or pass the module as
+`:provider`:
+
+```elixir
+config :octoroom_agents, stt_providers: [acme: MyApp.AcmeSTT], tts_providers: [acme: MyApp.AcmeTTS]
+```
+
 [decisions.md](../docs/decisions.md#where-the-code-came-from).
 
 ## Building

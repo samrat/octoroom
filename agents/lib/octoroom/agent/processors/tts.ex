@@ -8,11 +8,11 @@ defmodule Octoroom.Agent.Processors.TTS do
   and sent as one request, so the voice keeps its prosody across sentences.
   `LLMResponseEnd` and `End` wait until the queued audio is out.
 
-  Options: `:provider` (`:inworld`, `:openai`, `:woof`), `:model`, `:voice`,
-  `:stream`, `:audio_encoding`, `:output_sample_rate`, `:delivery_mode`,
-  `:timestamp_transport_strategy`, `:model_path`, `:token` (defaults to the
-  provider's environment variable), `:chunk_timeout_ms`, and `:synthesize`,
-  a `fn text, on_audio -> :ok | {:error, reason} end` that replaces the
+  Options are `Octoroom.Agent.TTS`'s: `:provider` (default `:inworld`),
+  `:model`, `:voice`, `:api_key` and the provider's own, with
+  `:output_sample_rate` as the provider's `:sample_rate`. Also
+  `:chunk_timeout_ms`, and `:synthesize`, a
+  `fn text, on_audio -> :ok | {:error, reason} end` that replaces the
   provider (for tests).
   """
 
@@ -20,51 +20,41 @@ defmodule Octoroom.Agent.Processors.TTS do
 
   require Logger
 
-  alias Octoroom.Agent.Cascaded.TextToSpeech
-  alias Octoroom.Agent.Frames
+  alias Octoroom.Agent.{Frames, TTS}
 
   @chunk_timeout_ms 15_000
 
   @impl true
   def init(opts, _ctx) do
-    opts = Map.new(opts)
-    provider = Map.get(opts, :provider, :inworld)
+    {synthesize, opts} = Keyword.pop(opts, :synthesize)
+    {chunk_timeout_ms, opts} = Keyword.pop(opts, :chunk_timeout_ms, @chunk_timeout_ms)
 
-    {:ok,
-     %{
-       synthesize: Map.get(opts, :synthesize) || provider_synthesize(provider, opts),
-       chunk_timeout_ms: Map.get(opts, :chunk_timeout_ms, @chunk_timeout_ms),
-       speaking?: false,
-       started?: false,
-       queue: [],
-       held: []
-     }}
-  end
-
-  defp provider_synthesize(provider, opts) do
-    token = Map.get(opts, :token) || provider_token(provider)
-
-    fn text, on_audio ->
-      TextToSpeech.stream_speech(
-        provider: provider,
-        token: token,
-        model: Map.get(opts, :model),
-        voice: Map.get(opts, :voice),
-        model_path: Map.get(opts, :model_path),
-        input: text,
-        stream: Map.get(opts, :stream, false),
-        audio_encoding: Map.get(opts, :audio_encoding, "LINEAR16"),
-        sample_rate: Map.get(opts, :output_sample_rate, 24_000),
-        delivery_mode: Map.get(opts, :delivery_mode),
-        timestamp_transport_strategy: Map.get(opts, :timestamp_transport_strategy),
-        on_audio: on_audio
-      )
+    with {:ok, synthesize} <- synthesizer(synthesize, opts) do
+      {:ok,
+       %{
+         synthesize: synthesize,
+         chunk_timeout_ms: chunk_timeout_ms,
+         speaking?: false,
+         started?: false,
+         queue: [],
+         held: []
+       }}
     end
   end
 
-  defp provider_token(:inworld), do: System.get_env("INWORLD_API_KEY")
-  defp provider_token(:openai), do: System.get_env("OPENAI_API_KEY")
-  defp provider_token(_provider), do: nil
+  defp synthesizer(synthesize, _opts) when is_function(synthesize, 2), do: {:ok, synthesize}
+
+  defp synthesizer(nil, opts) do
+    {rate, opts} = Keyword.pop(opts, :output_sample_rate)
+    opts = opts |> Keyword.put_new(:provider, :inworld) |> put_present(:sample_rate, rate)
+
+    with {:ok, module, opts} <- TTS.resolve(opts) do
+      {:ok, fn text, on_audio -> TTS.stream_with(module, text, on_audio, opts) end}
+    end
+  end
+
+  defp put_present(opts, _key, nil), do: opts
+  defp put_present(opts, key, value), do: Keyword.put(opts, key, value)
 
   @impl true
   def handle_frame(%Frames.Text{text: text}, :downstream, state) do

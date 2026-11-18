@@ -9,23 +9,15 @@
 # `{:latency, ...}` report, and when its first audio would reach the outlet.
 # `Q="..."` asks something else.
 
-alias Octoroom.Agent.Cascaded.Inworld
+alias Octoroom.Agent.TTS
 alias Octoroom.Agent.Worker
 
 question = System.get_env("Q", "What is the capital of France? Answer in one word.")
 
-{:ok, speech24} =
-  Inworld.speech(
-    token: System.fetch_env!("INWORLD_API_KEY"),
-    input: question,
-    model: "inworld-tts-2",
-    voice: "Ashley",
-    audio_encoding: "LINEAR16",
-    sample_rate: 24_000
-  )
+{:ok, speech2{:ok, speech24} =
+  TTS.synthesize("inworld:inworld-tts-2", question, voice: "Ashley", sample_rate: 24_000)
 
-speech24 =
-  case speech24 do
+case speech24 do
     <<"RIFF", _::binary-size(40), pcm::binary>> -> pcm
     pcm -> pcm
   end
