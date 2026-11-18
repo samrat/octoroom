@@ -71,7 +71,8 @@ def backend(_ctx), do: %{stt: "soniox:stt-rt-v6", tts: "inworld:inworld-tts-2"}
 Built in: STT from Soniox (`soniox`, the default) and AssemblyAI
 (`assembly_ai`), and TTS from Inworld (`inworld`, the default) and OpenAI
 (`openai`). Keys come from `SONIOX_API_KEY`, `ASSEMBLY_AI_API_KEY`,
-`INWORLD_API_KEY` and `OPENAI_API_KEY`. To
+`INWORLD_API_KEY` and `OPENAI_API_KEY`. Inworld speaks over its WebSocket:
+one connection per agent, each reply a context on it. To
 add one, implement the behaviour and register it, or pass the module as
 `:provider`:
 

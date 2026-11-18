@@ -10,7 +10,9 @@ defmodule Octoroom.Agent.Processors.TTS do
 
   Options are `Octoroom.Agent.TTS`'s: `:provider` (default `:inworld`),
   `:model`, `:voice`, `:api_key` and the provider's own, with
-  `:output_sample_rate` as the provider's `:sample_rate`. Also
+  `:output_sample_rate` as the provider's `:sample_rate`. It connects the
+  provider once (`Octoroom.Agent.TTS.connect/2`), for those that keep a
+  connection. Also
   `:chunk_timeout_ms`, and `:synthesize`, a
   `fn text, on_audio -> :ok | {:error, reason} end` that replaces the
   provider (for tests).
@@ -48,7 +50,8 @@ defmodule Octoroom.Agent.Processors.TTS do
     {rate, opts} = Keyword.pop(opts, :output_sample_rate)
     opts = opts |> Keyword.put_new(:provider, :inworld) |> put_present(:sample_rate, rate)
 
-    with {:ok, module, opts} <- TTS.resolve(opts) do
+    with {:ok, module, opts} <- TTS.resolve(opts),
+         {:ok, opts} <- TTS.connect(module, opts) do
       {:ok, fn text, on_audio -> TTS.stream_with(module, text, on_audio, opts) end}
     end
   end
