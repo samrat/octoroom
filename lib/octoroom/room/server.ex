@@ -340,6 +340,7 @@ defmodule Octoroom.Room.Server do
             mic: mic_status(p),
             tracks: Map.new(p.tracks, fn {src, t} -> {src, Map.take(t, [:status, :muted])} end),
             hears: for({name, %{status: :open}} <- p.subs, do: name) |> Enum.sort(),
+            data: p.data_subs |> MapSet.to_list() |> Enum.sort(),
             subscriptions:
               Map.new(p.subs, fn {name, s} -> {name, Map.take(s, [:status, :gain])} end)
           }
@@ -349,7 +350,7 @@ defmodule Octoroom.Room.Server do
           running = state.workers[spec.id]
 
           spec
-          |> Map.take([:id, :module, :inputs, :outputs])
+          |> Map.take([:id, :module, :inputs, :outputs, :data])
           |> Map.merge(%{
             running: running != nil,
             connected:
@@ -977,29 +978,59 @@ defmodule Octoroom.Room.Server do
 
     {specs, errors} =
       case call_room(fn -> state.module.workers(room) end, &worker_specs?/1, "worker specs") do
-        {:ok, specs} -> {Enum.uniq_by(specs, & &1.id), %{}}
-        {:error, error} -> {state.worker_specs, %{workers: error}}
+        {:ok, specs} ->
+          {specs |> Enum.uniq_by(& &1.id) |> Enum.map(&Map.put_new(&1, :data, [])), %{}}
+
+        {:error, error} ->
+          {state.worker_specs, %{workers: error}}
       end
 
     state = reconcile_workers(%{state | worker_specs: specs})
     room = room(state)
+    data_names = data_outputs(state)
 
-    {desired, errors} =
-      for %{media: :live} = p <- participants(state), reduce: {%{}, errors} do
-        {desired, errors} ->
+    # Subscriptions to data outputs carry no media, so they apply to every
+    # participant, live or not; the rest wait for its media to be live.
+    # With no data outputs in the room, only live participants are asked.
+    {desired, data_subs, errors} =
+      for p <- participants(state),
+          p.media == :live or data_names != %{},
+          reduce: {%{}, %{}, errors} do
+        {desired, data_subs, errors} ->
           listener = public(p)
           subscriptions = fn -> state.module.subscriptions(listener, room) end
 
           case call_room(subscriptions, &subscriptions?/1, "tracks or track names") do
             {:ok, wanted} ->
-              {Map.put(desired, p.id, wanted ++ held_ghosts(state, p, wanted)), errors}
+              {data, media} = Enum.split_with(wanted, &Map.has_key?(data_names, track_name(&1)))
+              data = MapSet.new(data, &track_name/1)
+
+              desired =
+                if p.media == :live,
+                  do: Map.put(desired, p.id, media ++ held_ghosts(state, p, media)),
+                  else: desired
+
+              {desired, Map.put(data_subs, p.id, data), errors}
 
             {:error, error} ->
-              {Map.put(desired, p.id, holding(p)), Map.put(errors, {:subscriptions, p.id}, error)}
+              desired = if p.media == :live, do: Map.put(desired, p.id, holding(p)), else: desired
+              {desired, data_subs, Map.put(errors, {:subscriptions, p.id}, error)}
           end
       end
 
     state = report_policy_errors(state, errors)
+
+    # A participant whose policy failed keeps what it had, less data outputs
+    # that are gone.
+    state =
+      Enum.reduce(state.participants, state, fn {id, p}, state ->
+        data =
+          Map.get_lazy(data_subs, id, fn ->
+            MapSet.filter(p.data_subs, &Map.has_key?(data_names, &1))
+          end)
+
+        if data == p.data_subs, do: state, else: put_p(state, %{p | data_subs: data})
+      end)
 
     actual = %{
       subscriptions: Map.new(state.participants, fn {id, p} -> {id, p.subs} end),
@@ -1244,9 +1275,12 @@ defmodule Octoroom.Room.Server do
 
   defp worker_specs?(specs), do: is_list(specs) and Enum.all?(specs, &worker_spec?/1)
 
-  defp worker_spec?(%{id: id, module: module, inputs: inputs, outputs: outputs, args: _})
-       when is_binary(id) and is_atom(module) and is_list(inputs) and is_list(outputs),
-       do: Enum.all?(inputs ++ outputs, &is_binary/1)
+  # `data` is optional, for specs built by hand rather than with `worker/3`.
+  defp worker_spec?(%{id: id, module: module, inputs: inputs, outputs: outputs, args: _} = spec)
+       when is_binary(id) and is_atom(module) and is_list(inputs) and is_list(outputs) do
+    data = Map.get(spec, :data, [])
+    is_list(data) and Enum.all?(inputs ++ outputs ++ data, &is_binary/1)
+  end
 
   defp worker_spec?(_spec), do: false
 
@@ -1257,6 +1291,18 @@ defmodule Octoroom.Room.Server do
         name -> is_binary(name)
       end)
   end
+
+  # Data output name => the id of the worker it belongs to. If two workers
+  # name the same one, the first in the specs has it, as with outputs.
+  defp data_outputs(state) do
+    for spec <- Enum.reverse(state.worker_specs),
+        name <- Map.get(spec, :data, []),
+        into: %{},
+        do: {name, spec.id}
+  end
+
+  defp track_name(%Track{name: name}), do: name
+  defp track_name(name) when is_binary(name), do: name
 
   # What `p` holds now, at the gains it has, so the diff leaves it alone.
   defp holding(p), do: for({name, sub} <- p.subs, do: %{Track.new(name) | gain: sub.gain})
@@ -1717,6 +1763,8 @@ defmodule Octoroom.Room.Server do
       # Publishes and unpublishes waiting for the session's queue.
       requests: [],
       subs: %{},
+      # Names of the data outputs it's subscribed to (see `Room.worker/3`).
+      data_subs: MapSet.new(),
       op: nil,
       # The grace timer while its connection is down.
       disconnected: nil,

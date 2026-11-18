@@ -57,6 +57,7 @@ defmodule Octoroom.Room do
           module: module,
           inputs: [String.t()],
           outputs: [String.t()],
+          data: [String.t()],
           args: term
         }
 
@@ -73,8 +74,8 @@ defmodule Octoroom.Room do
   @doc """
   Which server-side participants should be running now? Each is a
   `worker/3` spec, identified by its id. Octoroom starts and stops workers
-  to match. A spec that comes back with other inputs or outputs is updated in
-  place; one with another module or args is restarted.
+  to match. A spec that comes back with other inputs, outputs or data
+  outputs is updated in place; one with another module or args is restarted.
   """
   @callback workers(t) :: [worker_spec]
 
@@ -151,7 +152,11 @@ defmodule Octoroom.Room do
           source <- Map.keys(Track.sources()) |> Enum.sort(),
           do: track("#{p.id}/#{source}")
 
-    outputs = for w <- room.workers, name <- Map.get(w, :outputs, []), do: track(name)
+    outputs =
+      for w <- room.workers,
+          name <- Map.get(w, :outputs, []) ++ Map.get(w, :data, []),
+          do: track(name)
+
     published ++ outputs
   end
 
@@ -163,6 +168,12 @@ defmodule Octoroom.Room do
       take video yet.
     * `outputs`: names of the tracks the worker plays. Output names share a
       namespace with every other track in the room.
+    * `data`: names of data-only outputs, for a worker with something to
+      tell clients but nothing to play (a notetaker, a captioner). They
+      share the same namespace, and `subscriptions/2` lists them like
+      tracks, but they carry no media: subscribing to one never touches
+      Cloudflare, and it applies as soon as the participant has joined,
+      before its media is up.
     * `args`: passed to the worker's `init/2`.
   """
   def worker(id, module, opts) when is_binary(id) and is_atom(module) do
@@ -171,11 +182,21 @@ defmodule Octoroom.Room do
     if video = Enum.find(inputs, &(Track.new(&1).kind == :video)),
       do: raise(ArgumentError, "worker #{id}: #{video} is video, and workers take audio inputs")
 
+    outputs = opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
+    data = opts |> Keyword.get(:data, []) |> Enum.uniq()
+
+    if bad = Enum.find(data, &(not is_binary(&1))),
+      do: raise(ArgumentError, "worker #{id}: data output #{inspect(bad)} isn't a string")
+
+    if both = Enum.find(data, &(&1 in outputs)),
+      do: raise(ArgumentError, "worker #{id}: #{both} is both an output and a data output")
+
     %{
       id: id,
       module: module,
       inputs: inputs,
-      outputs: opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq(),
+      outputs: outputs,
+      data: data,
       args: Keyword.get(opts, :args, %{})
     }
   end

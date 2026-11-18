@@ -131,6 +131,10 @@ defmodule Octoroom.ReconcilerTest do
                {:update_worker, more},
                {:start_inlet, {"a", "b/mic"}}
              ]
+
+      # Data outputs have no media, so a change is only an update.
+      noted = Map.put(old, :data, ["notes"])
+      assert Reconciler.diff_workers([noted], actual) == [{:update_worker, noted}]
     end
 
     test "the first worker to name an output has it" do

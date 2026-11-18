@@ -38,6 +38,40 @@ defmodule Octoroom.RoomTest do
     def handle_audio(_input, _pcm, test), do: {:ok, test}
   end
 
+  defmodule Silent do
+    use Octoroom.Worker
+
+    @impl true
+    def init(_args, _ctx), do: {:ok, nil}
+
+    @impl true
+    def handle_audio(_input, _pcm, state), do: {:ok, state}
+  end
+
+  # A notetaker with a data output while the `notes` assign is on.
+  # Listeners with `notes: false` in their metadata leave it out.
+  defmodule DataRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def mount(_room_id), do: {:ok, %{notes: true}}
+
+    @impl true
+    def workers(%{assigns: %{notes: true}}),
+      do: [worker("notes", Octoroom.RoomTest.Silent, data: ["notes"])]
+
+    def workers(_room), do: []
+
+    @impl true
+    def subscriptions(%{meta: %{notes: false}} = listener, room),
+      do: default_subscriptions(listener, room) -- [track("notes")]
+
+    def subscriptions(listener, room), do: default_subscriptions(listener, room)
+  end
+
   # Policies that fail on demand: a listener's `policy` metadata, and the
   # room's `workers` assign or id prefix.
   defmodule PolicyRoom do
@@ -192,6 +226,48 @@ defmodule Octoroom.RoomTest do
     # One message per event: the "nobody" subscription got none of them.
     refute_receive {:octoroom, _, {:joined, _}}, 50
     refute_receive {:octoroom, _, {:left, _}}, 50
+  end
+
+  defp data(ctx) do
+    for p <- Octoroom.Room.state(ctx.room_id).participants, into: %{}, do: {p.meta.name, p.data}
+  end
+
+  test "data outputs are subscribed to without Cloudflare, before media is up", ctx do
+    alice = join(ctx, "alice", DataRoom)
+    bob = join(ctx, "bob", DataRoom, %{name: "bob", notes: false})
+
+    assert [%{id: "notes", outputs: [], data: ["notes"]}] =
+             Octoroom.Room.state(ctx.room_id).workers
+
+    # Neither has published, and alice already has the notes.
+    assert data(ctx) == %{"alice" => ["notes"], "bob" => []}
+
+    alice = publish(ctx, alice)
+    bob = publish(ctx, bob)
+    bob_mic = "#{bob.id}/mic"
+    alice_mic = "#{alice.id}/mic"
+
+    # Only mics are pulled: the data output never reaches Cloudflare.
+    assert [%{track: ^bob_mic}] = accept_pull(alice)
+    assert [%{track: ^alice_mic}] = accept_pull(bob)
+    refute_receive {:client, _, {:octoroom_signal, :renegotiate, _}}, 50
+    assert hears(ctx) == %{"alice" => [bob_mic], "bob" => [alice_mic]}
+    assert data(ctx) == %{"alice" => ["notes"], "bob" => []}
+
+    # The worker goes, and its data output with it.
+    :ok = Octoroom.Room.assign(ctx.room_id, :notes, false)
+    assert data(ctx) == %{"alice" => [], "bob" => []}
+    assert Octoroom.Room.state(ctx.room_id).workers == []
+  end
+
+  test "worker/3 refuses data outputs that aren't names or are also outputs" do
+    assert_raise ArgumentError, ~r/isn't a string/, fn ->
+      Octoroom.Room.worker("w", Silent, data: [:notes])
+    end
+
+    assert_raise ArgumentError, ~r/both an output and a data output/, fn ->
+      Octoroom.Room.worker("w", Silent, outputs: ["w"], data: ["w"])
+    end
   end
 
   test "subscribe/2 refuses a missing or unknown scope", ctx do
