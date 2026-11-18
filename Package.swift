@@ -10,6 +10,7 @@ let package = Package(
   products: [
     .library(name: "Octoroom", targets: ["Octoroom"]),
     .library(name: "OctoroomCore", targets: ["OctoroomCore"]),
+    .library(name: "OctoroomAgents", targets: ["OctoroomAgents"]),
   ],
   dependencies: [
     .package(url: "https://github.com/stasel/WebRTC.git", from: "137.0.0")
@@ -18,6 +19,10 @@ let package = Package(
     // The Phoenix channel client and the room's signaling, behind a media
     // engine protocol: no WebRTC dependency, so it tests without one.
     .target(name: "OctoroomCore", path: "swift/Sources/OctoroomCore"),
+    // Octoroom agents (octoroom_agents) as clients see them: their state,
+    // transcripts, and typing to them.
+    .target(
+      name: "OctoroomAgents", dependencies: ["OctoroomCore"], path: "swift/Sources/OctoroomAgents"),
     // The WebRTC media engine, capture (mic, camera, screen) and video views.
     .target(
       name: "Octoroom",
@@ -32,7 +37,7 @@ let package = Package(
     ),
     .testTarget(
       name: "OctoroomCoreTests",
-      dependencies: ["OctoroomCore"],
+      dependencies: ["OctoroomCore", "OctoroomAgents"],
       path: "swift/Tests/OctoroomCoreTests"
     ),
   ]

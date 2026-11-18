@@ -275,7 +275,9 @@ Each step is one commit, with tests passing.
    the helper's tests are `test/js/octoroom_agents.test.mjs`, so `bin/test
    js` runs them.)
 7. **Swift.** Core client changes, the `OctoroomAgents` product, and the
-   iOS example.
+   iOS example. (Done 2026-11-18. Checked in the simulator against meet:
+   both assistants listed with their state, and typing to Atlas gets a
+   spoken, transcribed answer.)
 8. **Docs.** architecture.md (the worker contract, the channel protocol),
    the D42 entry in decisions.md, and the roadmap's "Worker events to
    clients" gap removed.

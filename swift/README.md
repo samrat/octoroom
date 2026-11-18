@@ -67,6 +67,23 @@ that isn't state, use `for await event in room.events()`. You get
 `.left(reason)` and `.error`. `await room.levels()` returns audio levels
 for speaking indicators.
 
+Workers the room shows this client (AI agents, say) are in `room.workers`,
+with their presence (`state`, `attributes`); their events come as
+`.workerEvent`, and `try await room.send(to: "assistant", ["text": "hi"])`
+messages one. For `octoroom_agents` agents, `OctoroomAgents` does the
+decoding:
+
+```swift
+import OctoroomAgents
+
+let agents = Agents(room: room)              // @Observable
+ForEach(agents.agents) { agent in            // id, name, description, state
+  Text("\(agent.name): \(agent.state?.rawValue ?? "")")
+}
+ForEach(agents.transcript("assistant")) { item in Text(item.text) }
+try await agents.say("add Acme to the sheet", to: "assistant")
+```
+
 ## What differs from the browser client
 
 - **Screen sharing** on iOS shares the app's own screen through ReplayKit's
@@ -99,6 +116,9 @@ An example app is in [examples/ios](../examples/ios).
   engine.
 - `Octoroom` has the WebRTC engine, mic, camera and screen capture, and
   `VideoView`. It re-exports `OctoroomCore`.
+- `OctoroomAgents` has `Agents`: the room's agents, their transcripts and
+  typing to them, on top of `RoomClient` (a port of
+  `agents/priv/static/octoroom_agents.mjs`).
 
 ```sh
 bin/test swift   # or plain `swift test`, from the repository root

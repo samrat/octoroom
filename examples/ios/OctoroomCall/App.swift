@@ -1,9 +1,13 @@
 import Octoroom
+import OctoroomAgents
 import SwiftUI
 
 // A group call against examples/call: join the same room as the browsers
 // and hear and see each other. Run the server (`mix run --no-halt` in
 // examples/call), then this app; the simulator reaches it on localhost.
+// Agents in the room (examples/call's assistant, or meet's two: point the
+// socket URL at meet's server) show their state and transcript, and you
+// can type to them.
 
 @main
 struct OctoroomCallApp: App {
@@ -35,8 +39,12 @@ final class CallModel {
   var log: [String] = []
   var levels = AudioLevels()
   var usingTestPattern = false
+  /// What's typed to an agent, and which one.
+  var message = ""
+  var sayTo: String?
 
   private(set) var room: RoomClient?
+  private(set) var agents: Agents?
   private let engine = WebRTCEngine()
   private var listener: Task<Void, Never>?
   private var meter: Task<Void, Never>?
@@ -51,9 +59,11 @@ final class CallModel {
     let room = RoomClient(
       socket: socket, topic: "room:\(roomName)", params: ["name": .string(name)], engine: engine)
     listen(room)
+    let agents = Agents(room: room)
     do {
       try await room.join()
       self.room = room
+      self.agents = agents
       note("joined as \(room.participantId ?? "?")")
       if withCamera { await startCamera() }
       startMeter(room)
@@ -68,6 +78,7 @@ final class CallModel {
     room.leave()
     room.socket.disconnect()
     self.room = nil
+    agents = nil
     meter?.cancel()
     listener?.cancel()
     usingTestPattern = false
@@ -115,6 +126,20 @@ final class CallModel {
     }
   }
 
+  /// Types `message` to the chosen agent (the first, if none is chosen).
+  func say() async {
+    guard let agents, let to = sayTo ?? agents.agents.first?.id else { return }
+    let text = message.trimmingCharacters(in: .whitespaces)
+    guard !text.isEmpty else { return }
+    message = ""
+    do {
+      try await agents.say(text, to: to)
+    } catch {
+      message = text
+      self.error = "couldn't send to \(to): \(error.localizedDescription)"
+    }
+  }
+
   func name(of participantId: String?) -> String {
     guard let participantId else { return "worker" }
     let p = room?.participants.first { $0.id == participantId }
@@ -136,7 +161,10 @@ final class CallModel {
         case .error(let error): self.error = error.localizedDescription
         case .left(let reason):
           self.note("left: \(reason.rawValue)")
-          if reason == .closed { self.room = nil }
+          if reason == .closed {
+            self.room = nil
+            self.agents = nil
+          }
         default: break
         }
       }
