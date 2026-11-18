@@ -77,6 +77,7 @@ architecture.md in the same change.
 | [D38](#d38-a-worker-can-speak-at-another-rate-than-it-hears)         | A worker can speak at another rate than it hears          | Current               |
 | [D39](#d39-an-agent-runs-a-front-end-per-speaker)                    | An agent runs a front end per speaker                     | Current               |
 | [D40](#d40-a-decision-model-hears-each-turn-and-the-agent-may-wait-for-the-floor) | A decision model hears each turn, and the agent may wait for the floor | Current |
+| [D41](#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room) | The app asks the decision model its own questions, and several agents share a room | Current |
 | [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate) | Clients send their offer at the first ICE candidate | Current |
 
 ## Removed code
@@ -917,6 +918,11 @@ reply only if nobody starts talking in that time; otherwise listen. A
 follow-up now also covers the person it's answering before that reply is
 done, since Smart Turn splits "Assistant." from the question after it.
 
+The model also reads follow-ups: one it would listen to (someone the
+assistant just answered turning to the team) gets no reply. Waiting counts
+as replying there, since the speaker was just talking to the assistant,
+and a follow-up with no decision still replies.
+
 Half-cascaded (`backend: %{stt: false}`) runs `vad -> AudioTurns` (Smart
 Turn) per speaker and puts a `Transcriber` in front of the back end's
 context. Audio turns reach the LLM after a `[speaker]` text part; the
@@ -942,6 +948,58 @@ capital of Australia?" group 0.80, answerable 0.87, and in the lab it waited
 on text, starts replies on a confident partial read and drops them if the
 final read disagrees, weights toward whoever was addressed last, and only
 lets a speaker interrupt after two words so a laugh doesn't.
+
+#### D41. The app asks the decision model its own questions, and several agents share a room
+
+**Status:** Current. Steps 1 and 2 of three; the third (one listener for
+all agents) is not built.
+
+**Decision.** `Octoroom.Agent` has two more callbacks. `questions/1`
+returns the decision model's questions (default
+`Octoroom.Agent.default_questions/1`) and `decide/2` turns its answers into
+`:reply`, `:wait` or `:listen` (default `Octoroom.Agent.decide/2`, the D40
+thresholds). `Processors.Decisions` passes the model's raw answers through
+as `decision.answers`, so a question the app adds ("is this about a capital
+city?") reaches the app's `decide/2`. With a decision, a turn that
+says the agent's name goes to `decide/2` too (`turn.named`; the default
+replies), so an agent that only does capitals can turn down "Atlas, what's
+the weather?". A follow-up asks `decide/2` too and only `:listen` turns it
+down.
+A `decide/2` that raises or returns something else logs it and falls back
+to the default, so a bug in the app's rule doesn't restart the agent.
+
+`Octoroom.Agent.agents/2` adds several agents with a roster (`id`, `name`,
+`description`) that each gets as `ctx.roster`. The default questions then
+offer each agent as an addressee by name and description, and ask
+`"answerable_<id>"` for each. (Question and choice names may only use
+`[A-Za-z0-9_-]`: `Octoroom.Agent.question_key/1` cleans ids.) The default decision replies at
+`reply_above` for itself, waits on a maybe only if no other agent is
+likelier, and waits on an open question only if no other agent is better
+placed to answer, so two agents don't both take the floor. A turn naming
+another agent, and not this one, isn't a follow-up for this one. One agent
+alone keeps the old `"assistant"` and `"answerable"` keys.
+
+**Why not one decision per room.** One call per turn for all agents needs
+the agents to share front ends (one VAD, STT and decision call per speaker,
+turns routed to the back end the decision picks), which is a different
+worker shape. Until then each agent asks the same questions about each
+turn: an agent's cost in decision calls is one per turn, and two agents can
+read the same turn slightly differently.
+
+**Evidence.** Against `gemini-decision-1` with phrases from macOS `say`,
+the meet demo's two agents (Assistant, and Atlas with a "capital" question),
+warm calls 430–700 ms: "Does anyone know the capital of Peru?" went to
+Atlas (answerable Atlas 0.91, Assistant 0.09, capital 0.94; Atlas waits,
+Assistant listens). "Atlas, what's the weather like today?": capital 0.10,
+Atlas declines. "Assistant, can you set a reminder for three o'clock?":
+Assistant replies, Atlas listens. "Bob, can you share your screen please?"
+came back addressed to the assistant, so Assistant would wait and reply: a
+miss on synthesized speech.
+
+**Open.** Agents don't hear each other: neither knows what the other said,
+and one speaking doesn't end the other's wait. How many questions
+`gemini-decision-1` takes per call, and whether more slow it down, is
+unmeasured; per-agent `answerable` grows with the roster.
 
 #### D42. Clients send their offer at the first ICE candidate
 

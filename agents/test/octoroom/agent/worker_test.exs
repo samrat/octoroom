@@ -73,6 +73,23 @@ defmodule Octoroom.Agent.WorkerTest do
       do: %{id: call.id, name: call.name, response: %{speaker: ctx.speaker.meta.name}}
   end
 
+  # Answers only questions about capitals: its own question, read by its
+  # own `decide/2`.
+  defmodule CapitalsAgent do
+    use Octoroom.Agent
+
+    @impl true
+    def pipeline(ctx), do: {ctx.args.front_end, ctx.args.back_end}
+
+    @impl true
+    def decide(turn, ctx) do
+      case get_in(turn.decision, [:answers, "capital", "probability"]) do
+        p when p >= 0.6 -> Octoroom.Agent.decide(turn, ctx)
+        _ -> {:listen, :not_about_capitals}
+      end
+    end
+  end
+
   defmodule AgentRoom do
     use Octoroom.Room
 
@@ -88,11 +105,12 @@ defmodule Octoroom.Agent.WorkerTest do
 
         %{meta: %{agent: opts}} = p ->
           hears = Enum.map(room.participants, &mic/1)
+          {module, opts} = Keyword.pop(opts, :module, TestAgent)
 
           [
             Octoroom.Agent.agent(
               "assistant",
-              TestAgent,
+              module,
               [hears: hears, args: p.meta.args] ++ opts
             )
           ]
@@ -501,6 +519,107 @@ defmodule Octoroom.Agent.WorkerTest do
       assert %{outcome: :reply, why: :name} = event(:decision)
       say(ctx, alice, {:final, "What time is it?", decision("group", 0.4, 0.9)})
       assert %{outcome: :reply, why: :follow_up} = event(:decision)
+    end
+
+    test "in the follow-up window, talk aimed at someone else gets no reply", ctx do
+      %{alice: alice} = start(ctx, 200, Map.put(@decision_args, :follow_up_ms, 10_000))
+      say(ctx, alice, {:final, "What time is it?", decision("assistant", 0.85, 0.9)})
+      assert %{outcome: :reply, why: :addressed} = event(:decision)
+      assert_receive {:llm, _}
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant", {:agent, {:follow_up, %{speaker: "Alice"}}}}},
+                     2_000
+
+      say(ctx, alice, {:final, "Bob, can you share your screen?", decision("person", 0.05, 0.3)})
+      assert %{outcome: :listen, why: :not_addressed} = event(:decision)
+      refute_receive {:llm, _}, 400
+
+      say(ctx, alice, {:final, "And in Tokyo?", decision("nobody", 0.3, 0.8)})
+      assert %{outcome: :reply, why: :follow_up} = event(:decision)
+      assert_receive {:llm, _}
+    end
+
+    test "a follow-up with no decision still gets a reply", ctx do
+      %{alice: alice} = start(ctx, 200, Map.put(@decision_args, :follow_up_ms, 10_000))
+      say(ctx, alice, {:final, "Assistant, what time is it?"})
+      assert %{outcome: :reply, why: :name} = event(:decision)
+      assert_receive {:llm, _}
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant", {:agent, {:follow_up, %{speaker: "Alice"}}}}},
+                     2_000
+
+      say(ctx, alice, {:final, "And in Tokyo?"})
+      assert %{outcome: :reply, why: :follow_up} = event(:decision)
+    end
+
+    test "a module's decide/2 reads the answers to its own questions", ctx do
+      %{alice: alice} =
+        start(ctx, 200, %{
+          agent: [module: CapitalsAgent, gate: :decision, thresholds: %{wait_ms: 300}]
+        })
+
+      not_capitals =
+        put_in(decision("assistant", 0.9, 0.9)[:answers], %{"capital" => %{"probability" => 0.1}})
+
+      say(ctx, alice, {:final, "What's the weather like?", not_capitals})
+      assert %{outcome: :listen, why: :not_about_capitals} = event(:decision)
+      refute_receive {:llm, _}, 300
+
+      # Asked by name, it can still say no.
+      say(ctx, alice, {:final, "Assistant, what's the weather like?", not_capitals})
+      assert %{outcome: :listen, why: :not_about_capitals} = event(:decision)
+      refute_receive {:llm, _}, 300
+
+      capitals =
+        put_in(decision("assistant", 0.9, 0.9)[:answers], %{"capital" => %{"probability" => 0.95}})
+
+      say(ctx, alice, {:final, "What's the capital of Peru?", capitals})
+      assert %{outcome: :reply, why: :addressed} = event(:decision)
+      assert_receive {:llm, _}
+    end
+
+    test "with other agents, it answers what's for it and leaves the rest", ctx do
+      roster = [%{id: "assistant", name: "Assistant"}, %{id: "atlas", name: "Atlas"}]
+      %{alice: alice} = start(ctx, 200, Map.put(@decision_args, :roster, roster))
+
+      for_atlas = %{addressee: "atlas", probabilities: %{"atlas" => 0.85, "assistant" => 0.1}}
+      say(ctx, alice, {:final, "What's the capital of Peru?", for_atlas})
+      assert %{outcome: :listen} = event(:decision)
+
+      # An open question goes to whichever agent is likelier to answer it.
+      open = fn mine, theirs ->
+        %{
+          addressee: "group",
+          probabilities: %{"atlas" => 0.1, "assistant" => 0.1},
+          answers: %{
+            "answerable_assistant" => %{"probability" => mine},
+            "answerable_atlas" => %{"probability" => theirs}
+          }
+        }
+      end
+
+      say(ctx, alice, {:final, "Anyone know the capital of Peru?", open.(0.75, 0.95)})
+      assert %{outcome: :listen} = event(:decision)
+      say(ctx, alice, {:final, "Anyone free on Friday?", open.(0.9, 0.2)})
+      assert %{outcome: :wait, why: :open_question} = event(:decision)
+    end
+
+    test "naming another agent isn't a follow-up", ctx do
+      roster = [%{id: "assistant", name: "Assistant"}, %{id: "atlas", name: "Atlas"}]
+      args = @decision_args |> Map.put(:roster, roster) |> Map.put(:follow_up_ms, 10_000)
+      %{alice: alice} = start(ctx, 200, args)
+      say(ctx, alice, {:final, "Assistant, what time is it?"})
+      assert %{outcome: :reply, why: :name} = event(:decision)
+      assert_receive {:llm, _}
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant", {:agent, {:follow_up, %{speaker: "Alice"}}}}},
+                     2_000
+
+      say(ctx, alice, {:final, "Atlas, and the capital of Peru?"})
+      assert %{outcome: :listen, why: :named_other} = event(:decision)
     end
 
     test "with no decision (a failed or slow call) only the name counts", ctx do

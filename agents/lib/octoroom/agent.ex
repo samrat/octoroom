@@ -32,9 +32,45 @@ defmodule Octoroom.Agent do
         end
       end
 
-  Every callback gets `ctx`: `room_id`, `agent_id`, `participants` (when
-  the agent started), `resumed` (see `Octoroom.Worker.Context`) and `args`
-  (from `agent/3`). All callbacks are optional.
+  Every callback gets `ctx`: `room_id`, `agent_id`, `name`, `participants`
+  (when the agent started), `resumed` (see `Octoroom.Worker.Context`),
+  `args` (from `agent/3`) and `roster` (the agents in the room, see
+  `agents/2`). All callbacks are optional.
+
+  ## Deciding to answer
+
+  With `gate: :decision`, each turn's audio goes to a decision model with
+  `questions/1`, and `decide/2` reads the answers. The defaults ask who the
+  speaker is talking to (each agent by name, a person, the group, nobody)
+  and whether the agent could answer, and reply, wait or listen by the
+  agent's `:thresholds`. Override either to ask about something else:
+
+      @impl true
+      def questions(ctx) do
+        Map.put(Octoroom.Agent.default_questions(ctx), "capital", %{
+          type: :boolean,
+          instructions: "Is this a question about a capital city?"
+        })
+      end
+
+      @impl true
+      def decide(turn, ctx) do
+        if get_in(turn.decision.answers, ["capital", "probability"]) >= 0.6,
+          do: Octoroom.Agent.decide(turn, ctx),
+          else: {:listen, :not_about_capitals}
+      end
+
+  `turn.named` says the turn used the agent's name; the default replies to
+  it, and a `decide/2` like the one above can still say no. Follow-ups are
+  checked first, and only `:listen` turns one down (see
+  `Octoroom.Agent.Worker`).
+
+  ## Several agents
+
+  `agents/2` adds several to a room. Each knows the others (`ctx.roster`),
+  so the decision model is asked which of them a turn is for, by name and
+  `:description`, and an open question goes to the one best placed to
+  answer it.
 
   An agent runs as an `Octoroom.Agent.Worker`; its moduledoc has the
   details of turn-taking and the events it emits.
@@ -86,6 +122,25 @@ defmodule Octoroom.Agent do
   """
   @callback pipeline(ctx) :: {Spec.t(), Spec.t()} | nil
 
+  @doc """
+  The questions for the decision model, as for `ReqLLM.evaluate/4` (with
+  `gate: :decision`). Default: `default_questions/1`.
+  """
+  @callback questions(ctx) :: map
+
+  @doc """
+  Whether to answer a turn, from the decision model's answers (with
+  `gate: :decision`). `turn` has `speaker`, `source`, `text` (nil for a
+  half-cascaded turn), `named` (it says this agent's name) and `decision`,
+  whose `answers` are the model's raw answers by question. `ctx` also has
+  `thresholds`.
+
+  `:wait` holds the turn for `wait_ms` and replies if nobody speaks. A bare
+  outcome is reported with why `:decided`. Default: `decide/2`.
+  """
+  @callback decide(turn :: map, ctx) ::
+              :reply | :wait | :listen | {:reply | :wait | :listen, why :: term}
+
   defmacro __using__(_opts) do
     quote do
       @behaviour Octoroom.Agent
@@ -105,12 +160,33 @@ defmodule Octoroom.Agent do
       @impl Octoroom.Agent
       def pipeline(_ctx), do: nil
 
-      defoverridable instructions: 1, tools: 1, backend: 1, initial_text: 1, pipeline: 1
+      @impl Octoroom.Agent
+      def questions(ctx), do: Octoroom.Agent.default_questions(ctx)
+
+      @impl Octoroom.Agent
+      def decide(turn, ctx), do: Octoroom.Agent.decide(turn, ctx)
+
+      defoverridable instructions: 1,
+                     tools: 1,
+                     backend: 1,
+                     initial_text: 1,
+                     pipeline: 1,
+                     questions: 1,
+                     decide: 2
     end
   end
 
   # Options passed through to `Octoroom.Agent.Worker` as they are.
-  @worker_opts [:name, :respond, :gate, :thresholds, :decisions, :follow_up_ms]
+  @worker_opts [
+    :name,
+    :description,
+    :roster,
+    :respond,
+    :gate,
+    :thresholds,
+    :decisions,
+    :follow_up_ms
+  ]
 
   @doc """
   A worker spec for an agent, for a room's `workers/1`.
@@ -122,6 +198,8 @@ defmodule Octoroom.Agent do
       reply. Default `:always` with one input, `:addressed` with more.
     * `name:` - what people call it, which `:addressed` listens for.
       Default: the id.
+    * `description:` - what it's for ("answers questions about capital
+      cities"), told to the decision model so it can tell agents apart.
     * `voice:` - `false` for an agent that listens and calls tools but
       never speaks (no text-to-speech, no output track). Default `true`.
     * `args:` - passed to the callbacks as `ctx.args`. Changing it
@@ -159,6 +237,163 @@ defmodule Octoroom.Agent do
       args: worker_args
     )
   end
+
+  @doc """
+  Worker specs for several agents in one room, each `{id, module, opts}`
+  as for `agent/3`, with `shared` options merged under each agent's own:
+
+      agents(
+        [
+          {"assistant", MyApp.Assistant, name: "Assistant"},
+          {"atlas", MyApp.Atlas, name: "Atlas", description: "Answers questions about capital cities."}
+        ],
+        hears: Enum.map(room.participants, &mic/1),
+        gate: :decision
+      )
+
+  Each agent gets the roster (`ctx.roster`: `id`, `name` and `description`
+  of every agent), so the decision model is asked which of them a turn is
+  for, and whether each could answer it. Each agent still makes its own
+  decision call per turn.
+
+  A turn that says another agent's name, and not this one's, isn't a
+  follow-up for this one.
+  """
+  def agents(specs, shared \\ []) when is_list(specs) and is_list(shared) do
+    roster =
+      for {id, _module, opts} <- specs do
+        opts = Keyword.merge(shared, opts)
+        %{id: id, name: Keyword.get(opts, :name, id), description: opts[:description]}
+      end
+
+    for {id, module, opts} <- specs,
+        do: agent(id, module, shared |> Keyword.merge(opts) |> Keyword.put(:roster, roster))
+  end
+
+  # -- The decision gate's defaults
+
+  @doc """
+  The decision model's default questions for an agent: `"addressee"`, a
+  choice of who the speaker is talking to (each agent in `ctx.roster` by
+  id, `"person"`, `"group"` or `"nobody"`), and whether the agent could
+  answer: `"answerable"` when it's the only agent, or
+  `"answerable_<key>"` for each agent when there are several, where `key`
+  is `question_key/1` of its id (the API takes only `[A-Za-z0-9_-]` in
+  question and choice names).
+  """
+  def default_questions(ctx) do
+    roster = roster(ctx)
+    names = roster |> Enum.map(& &1.name) |> Enum.join(", ")
+
+    agents =
+      Map.new(roster, fn a ->
+        {question_key(a.id), "#{a.name}, an AI assistant in the call.#{about(a)}"}
+      end)
+
+    addressee = %{
+      type: :choice,
+      instructions:
+        "This is one turn from a group voice call that includes " <>
+          if(length(roster) == 1,
+            do: "an AI assistant, #{names}. ",
+            else: "AI assistants: #{names}. "
+          ) <>
+          "Who is the speaker talking to?",
+      criteria:
+        Map.merge(agents, %{
+          "person" => "A specific other person in the call.",
+          "group" => "Everyone in the call, or no one in particular.",
+          "nobody" => "Nobody: thinking aloud, a remark, or a statement."
+        })
+    }
+
+    answerable =
+      case roster do
+        [a] ->
+          %{"answerable" => answerable_question(a)}
+
+        many ->
+          Map.new(many, &{"answerable_#{question_key(&1.id)}", answerable_question(&1)})
+      end
+
+    Map.put(answerable, "addressee", addressee)
+  end
+
+  defp answerable_question(agent) do
+    %{
+      type: :boolean,
+      instructions:
+        "Is this a question or request that #{agent.name}, an AI assistant, " <>
+          "should answer right now?#{about(agent)}"
+    }
+  end
+
+  defp about(%{description: d}) when is_binary(d) and d != "", do: " " <> d
+  defp about(_agent), do: ""
+
+  @doc """
+  The default decision: reply when the turn says the agent's name, and
+  otherwise, with `ctx.thresholds` (see `Octoroom.Agent.Worker`),
+
+    * reply when the model gives this agent at least `reply_above`;
+    * wait from `wait_above`, if no other agent is more likely;
+    * wait on an open question (to the group or nobody) that this agent is
+      at least `answer_above` likely to answer, and no other agent more so;
+    * otherwise listen.
+  """
+  def decide(%{named: true}, _ctx), do: {:reply, :name}
+
+  def decide(%{decision: d}, ctx) do
+    t = ctx.thresholds
+    me = ctx.agent_id
+    roster = roster(ctx)
+    probabilities = d[:probabilities] || %{}
+    # A single agent's choice may be the old "assistant", whatever its id.
+    assistant =
+      probabilities[question_key(me)] || (length(roster) == 1 && probabilities["assistant"]) ||
+        0.0
+
+    answerable = answerable(d, me, roster)
+
+    others = for a <- roster, a.id != me, do: a.id
+    likeliest? = Enum.all?(others, &((probabilities[question_key(&1)] || 0.0) <= assistant))
+    best_placed? = Enum.all?(others, &(answerable(d, &1, roster) <= answerable))
+
+    cond do
+      assistant >= t.reply_above ->
+        {:reply, :addressed}
+
+      assistant >= t.wait_above and likeliest? ->
+        {:wait, :maybe_addressed}
+
+      d[:addressee] in ["group", "nobody"] and answerable >= t.answer_above and best_placed? ->
+        {:wait, :open_question}
+
+      true ->
+        {:listen, :not_addressed}
+    end
+  end
+
+  defp answerable(d, id, roster) do
+    answers = d[:answers] || %{}
+
+    case get_in(answers, ["answerable_#{question_key(id)}", "probability"]) do
+      p when is_number(p) -> p
+      _ when length(roster) <= 1 -> d[:answerable] || 0.0
+      _ -> 0.0
+    end
+  end
+
+  @doc """
+  An agent id as the decision model's questions and choices name it: up to
+  64 of `[A-Za-z0-9_-]`, anything else becoming `_`.
+  """
+  def question_key(id), do: id |> String.replace(~r/[^A-Za-z0-9_-]/, "_") |> String.slice(0, 50)
+
+  defp roster(%{roster: [_ | _] = roster}), do: roster
+
+  defp roster(ctx),
+    do: [%{id: ctx.agent_id, name: Map.get(ctx, :name, ctx.agent_id), description: nil}]
 
   @doc """
   Speaks `text` now, word for word, interrupting whatever the agent is
