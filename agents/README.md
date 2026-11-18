@@ -65,7 +65,7 @@ Speech-to-text and text-to-speech go through two small behaviours,
 the provider fills in its own defaults:
 
 ```elixir
-def backend(_ctx), do: %{stt: "soniox:stt-rt-v5", tts: "inworld:inworld-tts-2"}
+def backend(_ctx), do: %{stt: "soniox:stt-rt-v6", tts: "inworld:inworld-tts-2"}
 ```
 
 Built in: STT from Soniox (`soniox`, the default) and AssemblyAI

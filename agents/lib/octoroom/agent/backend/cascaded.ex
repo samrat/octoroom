@@ -6,7 +6,7 @@ defmodule Octoroom.Agent.Backend.Cascaded do
 
   `speech_to_text` and `text_to_speech` take the options of
   `Octoroom.Agent.STT` and `Octoroom.Agent.TTS`, or just a
-  `"provider:model"` string: `%{stt: "soniox:stt-rt-v5", tts: "inworld"}`.
+  `"provider:model"` string: `%{stt: "soniox:stt-rt-v6", tts: "inworld"}`.
   The provider's own defaults fill in the rest.
   """
 
@@ -265,7 +265,7 @@ defmodule Octoroom.Agent.Backend.Cascaded do
     |> Map.merge(config)
   end
 
-  # `%{model: "soniox:stt-rt-v5"}` names the provider; `"soniox"` becomes
+  # `%{model: "soniox:stt-rt-v6"}` names the provider; `"soniox"` becomes
   # `:soniox`.
   defp speech_provider(config, registry) do
     config = SpeechProvider.split_model(config, registry)
