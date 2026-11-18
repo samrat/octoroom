@@ -36,6 +36,14 @@ defmodule Octoroom.WorkerTest do
 
     def handle_info({:play, pcm}, s), do: {:ok, s, play: {:default, pcm}}
     def handle_info({:emit, event}, s), do: {:ok, s, emit: event}
+    def handle_info({:do, actions}, s), do: {:ok, s, actions}
+
+    def handle_info({:octoroom, kind, _pid, _output} = msg, {test, _} = s)
+        when kind in [:subscribed, :unsubscribed] do
+      send(test, {:worker_info, self(), msg})
+      {:ok, s}
+    end
+
     def handle_info(_msg, s), do: {:ok, s}
 
     @impl true
@@ -266,6 +274,40 @@ defmodule Octoroom.WorkerTest do
 
     assert hears["alice"] == Enum.sort([echo, "#{bob.id}/mic"])
     assert hears["bob"] == [alice_mic]
+  end
+
+  test "a worker is seen once its audio output's pull is open, and only there", ctx do
+    %{alice: alice, worker_id: worker_id, echo: echo} = live_echo(ctx)
+    alice_id = alice.id
+
+    assert_receive {:client, "alice",
+                    {:octoroom_signal, :worker,
+                     %{op: :added, worker: %{id: ^worker_id, outputs: [^echo], state: nil}}}}
+
+    assert_receive {:worker_info, _, {:octoroom, :subscribed, ^alice_id, ^echo}}
+
+    bob = join(ctx, "bob", EchoRoom) |> then(&publish(ctx, &1))
+    accept_pull(bob)
+    accept_pull(alice)
+
+    :ok =
+      Octoroom.Worker.send(
+        ctx.room_id,
+        worker_id,
+        {:do, [presence: %{state: "speaking"}, notify: {:default, "level", %{db: -20}}]}
+      )
+
+    assert_receive {:client, "alice",
+                    {:octoroom_signal, :worker,
+                     %{op: :updated, worker: %{id: ^worker_id, state: "speaking"}}}}
+
+    assert_receive {:client, "alice",
+                    {:octoroom_signal, :worker_event,
+                     %{worker: ^worker_id, output: ^echo, type: "level", data: %{db: -20}}}}
+
+    # Bob doesn't hear the echo, so he never learns of it.
+    refute_receive {:client, "bob", {:octoroom_signal, :worker, _}}, 100
+    refute_received {:client, "bob", {:octoroom_signal, :worker_event, _}}
   end
 
   test "turning a worker off stops it and its peer", ctx do
