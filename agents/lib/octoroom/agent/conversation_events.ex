@@ -2,8 +2,12 @@ defmodule Octoroom.Agent.ConversationEvents do
   @moduledoc """
   Accumulates observed text and emits finalized conversation items to the owner.
 
-  `:completed` means text generation/transcription completed, not audio playback.
-  Interrupted/failed items contain only text observed before that boundary.
+  An assistant reply that's spoken is emitted twice with the same
+  `message_id`: `:playing` when its text is done and its audio is playing,
+  then `:completed` once it played to the end, or `:interrupted` with only
+  the words that were heard. Without TTS, `:completed` means the text is
+  done. Interrupted/failed items contain only text observed before that
+  boundary.
   This event ledger is separate from the model's history and does not persist it.
   """
 
@@ -79,6 +83,29 @@ defmodule Octoroom.Agent.ConversationEvents do
           interrupted: status == :interrupted
         })
         |> Map.merge(extra)
+
+      send(state.owner, {:voice_pipeline, self(), {:conversation, item}})
+    end
+
+    state
+  end
+
+  @doc """
+  Emits a reserved item, or a new version of one already emitted (same
+  `message_id` and `sequence`), even with empty text: an assistant reply
+  shown as `:playing` and then cut off before any of it was heard.
+  """
+  def update_reserved(state, role, reservation, text, status)
+      when role in [:user, :assistant] and status in [:playing, :completed, :interrupted, :failed] do
+    if is_pid(Map.get(state, :owner)) do
+      item =
+        Map.merge(reservation, %{
+          type: "conversation_item_added",
+          role: Atom.to_string(role),
+          text: text,
+          status: Atom.to_string(status),
+          interrupted: status == :interrupted
+        })
 
       send(state.owner, {:voice_pipeline, self(), {:conversation, item}})
     end

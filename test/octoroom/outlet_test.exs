@@ -60,7 +60,10 @@ defmodule Octoroom.OutletTest do
     connect(ctx)
     Outlet.play(ctx.room_id, "out", frames(50))
     assert_receive {:octoroom_pcm, _}
-    Outlet.flush(ctx.room_id, "out")
+    # 50 frames queued, one or two already sent.
+    dropped_ms = Outlet.flush(ctx.room_id, "out")
+    assert dropped_ms >= 900 and dropped_ms < 1_000
+    assert Outlet.flush(ctx.room_id, "nobody") == nil
     # At most a frame or two already due go out (the test may be slow to flush).
     assert length(collect(100)) <= 2
     assert %{queued_ms: 0} = Outlet.stats(ctx.room_id, "out")

@@ -1,9 +1,9 @@
 defmodule Call.Agent do
   @moduledoc """
   The call assistant's settings, kept in the room's `:agent` assign so
-  everyone in the room shares them, and how they become
-  `Octoroom.Agent.Worker` args. Changing them restarts the assistant (new
-  args), which starts its conversation afresh.
+  everyone in the room shares them, and how they become `agent/3` options
+  for `Call.Assistant`. Changing them restarts the assistant (new args),
+  which starts its conversation afresh.
   """
 
   @defaults %{
@@ -18,25 +18,17 @@ defmodule Call.Agent do
     wait_s: 2.5
   }
 
-  @instructions "You are the assistant in a group voice call. Each line from the call starts " <>
-                  "with the speaker's name in brackets. People mostly talk to each other; you " <>
-                  "only answer when someone addresses you, or when a question is left open " <>
-                  "that you can answer. Your replies are spoken aloud: keep them to a sentence " <>
-                  "or two, with no markdown, and don't start with a name tag."
-
   def defaults, do: @defaults
 
   @doc "The settings in a room's assigns, over the defaults."
   def config(assigns), do: Map.merge(@defaults, Map.get(assigns, :agent) || %{})
 
-  @doc "`Octoroom.Agent.Worker` args for `config`."
-  def args(config) do
-    %{
+  @doc "`Octoroom.Agent.agent/3` options for `config` (`Call.Assistant` reads `args`)."
+  def opts(config) do
+    [
       name: "Assistant",
       # Even alone in the call, so it behaves the same with one person or ten.
       respond: :addressed,
-      instructions: @instructions,
-      backend: if(config.pipeline == :half, do: %{stt: false}, else: %{}),
       gate: config.gate,
       follow_up_ms: round(config.follow_up_s * 1_000),
       thresholds: %{
@@ -44,8 +36,9 @@ defmodule Call.Agent do
         wait_above: config.wait_above,
         answer_above: config.answer_above,
         wait_ms: round(config.wait_s * 1_000)
-      }
-    }
+      },
+      args: %{pipeline: config.pipeline}
+    ]
   end
 
   @doc "Settings from the lab's form; anything unexpected keeps its current value."
@@ -220,16 +213,29 @@ defmodule Call.LabLive do
     end
   end
 
+  # A spoken reply comes as "playing" first, then again (same message_id)
+  # once it's known how much of it was heard.
   defp agent_event(socket, {:conversation, %{role: "assistant"} = item}) do
-    entry = %{
-      kind: :reply,
-      text: item.text,
-      status: item.status,
-      latency: socket.assigns.pending_latency,
-      browser_ms: nil
-    }
+    id = Map.get(item, :message_id)
+    feed = socket.assigns.feed
 
-    socket |> assign(pending_latency: nil) |> push(entry)
+    case Enum.find_index(feed, &(&1.kind == :reply and id != nil and &1.message_id == id)) do
+      nil ->
+        entry = %{
+          kind: :reply,
+          message_id: id,
+          text: item.text,
+          status: item.status,
+          latency: socket.assigns.pending_latency,
+          browser_ms: nil
+        }
+
+        socket |> assign(pending_latency: nil) |> push(entry)
+
+      i ->
+        update = &%{&1 | text: item.text, status: item.status}
+        assign(socket, feed: List.update_at(feed, i, update))
+    end
   end
 
   defp agent_event(socket, {:latency, latency}), do: assign(socket, pending_latency: latency)
@@ -245,6 +251,10 @@ defmodule Call.LabLive do
     do: socket |> assign(follow_up: %{speaker: speaker, until: now() + ms}) |> start_ticking()
 
   defp agent_event(socket, _event), do: socket
+
+  defp status_note("playing"), do: " (speaking…)"
+  defp status_note("interrupted"), do: " (interrupted)"
+  defp status_note(_status), do: ""
 
   defp push(socket, entry),
     do: assign(socket, feed: Enum.take(socket.assigns.feed ++ [entry], -@feed_size))
@@ -498,7 +508,7 @@ defmodule Call.LabLive do
             <% else %>
               <div>
                 <span class="who">Assistant:</span>
-                {e.text}{if e.status == "interrupted", do: " (interrupted)"}
+                {e.text}{status_note(e.status)}
               </div>
               <div :if={e.latency || e.browser_ms} class="latency">
                 {latency(e.latency)}{if e.browser_ms, do: " · heard in browser #{e.browser_ms} ms"}

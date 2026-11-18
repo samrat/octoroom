@@ -82,6 +82,10 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     spoken = harness |> Harness.outputs(Frames.OutputAudio) |> Enum.map(& &1.audio)
     assert spoken == ["audio:Let me check.", "audio:It's sunny."]
 
+    # The reply goes into the history once its audio has played.
+    refute {:text, "Let me check. It's sunny."} in Harness.notifications(harness)
+    harness = Harness.fire_timer(harness, :collector, :played)
+
     notices = Harness.notifications(harness)
     assert {:transcription, %{status: "partial", text: "what's the"}} in notices
     assert {:transcription, %{status: "final", text: "What's the weather?"}} in notices
@@ -99,7 +103,7 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     assert List.last(history) == %{role: "assistant", content: "Let me check. It's sunny."}
   end
 
-  test "barge-in kills the reply and records what was said" do
+  test "barge-in before any audio kills the reply, and nothing was said" do
     backend = Backend.Cascaded.new(%{stt: %{provider: :soniox}})
 
     harness =
@@ -124,9 +128,12 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
 
     assert Harness.pending_tasks(harness) == []
 
-    assert_received {:voice_pipeline, _,
-                     {:conversation,
-                      %{role: "assistant", text: "Once upon", status: "interrupted"}}}
+    # The LLM wrote "Once upon", but none of it was spoken.
+    refute_received {:voice_pipeline, _, {:conversation, %{role: "assistant"}}}
+
+    assert Harness.state(harness, :context).history == [
+             %{role: "user", content: "Tell me a story."}
+           ]
   end
 
   test "a when_idle result waits until the reply is done" do

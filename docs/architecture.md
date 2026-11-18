@@ -679,7 +679,8 @@ forwards each track unchanged.
 
 # actions
 play: {output, pcm}      # queued on the outlet, paced to real time; :default is the first output
-flush: output            # drop queued, unplayed audio (barge-in)
+flush: output            # drop queued, unplayed audio (barge-in); the worker then gets
+                         # {:octoroom, :flushed, output, dropped_ms} in handle_info/2
 emit: event              # broadcast {:worker_event, worker_id, event} to the room's subscribers
 ```
 
@@ -732,7 +733,8 @@ media gets:
 - **An outlet per output** (`Octoroom.Outlet`). It queues the worker's PCM
   and sends one 20 ms Opus frame per 20 ms tick, and nothing when the queue
   is empty. `flush` empties the queue, so at most one frame plus the network
-  is already on its way. Audio that comes due before the connection is up is
+  is already on its way, and tells the worker how many ms it dropped: an
+  agent uses that to know how much of its reply was heard. Audio that comes due before the connection is up is
   dropped, as a live stream would be. The clock stops when the queue runs
   dry; a lag over 100 ms restarts it rather than sending a burst. The first
   packet sent tells the room server the track is live.

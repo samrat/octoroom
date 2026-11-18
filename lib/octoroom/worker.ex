@@ -38,6 +38,10 @@ defmodule Octoroom.Worker do
       paced to real time, so a worker can hand over audio faster than it
       plays. `:default` is the worker's first output.
     * `flush: output`: drop that output's queued, unplayed audio (barge-in).
+      The worker then gets `handle_info({:octoroom, :flushed, output,
+      dropped_ms}, state)`: how many ms of audio were dropped (nil if the
+      output's outlet wasn't running), so what it queued minus `dropped_ms`
+      is what listeners heard, give or take the frame on its way.
     * `emit: event`: broadcast `{:worker_event, worker_id, event}` to the
       room's subscribers (see `Octoroom.subscribe/1`).
 
