@@ -5,8 +5,9 @@ defmodule Meet.Room do
   and Atlas, who only answers questions about capital cities.
 
   Both hear every mic and everyone hears both. Each uses a decision model
-  (`gate: :decision`) on each turn's audio to tell whether it's being
-  talked to, so nobody has to say their names. The model is told who they
+  (`gate: :decision`, Cloudflare's Clef Flash through OpenRouter) on each
+  turn's transcript to tell whether it's being talked to, so nobody has to
+  say their names. The model is told who they
   are (`name:` and `description:`), so it can tell them apart.
   """
   use Octoroom.Room
@@ -14,9 +15,7 @@ defmodule Meet.Room do
 
   @agents [
     {"assistant", Meet.Assistant,
-     name: "Assistant",
-     description:
-       "A general assistant for the team."},
+     name: "Assistant", description: "A general assistant for the team."},
     {"atlas", Meet.Atlas,
      name: "Atlas", description: "Answers questions about geography, and nothing else."}
   ]
@@ -42,9 +41,10 @@ defmodule Meet.Room do
       hears: Enum.map(room.participants, &mic/1),
       respond: :addressed,
       gate: :decision,
-      # The model usually answers in about a second, but can take more:
-      # wait up to 3 s so every turn in the transcript gets its tags.
-      decisions: [max_wait_ms: 3_000]
+      # Clef Flash judges the final transcript, so its call adds to every
+      # turn's latency; it usually answers in under a second. A turn it
+      # hasn't answered after 1.5 s goes on without tags.
+      decisions: [model: "openrouter:cloudflare/clef-flash", max_wait_ms: 1_500]
     )
   end
 
