@@ -72,12 +72,17 @@ defmodule Octoroom.StoreTest do
       Store.put(ctx.store, :rooms, "old", %{run: "r", assigns: %{}, updated_at: 0})
       Store.put(ctx.store, :rooms, "recent", %{run: "r", assigns: %{}, updated_at: Store.now()})
       Store.put(ctx.store, :rooms, "running", %{run: "r", assigns: %{}, updated_at: 0})
+      Store.put(ctx.store, :workers, {"old", "agent"}, :memory)
+      Store.put(ctx.store, :workers, {"recent", "agent"}, :memory)
       run_of = fn room -> if room == "running", do: "r" end
 
       assert %{deleted_rooms: ["old"]} = Janitor.sweep(store: ctx.store, run_of: run_of)
 
       assert ctx.store |> Store.all(:rooms) |> Enum.map(&elem(&1, 0)) |> Enum.sort() ==
                ["recent", "running"]
+
+      # And what the old room's workers saved.
+      assert Store.all(ctx.store, :workers) == [{{"recent", "agent"}, :memory}]
     end
   end
 

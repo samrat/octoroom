@@ -25,7 +25,12 @@ defmodule Octoroom.Agent.Processors.Context do
     * `Start` - after `initial_delay_ms`, the agent's `initial_text` starts a
       turn
 
-  It also emits the owner's conversation events (`Octoroom.Agent.ConversationEvents`).
+  It also emits the owner's conversation events (`Octoroom.Agent.ConversationEvents`),
+  and sends the owner `{:voice_pipeline, pid, {:memory, memory}}` whenever
+  what's worth keeping changes: `%{history: messages, conversation: %{id,
+  sequence}}`, the history without replies still to come or turns still
+  audio. The worker saves it, and a context started with `saved:` (in its
+  runner context) carries on from it.
 
   Options (each defaults to the runner context's value): `:instructions`,
   `:initial_text`, `:tools`; plus `:max_tool_rounds` (4), `:max_history` (20),
@@ -46,38 +51,78 @@ defmodule Octoroom.Agent.Processors.Context do
 
   @impl true
   def init(opts, ctx) do
-    {:ok,
-     %{
-       instructions: Keyword.get(opts, :instructions, Map.get(ctx, :instructions)),
-       initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
-       tools: Keyword.get(opts, :tools, Map.get(ctx, :tools, [])),
-       max_tool_rounds: Keyword.get(opts, :max_tool_rounds, 4),
-       max_history: Keyword.get(opts, :max_history, 20),
-       initial_delay_ms: Keyword.get(opts, :initial_delay_ms, 100),
-       history: [],
-       input: [],
-       rounds_left: 0,
-       audio_turns: %{},
-       # The map `Octoroom.Agent.ConversationEvents` works on.
-       events: %{owner: Map.get(ctx, :owner), conversation_events: ConversationEvents.new()}
-     }}
+    saved = Map.get(ctx, :saved) || %{}
+
+    events =
+      case saved do
+        %{conversation: %{id: id, sequence: sequence}} ->
+          %{ConversationEvents.new() | id: id, sequence: sequence}
+
+        _ ->
+          ConversationEvents.new()
+      end
+
+    state = %{
+      instructions: Keyword.get(opts, :instructions, Map.get(ctx, :instructions)),
+      initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      tools: Keyword.get(opts, :tools, Map.get(ctx, :tools, [])),
+      max_tool_rounds: Keyword.get(opts, :max_tool_rounds, 4),
+      max_history: Keyword.get(opts, :max_history, 20),
+      initial_delay_ms: Keyword.get(opts, :initial_delay_ms, 100),
+      history: Map.get(saved, :history, []),
+      input: [],
+      rounds_left: 0,
+      audio_turns: %{},
+      # The map `Octoroom.Agent.ConversationEvents` works on.
+      events: %{owner: Map.get(ctx, :owner), conversation_events: events},
+      # The last memory sent to the owner.
+      memory: nil
+    }
+
+    {:ok, %{state | memory: memory(state)}}
   end
 
   @impl true
-  def handle_frame(%Frames.Start{} = frame, :downstream, %{initial_text: text} = state)
-      when is_binary(text) and text != "",
-      do: {[{:push, frame, :downstream}, {:timer, :initial_text, state.initial_delay_ms}], state}
+  def handle_frame(frame, direction, state), do: frame |> frame(direction, state) |> remember()
 
-  def handle_frame(
-        %Frames.Transcription{turn_id: turn_id, text: text} = frame,
-        :downstream,
-        state
-      )
-      when is_map_key(state.audio_turns, turn_id),
-      do: audio_transcript(frame, text, state)
+  @impl true
+  def handle_timer(key, state), do: key |> timer(state) |> remember()
 
-  def handle_frame(%Frames.Transcription{text: text} = frame, :downstream, state)
-      when text != "" do
+  # What a restarted agent needs to carry on, sent to the owner when it
+  # changes.
+  defp remember({effects, state}) do
+    case memory(state) do
+      same when same == state.memory ->
+        {effects, state}
+
+      memory ->
+        owner = state.events.owner
+        if is_pid(owner), do: send(owner, {:voice_pipeline, self(), {:memory, memory}})
+        {effects, %{state | memory: memory}}
+    end
+  end
+
+  defp memory(state) do
+    %{
+      history: Enum.reject(state.history, &(pending?(&1) or Map.has_key?(&1, :audio_turn_id))),
+      conversation: Map.take(state.events.conversation_events, [:id, :sequence])
+    }
+  end
+
+  defp frame(%Frames.Start{} = frame, :downstream, %{initial_text: text} = state)
+       when is_binary(text) and text != "",
+       do: {[{:push, frame, :downstream}, {:timer, :initial_text, state.initial_delay_ms}], state}
+
+  defp frame(
+         %Frames.Transcription{turn_id: turn_id, text: text} = frame,
+         :downstream,
+         state
+       )
+       when is_map_key(state.audio_turns, turn_id),
+       do: audio_transcript(frame, text, state)
+
+  defp frame(%Frames.Transcription{text: text} = frame, :downstream, state)
+       when text != "" do
     extra = if frame.speaker, do: %{speaker: frame.speaker, source: frame.source}, else: %{}
 
     state =
@@ -94,7 +139,7 @@ defmodule Octoroom.Agent.Processors.Context do
       else: {[], %{state | history: append(state.history, message, state)}}
   end
 
-  def handle_frame(%Frames.UserAudio{} = frame, :downstream, state) do
+  defp frame(%Frames.UserAudio{} = frame, :downstream, state) do
     {events, reservation} = ConversationEvents.reserve(state.events)
     turn = %{reservation: reservation, speaker: frame.speaker, source: frame.source}
 
@@ -111,13 +156,13 @@ defmodule Octoroom.Agent.Processors.Context do
       else: {[], %{state | history: append(state.history, message, state)}}
   end
 
-  def handle_frame(%Frames.Prompt{text: text}, :downstream, state) when is_binary(text) do
+  defp frame(%Frames.Prompt{text: text}, :downstream, state) when is_binary(text) do
     message = %{role: "user", content: "[From the app, not said by anyone on the call] " <> text}
     {effects, state} = start_turn(message, state)
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end
 
-  def handle_frame(%Frames.ToolResults{messages: messages}, :upstream, state) do
+  defp frame(%Frames.ToolResults{messages: messages}, :upstream, state) do
     input = state.input ++ messages
 
     if state.rounds_left > 0 do
@@ -132,7 +177,7 @@ defmodule Octoroom.Agent.Processors.Context do
   # The reply's text is done and its audio is playing: requests that start
   # meanwhile include it, and the app sees it now, marked `playing`, in its
   # place among the turns. Its `AssistantMessage` updates both.
-  def handle_frame(%Frames.AssistantDraft{text: text}, :upstream, state) do
+  defp frame(%Frames.AssistantDraft{text: text}, :upstream, state) do
     case Enum.find_index(state.history, &(&1 == @reply_pending)) do
       nil ->
         {[], state}
@@ -148,7 +193,7 @@ defmodule Octoroom.Agent.Processors.Context do
     end
   end
 
-  def handle_frame(%Frames.AssistantMessage{} = message, :upstream, state) do
+  defp frame(%Frames.AssistantMessage{} = message, :upstream, state) do
     status = if message.interrupted?, do: :interrupted, else: :completed
     text = message.text || ""
 
@@ -181,25 +226,24 @@ defmodule Octoroom.Agent.Processors.Context do
     {notices, %{state | history: history}}
   end
 
-  def handle_frame(
-        %Frames.AsyncToolResult{result: %{scheduling: :silent} = result},
-        :upstream,
-        state
-      ) do
+  defp frame(
+         %Frames.AsyncToolResult{result: %{scheduling: :silent} = result},
+         :upstream,
+         state
+       ) do
     Logger.info("ASYNC_TOOL_RESULT name=#{result.name} scheduling=silent")
     {[], %{state | history: append(state.history, async_result_message(result), state)}}
   end
 
-  def handle_frame(%Frames.AsyncToolResult{result: result}, :upstream, state) do
+  defp frame(%Frames.AsyncToolResult{result: result}, :upstream, state) do
     Logger.info("ASYNC_TOOL_RESULT name=#{result.name} scheduling=#{result.scheduling} speaking")
     {effects, state} = start_turn(async_result_message(result), state)
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end
 
-  def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
+  defp frame(frame, direction, state), do: {[{:push, frame, direction}], state}
 
-  @impl true
-  def handle_timer(:initial_text, state) do
+  defp timer(:initial_text, state) do
     {effects, state} = start_turn(%{role: "user", content: state.initial_text}, state)
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end

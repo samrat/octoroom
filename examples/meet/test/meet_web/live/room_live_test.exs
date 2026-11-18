@@ -15,6 +15,28 @@ defmodule MeetWeb.RoomLiveTest do
     assert has_element?(view, "#transcript-panel")
   end
 
+  test "a page that mounts again rebuilds the transcript from what the assistants saved",
+       %{conn: conn} do
+    room = "restored-#{System.unique_integer([:positive])}"
+    store = Octoroom.Store.config()
+    at = System.system_time(:millisecond)
+
+    turn = %{role: "user", message_id: "u1", text: "Capital of Peru?", speaker: "Ada", at: at}
+    reply = %{role: "assistant", message_id: "a1", text: "Lima.", status: "completed", at: at + 1}
+
+    # The general assistant heard the turn; Atlas heard it too, and replied.
+    Octoroom.Store.put(store, :workers, {room, "assistant"}, %{items: [turn]})
+    Octoroom.Store.put(store, :workers, {room, "atlas"}, %{items: [turn, reply]})
+    on_exit(fn -> Octoroom.Worker.forget_room(store, room) end)
+
+    {:ok, view, _html} = live(conn, ~p"/r/#{room}")
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+
+    assert has_element?(view, "#transcript-turn-1", "Capital of Peru?")
+    assert has_element?(view, "#transcript-reply-atlas-a1", "Lima.")
+    refute has_element?(view, "#transcript-turn-2")
+  end
+
   test "the transcript tags each turn with the decision", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/r/test")
     render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})

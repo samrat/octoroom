@@ -175,6 +175,9 @@ defmodule Octoroom.Room.Server do
     cf = Keyword.get_lazy(opts, :cloudflare, &Cloudflare.config/0)
     now = Store.now()
     Store.put(store, :rooms, room_id, %{run: run, assigns: assigns, updated_at: now})
+    # A fresh room: what workers saved belongs to an earlier one that
+    # stopped (a worker can save while the room stops).
+    if previous == nil, do: Worker.forget_room(store, room_id)
     grace_ms = Keyword.get(opts, :grace_ms, @grace_ms)
     heartbeat_ms = Keyword.get(opts, :heartbeat_ms, @heartbeat_ms)
     Process.send_after(self(), :heartbeat, heartbeat_ms)
@@ -710,7 +713,10 @@ defmodule Octoroom.Room.Server do
 
     # The last participant left: nothing to recover. Otherwise (a crash, a
     # shutdown) the record stays so the next run recovers the room.
-    if reason == :normal, do: Store.delete(state.store, :rooms, state.id)
+    if reason == :normal do
+      Store.delete(state.store, :rooms, state.id)
+      Worker.forget_room(state.store, state.id)
+    end
   end
 
   ## Results of Cloudflare calls
@@ -1300,7 +1306,14 @@ defmodule Octoroom.Room.Server do
     %{state | outlets: outlets, closes: [{outlet.worker_id, {:output, name}} | state.closes]}
   end
 
-  defp apply_worker_op({:stop_worker, id}, state), do: stop_worker(state, id)
+  # The room no longer wants it: what it saved goes too. A restart (below)
+  # keeps it.
+  defp apply_worker_op({:stop_worker, id}, state) do
+    state = stop_worker(state, id)
+    Worker.forget(state.store, state.id, id)
+    state
+  end
+
   defp apply_worker_op({:start_worker, spec}, state), do: start_worker(state, spec)
 
   defp apply_worker_op({:restart_worker, spec}, state),
@@ -1494,7 +1507,8 @@ defmodule Octoroom.Room.Server do
         room_id: state.id,
         spec: spec,
         participants: Enum.map(participants(state), &public/1),
-        resumed: state.recovering
+        resumed: state.recovering,
+        store: state.store
       }
 
       case start_child(state, :workers, {Worker.Server, opts}) do

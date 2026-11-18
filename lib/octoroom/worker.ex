@@ -44,6 +44,14 @@ defmodule Octoroom.Worker do
       is what listeners heard, give or take the frame on its way.
     * `emit: event`: broadcast `{:worker_event, worker_id, event}` to the
       room's subscribers (see `Octoroom.subscribe/1`).
+    * `save: term`: keep `term` in the store (`Octoroom.Store`) as what
+      this worker would need to carry on, such as its conversation so far.
+      Each save replaces the last. The worker's next start in the same room
+      gets it as `ctx.saved`: after a crash, a change of args, or the node
+      restarting mid-call. It's deleted when the room stops the worker
+      because `workers/1` no longer lists it, and when the room stops
+      because its last participant left. Keep it small: it's written on
+      every save.
 
   `handle_info/2` also receives `{:octoroom, :inputs, names}` and
   `{:octoroom, :outputs, names}` when the room changes the worker's inputs or
@@ -60,7 +68,8 @@ defmodule Octoroom.Worker do
   @type actions :: [
           play: {String.t() | :default, binary},
           flush: String.t() | :default,
-          emit: term
+          emit: term,
+          save: term
         ]
   @type result :: {:ok, state} | {:ok, state, actions}
 
@@ -109,6 +118,27 @@ defmodule Octoroom.Worker do
   end
 
   @doc """
+  What worker `id` in room `room_id` last saved (the `save:` action), or
+  nil. For apps that show what a worker kept, such as a conversation, while
+  the room is down or before its workers have started again.
+  """
+  def saved(room_id, id, store \\ Octoroom.Store.config()),
+    do: Octoroom.Store.get(store, :workers, {room_id, id})
+
+  @doc false
+  # Deletes what the worker saved.
+  def forget(store, room_id, id), do: Octoroom.Store.delete(store, :workers, {room_id, id})
+
+  @doc false
+  # Deletes what every worker of the room saved.
+  def forget_room(store, room_id) do
+    for {{^room_id, _id} = key, _} <- Octoroom.Store.all(store, :workers),
+        do: Octoroom.Store.delete(store, :workers, key)
+
+    :ok
+  end
+
+  @doc """
   Sends `message` to a running worker's `handle_info/2`, for example from a
   LiveView. Returns `:ok`, or `{:error, :no_worker}`.
   """
@@ -134,9 +164,13 @@ defmodule Octoroom.Worker.Context do
   a crash or restart: `%{gone_ms: ms}`, about how long the room was down.
   A worker that keeps state outside its process (a conversation so far)
   reloads it then.
+
+  `saved` is what this worker last returned in a `save:` action (see
+  `Octoroom.Worker`), or nil: it's set after a crash or a change of args as
+  well as on recovery.
   """
 
-  defstruct [:room_id, :id, :resumed, inputs: [], outputs: [], participants: []]
+  defstruct [:room_id, :id, :resumed, :saved, inputs: [], outputs: [], participants: []]
 
   @type t :: %__MODULE__{
           room_id: String.t(),
@@ -144,6 +178,7 @@ defmodule Octoroom.Worker.Context do
           inputs: [String.t()],
           outputs: [String.t()],
           participants: [Octoroom.Participant.t()],
-          resumed: nil | %{gone_ms: non_neg_integer}
+          resumed: nil | %{gone_ms: non_neg_integer},
+          saved: term
         }
 end

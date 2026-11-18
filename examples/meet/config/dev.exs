@@ -53,6 +53,16 @@ config :meet, MeetWeb.Endpoint,
     ]
   ]
 
+# The room store's snapshot, so a call (and what the assistants remember)
+# survives restarting the server. One per port, here rather than the default
+# in the system temp directory: that file is named after the node, and every
+# server not started with --sname is nonode@nohost, so they overwrite each
+# other's snapshots.
+config :octoroom,
+  store:
+    {Octoroom.Store.ETS,
+     path: Path.expand("../tmp/octoroom-#{System.get_env("PORT", "4000")}.store", __DIR__)}
+
 # Enable dev routes for dashboard and mailbox
 config :meet, dev_routes: true
 

@@ -12,7 +12,7 @@ defmodule Octoroom.Worker.Server do
 
   require Logger
 
-  alias Octoroom.{Audio, Outlet}
+  alias Octoroom.{Audio, Outlet, Store}
   alias Octoroom.Worker.Context
 
   def start_link(%{room_id: room_id, spec: spec} = opts),
@@ -27,6 +27,7 @@ defmodule Octoroom.Worker.Server do
     module = spec.module
     {rate, channels} = module.__octoroom_audio__()
     {out_rate, out_channels} = module.__octoroom_audio_output__()
+    store = Map.get_lazy(opts, :store, &Store.config/0)
 
     ctx = %Context{
       room_id: room_id,
@@ -34,13 +35,15 @@ defmodule Octoroom.Worker.Server do
       inputs: spec.inputs,
       outputs: spec.outputs,
       participants: participants,
-      resumed: Map.get(opts, :resumed)
+      resumed: Map.get(opts, :resumed),
+      saved: Store.get(store, :workers, {room_id, spec.id})
     }
 
     state = %{
       room_id: room_id,
       id: spec.id,
       module: module,
+      store: store,
       rate: rate,
       channels: channels,
       out_rate: out_rate,
@@ -117,6 +120,11 @@ defmodule Octoroom.Worker.Server do
 
   defp action({:emit, event}, state) do
     Octoroom.broadcast(state.room_id, {:worker_event, state.id, event})
+    state
+  end
+
+  defp action({:save, data}, state) do
+    Store.put(state.store, :workers, {state.room_id, state.id}, data)
     state
   end
 
