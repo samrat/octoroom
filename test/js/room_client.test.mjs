@@ -48,7 +48,7 @@ function client(options = {}) {
   const room = new RoomClient({socket, topic: "room:1", params: {name: "alice"}, ...options})
   const events = []
   const names = ["state", "participants", "tracks", "local", "error", "left", "connection"]
-  for (const name of [...names, "reconnecting", "reconnected", "room_event"]) {
+  for (const name of [...names, "reconnecting", "reconnected", "room_event", "workers", "worker_event"]) {
     room.on(name, (payload) => events.push([name, payload]))
   }
   const emitted = (name) => events.filter(([n]) => n === name).map(([, payload]) => payload)
@@ -993,5 +993,76 @@ describe("the room", () => {
     off()
     channel.emit("room_event", {type: "left", participant: BOB})
     assert.deepEqual(seen, [2])
+  })
+})
+
+describe("workers", () => {
+  const COACH = {id: "coach", outputs: [], data: ["coach"], state: null, attributes: {}}
+  const ECHO = {id: "echo", outputs: ["p1/echo"], data: [], state: null, attributes: {}}
+
+  test("the join reply lists them, and worker messages keep the list current", async () => {
+    const ctx = client()
+    const joining = ctx.room.join()
+    const channel = ctx.socket.channels[0]
+    channel.joinPush.reply("ok", joinReply({workers: [COACH]}))
+    ;(await channel.next("publish")).reply("ok", {sdp: "cf-answer"})
+    ;(await channel.next("connected")).reply("ok", {})
+    await joining
+    const {room, emitted} = ctx
+    assert.deepEqual(room.workers, [COACH])
+
+    channel.emit("worker", {op: "added", worker: ECHO})
+    assert.deepEqual(room.workers, [COACH, ECHO])
+
+    // An update replaces it in place; one for a worker it doesn't see is ignored.
+    const listening = {...COACH, state: "listening", attributes: {name: "Coach"}}
+    channel.emit("worker", {op: "updated", worker: listening})
+    channel.emit("worker", {op: "updated", worker: {...ECHO, id: "ghost"}})
+    assert.deepEqual(room.workers, [listening, ECHO])
+
+    // Added again (after the server restarted) isn't listed twice.
+    channel.emit("worker", {op: "added", worker: ECHO})
+    assert.deepEqual(room.workers, [listening, ECHO])
+
+    channel.emit("worker", {op: "removed", worker: {id: "coach"}})
+    assert.deepEqual(room.workers, [ECHO])
+    assert.deepEqual(emitted("workers").at(-1), [ECHO])
+    assert.equal(emitted("workers").length, 5)
+
+    await room.leave()
+    assert.deepEqual(room.workers, [])
+    assert.deepEqual(emitted("workers").at(-1), [])
+  })
+
+  test("a resume replaces the list with the server's", async () => {
+    const {room, channel} = await join()
+    channel.emit("worker", {op: "added", worker: COACH})
+    channel.joinPush.reply("ok", joinReply({resumed: true, workers: [ECHO]}))
+    await settle()
+    assert.deepEqual(room.workers, [ECHO])
+  })
+
+  test("passes worker events on", async () => {
+    const {channel, emitted} = await join()
+    const event = {worker: "coach", output: "coach", type: "tip", data: {text: "slow down"}}
+    channel.emit("worker_event", event)
+    assert.deepEqual(emitted("worker_event"), [event])
+  })
+
+  test("send() messages a worker and rejects with the server's reason", async () => {
+    const {room, channel} = await join()
+
+    const sent = room.send("assistant", {text: "hi"})
+    const push = await channel.next("worker_message")
+    assert.deepEqual(push.payload, {worker: "assistant", payload: {text: "hi"}})
+    push.reply("ok", {})
+    assert.deepEqual(await sent, {})
+
+    const refused = room.send("coach", {text: "hi"})
+    ;(await channel.next("worker_message")).reply("error", {reason: "not_allowed"})
+    await assert.rejects(refused, /not_allowed/)
+
+    await room.leave()
+    await assert.rejects(room.send("assistant", {text: "hi"}), /not in a room/)
   })
 })

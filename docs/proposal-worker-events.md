@@ -261,6 +261,9 @@ Each step is one commit, with tests passing.
    opts.)
 5. **JS client.** `workers`, `worker_event`, `send`. Checked by hand in
    `examples/call` until the Playwright test from the roadmap exists.
+   (Done 2026-11-18, with Node tests against the fake channel in
+   `test/js/room_client.test.mjs`. Not yet checked by hand: no example
+   has a worker that sets presence or notifies until step 6.)
 6. **Agents.** Presence, `transcript` events, snapshots, typed messages,
    text-only data output, and `octoroom_agents.mjs`. meet moves to scoped
    subscribe. Tests in `agents/test` with the fake providers.
