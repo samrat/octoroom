@@ -53,22 +53,20 @@ defmodule Octoroom.Agent.TTSTest do
     assert {:ok, "abc"} = TTS.synthesize(Chunks, "abc")
   end
 
-  test "Inworld makes one plain request with stream: false" do
-    parent = self()
+  test "Inworld synthesizes by collecting what its socket streams" do
+    socket =
+      spawn(fn ->
+        receive do
+          {:"$websockex_cast", {:speak, caller, ref, "Hello.", _config}} ->
+            send(caller, {ref, {:audio, <<1, 2>>}})
+            send(caller, {ref, {:audio, <<3>>}})
+            send(caller, {ref, :done})
+        end
 
-    request_fun = fn url, _opts ->
-      send(parent, {:tts_url, url})
-      {:ok, %{status: 200, body: %{"audioContent" => Base.encode64(<<1, 2, 3>>)}}}
-    end
+        Process.sleep(:infinity)
+      end)
 
-    assert :ok =
-             TTS.stream(:inworld, "Hello.", fn audio -> send(parent, {:audio, audio}) end,
-               api_key: "key",
-               stream: false,
-               request_fun: request_fun
-             )
-
-    assert_receive {:tts_url, "https://api.inworld.ai/tts/v1/voice"}
-    assert_receive {:audio, <<1, 2, 3>>}
+    assert {:ok, <<1, 2, 3>>} =
+             TTS.synthesize(:inworld, "Hello.", api_key: "key", connection: socket)
   end
 end
