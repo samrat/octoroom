@@ -82,6 +82,17 @@ defmodule Octoroom.Room do
   @doc "What should `listener` hear now?"
   @callback subscriptions(listener :: Participant.t(), t) :: [Track.t() | String.t()]
 
+  @doc """
+  May `sender` send worker `worker_id` a message from its client? Only
+  asked for a sender the worker hears (one of its tracks is among the
+  worker's inputs): others are refused before this runs, so it can only
+  narrow that rule. Without it, everyone the worker hears may. A raise
+  counts as no.
+  """
+  @callback message(sender :: Participant.t(), worker_id :: String.t(), t) :: boolean
+
+  @optional_callbacks message: 3
+
   defmacro __using__(_opts) do
     quote do
       @behaviour Octoroom.Room
@@ -179,7 +190,9 @@ defmodule Octoroom.Room do
   def worker(id, module, opts) when is_binary(id) and is_atom(module) do
     inputs = opts |> Keyword.get(:inputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
 
-    if video = Enum.find(inputs, &(Track.new(&1).kind == :video)),
+    video = Enum.find(inputs, &(Track.new(&1).kind == :video))
+
+    if video,
       do: raise(ArgumentError, "worker #{id}: #{video} is video, and workers take audio inputs")
 
     outputs = opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()

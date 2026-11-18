@@ -15,7 +15,13 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     between the browser and the room server, which owns every session.
 
     Client → server: `publish`, `publish_tracks`, `push_offer`, `unpublish`,
-    `mute`, `connected`, `answer`, `close_offer`.
+    `mute`, `connected`, `answer`, `close_offer`, `worker_message`.
+
+    `worker_message` is `{worker, payload}`, with `payload` a JSON object,
+    for the worker's `handle_info/2` (see `Octoroom.Room.Server.worker_message/5`).
+    It's refused with `too_large` above `config :octoroom, worker_messages:
+    [max_bytes: ...]` (16 KB by default), or with `no_worker`,
+    `not_allowed` or `rate_limited` by the room.
     Server → client: `renegotiate`, `close`, `push`, `tracks`, `gain`,
     `room_event`, `resume_token`, `republish`, `worker` and `worker_event`.
 
@@ -73,7 +79,7 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     @salt "octoroom resume"
-    @events ~w(publish publish_tracks push_offer unpublish mute connected answer close_offer)
+    @events ~w(publish publish_tracks push_offer unpublish mute connected answer close_offer worker_message)
 
     @doc false
     def __join__(module, topic, params, socket) do
@@ -194,6 +200,19 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       %{server: server, participant_id: id} = socket.assigns.octoroom
       Server.close_offer(server, id, op_id, sdp, socket_ref(socket))
       {:noreply, socket}
+    end
+
+    def __handle_in__("worker_message", %{"worker" => worker, "payload" => payload}, socket)
+        when is_binary(worker) and is_map(payload) do
+      %{max_bytes: max} = Octoroom.worker_message_limits()
+
+      if byte_size(Jason.encode!(payload)) > max do
+        {:reply, {:error, %{reason: "too_large"}}, socket}
+      else
+        %{server: server, participant_id: id} = socket.assigns.octoroom
+        Server.worker_message(server, id, worker, payload, socket_ref(socket))
+        {:noreply, socket}
+      end
     end
 
     def __handle_in__(event, _payload, socket) when event in @events, do: bad_payload(socket)

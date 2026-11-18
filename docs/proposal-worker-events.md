@@ -254,7 +254,11 @@ Each step is one commit, with tests passing.
    than the channel.)
 4. **Messages.** The `worker_message` channel event, the permission check,
    `message/3`, size and rate limits. Tests: each error reason; an allowed
-   message arrives with the sender's id.
+   message arrives with the sender's id. (Done 2026-11-18. As built:
+   "hears" means one of the worker's inputs is the sender's track, whether
+   or not it's live yet; refused messages don't spend a token; the payload
+   must be a JSON object; `worker_messages:` can also be passed in the room
+   opts.)
 5. **JS client.** `workers`, `worker_event`, `send`. Checked by hand in
    `examples/call` until the Playwright test from the roadmap exists.
 6. **Agents.** Presence, `transcript` events, snapshots, typed messages,

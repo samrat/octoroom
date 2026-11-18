@@ -19,6 +19,11 @@ defmodule Octoroom.WorkerEventsTest do
     @impl true
     def handle_info({:do, actions}, s), do: {:ok, s, actions}
 
+    def handle_info({:octoroom, :message, pid, payload}, s) do
+      send(s.test, {:message, s.id, pid, payload})
+      {:ok, s}
+    end
+
     def handle_info({:octoroom, kind, pid, output}, s)
         when kind in [:subscribed, :unsubscribed] do
       send(s.test, {:worker, s.id, kind, pid, output})
@@ -28,8 +33,10 @@ defmodule Octoroom.WorkerEventsTest do
     def handle_info(_msg, s), do: {:ok, s}
   end
 
-  # A private coach and an interpreter with a data output per language.
-  # Each listener gets the data outputs in its `data` metadata.
+  # A private coach, an interpreter with a data output per language, and
+  # an assistant that hears everyone with `heard: true`. Each listener gets
+  # the data outputs in its `data` metadata; nobody with `typing: false`
+  # may message a worker.
   defmodule CoachRoom do
     use Octoroom.Room
 
@@ -40,8 +47,11 @@ defmodule Octoroom.WorkerEventsTest do
     def mount(_room_id), do: {:ok, %{}}
 
     @impl true
-    def workers(%{assigns: %{test: test}}) do
+    def workers(%{assigns: %{test: test}} = room) do
+      heard = for %{meta: %{heard: true}} = p <- room.participants, do: mic(p)
+
       [
+        worker("assistant", Octoroom.WorkerEventsTest.Notifier, inputs: heard, args: test),
         worker("coach", Octoroom.WorkerEventsTest.Notifier, data: ["coach"], args: test),
         worker("interp", Octoroom.WorkerEventsTest.Notifier,
           data: ["interp/es", "interp/fr"],
@@ -53,6 +63,9 @@ defmodule Octoroom.WorkerEventsTest do
     def workers(_room), do: []
 
     @impl true
+    def message(sender, _worker_id, _room), do: Map.get(sender.meta, :typing, true)
+
+    @impl true
     def subscriptions(listener, room),
       do: for(p <- others(room, listener), do: mic(p)) ++ Map.get(listener.meta, :data, [])
   end
@@ -60,7 +73,13 @@ defmodule Octoroom.WorkerEventsTest do
   setup do
     {:ok, fake} = FakeCloudflare.start_link(self())
     room_id = "room-#{System.unique_integer([:positive])}"
-    opts = [cloudflare: FakeCloudflare.config(fake), signal_timeout: 500]
+
+    opts = [
+      cloudflare: FakeCloudflare.config(fake),
+      signal_timeout: 500,
+      worker_messages: [per_second: 1, burst: 3]
+    ]
+
     ctx = %{fake: fake, room_id: room_id, opts: opts}
 
     # The first join starts the room; the workers start once it has the
@@ -72,8 +91,22 @@ defmodule Octoroom.WorkerEventsTest do
     Map.put(ctx, :host, host)
   end
 
-  defp join(ctx, name, data),
-    do: Client.join(name, CoachRoom, ctx.room_id, %{name: name, data: data}, ctx.opts)
+  defp join(ctx, name, data, meta \\ %{}),
+    do:
+      Client.join(
+        name,
+        CoachRoom,
+        ctx.room_id,
+        Map.merge(%{name: name, data: data}, meta),
+        ctx.opts
+      )
+
+  defp message(client, worker, payload) do
+    name = client.name
+    Octoroom.Room.Server.worker_message(client.server, client.id, worker, payload, :msg)
+    assert_receive {:client, ^name, {:octoroom_signal, :reply, :msg, result}}
+    result
+  end
 
   defp tell(ctx, worker, actions),
     do: :ok = Octoroom.Worker.send(ctx.room_id, worker, {:do, actions})
@@ -193,6 +226,35 @@ defmodule Octoroom.WorkerEventsTest do
                      %{op: :updated, worker: %{state: nil, attributes: %{name: "Coach"}}}}}
 
     refute_receive {:client, "agent", {:octoroom_signal, :worker, %{op: :removed}}}, 100
+  end
+
+  test "a client may message a worker that hears it, within limits", ctx do
+    talker = join(ctx, "talker", [], %{heard: true})
+    quiet = join(ctx, "quiet", [])
+    silenced = join(ctx, "silenced", [], %{heard: true, typing: false})
+    talker_id = talker.id
+
+    assert {:ok, %{}} = message(talker, "assistant", %{"text" => "hi"})
+    assert_receive {:message, "assistant", ^talker_id, %{"text" => "hi"}}
+
+    # The assistant doesn't hear quiet; the room refuses silenced; the coach
+    # hears nobody.
+    assert {:error, :not_allowed} = message(quiet, "assistant", %{"text" => "hi"})
+    assert {:error, :not_allowed} = message(silenced, "assistant", %{"text" => "hi"})
+    assert {:error, :not_allowed} = message(talker, "coach", %{"text" => "hi"})
+    assert {:error, :no_worker} = message(talker, "nobody", %{"text" => "hi"})
+    assert {:error, :bad_payload} = message(talker, "assistant", "hi")
+    refute_received {:message, _, _, _}
+
+    # A burst of 3, one already spent; refused messages don't count.
+    assert {:ok, %{}} = message(talker, "assistant", %{"n" => 2})
+    assert {:ok, %{}} = message(talker, "assistant", %{"n" => 3})
+    assert {:error, :rate_limited} = message(talker, "assistant", %{"n" => 4})
+    assert_receive {:message, "assistant", ^talker_id, %{"n" => 3}}
+    refute_receive {:message, _, _, %{"n" => 4}}, 50
+
+    # The bucket is per worker.
+    assert {:error, :not_allowed} = message(talker, "interp", %{"n" => 5})
   end
 
   test "a notify or presence clients couldn't decode crashes the worker", ctx do
