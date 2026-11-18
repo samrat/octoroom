@@ -35,6 +35,12 @@ def workers(room) do
 end
 ```
 
+With `gate: :decision`, a decision model hears each turn. The module's
+`questions/1` and `decide/2` can ask it more and decide from the answers
+("only questions about capital cities"), and `agents/2` puts several
+agents in one room, each told apart by name and `description:`
+([D41](../docs/decisions.md#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room)).
+
 Tool handlers get `speaker`, the participant who asked. From outside the
 room, `Octoroom.Agent.say/3`, `prompt/3` and `interrupt/2`. The history
 holds what people heard: an interrupted reply is cut where its audio
@@ -50,12 +56,6 @@ environment: `SONIOX_API_KEY`, `GOOGLE_API_KEY` (Gemini, the default LLM)
 and `INWORLD_API_KEY`. See `Octoroom.Agent.Worker` for the args, what it
 emits, and how it reports latency.
 
-## Where the code came from
-
-The pipeline (frames, processors, the pure `Pipeline.Core`, providers,
-tools) is copied from Subvocal, an earlier experiment, and renamed under
-`Octoroom.Agent`. Each phase copies what it needs and changes it freely;
-nothing goes back. The list is in
 ## Speech providers
 
 Speech-to-text and text-to-speech go through two small behaviours,
@@ -79,6 +79,12 @@ add one, implement the behaviour and register it, or pass the module as
 config :octoroom_agents, stt_providers: [acme: MyApp.AcmeSTT], tts_providers: [acme: MyApp.AcmeTTS]
 ```
 
+## Where the code came from
+
+The pipeline (frames, processors, the pure `Pipeline.Core`, providers,
+tools) is copied from Subvocal, an earlier experiment, and renamed under
+`Octoroom.Agent`. Each phase copies what it needs and changes it freely;
+nothing goes back. The list is in
 [decisions.md](../docs/decisions.md#where-the-code-came-from).
 
 ## Building

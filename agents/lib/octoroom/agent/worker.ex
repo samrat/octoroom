@@ -45,7 +45,8 @@ defmodule Octoroom.Agent.Worker do
     * `:addressed` - turns that say the agent's `:name` (as a word, any
       case; text turns only), and follow-ups: a turn from the person it
       last answered within `:follow_up_ms` after it stops talking, or
-      before that reply is done. The default with several inputs, or with
+      before that reply is done. With the decision gate, the model can
+      still turn a follow-up down (see below). The default with several inputs, or with
       the decision gate. Half-cascaded turns are audio, so the name never
       matches and only follow-ups reply: use `gate: :decision` there.
     * `:never` - none.
@@ -60,6 +61,11 @@ defmodule Octoroom.Agent.Worker do
       answerable at least `answer_above` (0.7): wait `wait_ms` (2.5 s), and
       reply if nobody starts talking in the meantime;
     * otherwise: listen.
+
+  A follow-up gets the same reading, except that waiting counts as
+  replying: it replies unless the model says listen. So the person it just
+  answered can carry on without the name, but turning to someone else
+  ("Bob, can you share your screen?") doesn't get an answer.
 
   A turn with no decision (the call failed or took too long) falls back to
   the name and follow-ups.
@@ -156,7 +162,7 @@ defmodule Octoroom.Agent.Worker do
 
   @impl true
   def init(args, ctx) do
-    args = args |> Map.new() |> from_agent(ctx)
+    args = args |> Map.new() |> with_roster(ctx) |> from_agent(ctx) |> with_questions(ctx)
 
     with {:ok, front_spec, back_spec, silence_ms} <- specs(args),
          {:ok, back_core} <- Core.new(back_spec, back_ctx(args, ctx)) do
@@ -172,11 +178,17 @@ defmodule Octoroom.Agent.Worker do
         fronts: %{},
         front_spec: front_spec,
         people: people(ctx.participants),
-        name_pattern: ~r/\b#{Regex.escape(name)}\b/i,
+        name_pattern: name_pattern(name),
+        # The other agents' names: a turn naming one of them isn't a
+        # follow-up for this one.
+        other_names: for(a <- args.roster, a.id != ctx.id, do: name_pattern(a.name)),
+        # For `decide/2`: the agent module, if any, and its ctx.
+        agent: Map.get(args, :agent),
+        decide_ctx: decide_ctx(args, ctx),
         respond: Map.get(args, :respond),
         follow_up_ms: Map.get(args, :follow_up_ms, 10_000),
         gate: Map.get(args, :gate, :name),
-        thresholds: Map.merge(@thresholds, Map.new(Map.get(args, :thresholds, %{}))),
+        thresholds: thresholds(args),
         # A turn held while the agent waits to see if anyone else answers:
         # %{input, name, frame, ref}.
         waiting: nil,
@@ -379,14 +391,63 @@ defmodule Octoroom.Agent.Worker do
   # -- Setup --
 
   # An `Octoroom.Agent` module's callbacks fill in the args they cover.
-  defp from_agent(%{agent: module} = args, ctx) when is_atom(module) do
-    agent_ctx = %{
+  defp name_pattern(name), do: ~r/\b#{Regex.escape(name)}\b/i
+
+  defp thresholds(args), do: Map.merge(@thresholds, Map.new(Map.get(args, :thresholds, %{})))
+
+  # The agents in the room (`Octoroom.Agent.agents/2`), or just this one.
+  defp with_roster(args, ctx) do
+    me = %{
+      id: ctx.id,
+      name: Map.get(args, :name, "Assistant"),
+      description: Map.get(args, :description)
+    }
+
+    roster =
+      case Map.get(args, :roster) do
+        [_ | _] = roster -> Enum.map(roster, &Map.merge(%{description: nil}, Map.new(&1)))
+        _ -> [me]
+      end
+
+    Map.put(args, :roster, roster)
+  end
+
+  defp agent_ctx(args, ctx) do
+    %{
       room_id: ctx.room_id,
       agent_id: ctx.id,
+      name: Map.get(args, :name, "Assistant"),
+      roster: args.roster,
       participants: ctx.participants,
       resumed: ctx.resumed,
       args: Map.get(args, :args, %{})
     }
+  end
+
+  defp decide_ctx(args, ctx), do: Map.put(agent_ctx(args, ctx), :thresholds, thresholds(args))
+
+  # The decision model's questions: `decisions: [questions: ...]` if given,
+  # else the agent module's, else the defaults for the roster.
+  defp with_questions(%{gate: :decision} = args, ctx) do
+    opts = Map.get(args, :decisions, [])
+
+    questions =
+      Keyword.get_lazy(opts, :questions, fn ->
+        agent_ctx = agent_ctx(args, ctx)
+
+        case Map.get(args, :agent) do
+          module when is_atom(module) and module != nil -> module.questions(agent_ctx)
+          _ -> Octoroom.Agent.default_questions(agent_ctx)
+        end
+      end)
+
+    Map.put(args, :decisions, Keyword.put(opts, :questions, questions))
+  end
+
+  defp with_questions(args, _ctx), do: args
+
+  defp from_agent(%{agent: module} = args, ctx) when is_atom(module) do
+    agent_ctx = agent_ctx(args, ctx)
 
     from_module = %{
       instructions: module.instructions(agent_ctx),
@@ -717,6 +778,7 @@ defmodule Octoroom.Agent.Worker do
   # model; the decision gate then reads the turn's `decision`.
   defp outcome(input, frame, state) do
     text = Map.get(frame, :text)
+    named = fn pattern -> is_binary(text) and Regex.match?(pattern, text) end
 
     case mode(state) do
       :always ->
@@ -726,25 +788,78 @@ defmodule Octoroom.Agent.Worker do
         {:listen, :never}
 
       :addressed ->
+        decision = if state.gate == :decision, do: Map.get(frame, :decision)
+
+        named? = named.(state.name_pattern)
+        turn = %{source: input, speaker: nil, text: text, decision: decision, named: named?}
+
         cond do
-          is_binary(text) and Regex.match?(state.name_pattern, text) -> {:reply, :name}
-          follow_up?(input, state) -> {:reply, :follow_up}
-          state.gate == :decision and frame.decision != nil -> decide(frame.decision, state)
+          # With a decision, the name goes to `decide/2` too, so an agent
+          # can turn down what it's asked by name (the default doesn't).
+          named? and decision != nil -> decide(turn, state)
+          named? -> {:reply, :name}
+          Enum.any?(state.other_names, named) -> {:listen, :named_other}
+          follow_up?(input, state) -> follow_up(turn, state)
+          decision != nil -> decide(turn, state)
           true -> {:listen, :not_addressed}
         end
     end
   end
 
-  defp decide(decision, %{thresholds: t}) do
-    assistant = get_in(decision, [:probabilities, "assistant"]) || 0.0
-    answerable = decision.answerable || 0.0
-    open? = decision.addressee in ["group", "nobody"]
+  # A follow-up replies at once, unless the decision model hears it aimed
+  # elsewhere: someone the assistant just answered turning to the team.
+  # Anything the model would reply to or wait on counts, since the speaker
+  # was just talking to the assistant.
+  defp follow_up(%{decision: nil}, _state), do: {:reply, :follow_up}
 
-    cond do
-      assistant >= t.reply_above -> {:reply, :addressed}
-      assistant >= t.wait_above -> {:wait, :maybe_addressed}
-      open? and answerable >= t.answer_above -> {:wait, :open_question}
-      true -> {:listen, :not_addressed}
+  defp follow_up(turn, state) do
+    case decide(turn, state) do
+      {:listen, why} -> {:listen, why}
+      _reply_or_wait -> {:reply, :follow_up}
+    end
+  end
+
+  # The agent module's `decide/2`, or the default. A raise counts as the
+  # default, so a bug in the app's rule doesn't restart the agent.
+  defp decide(turn, state) do
+    turn = %{turn | speaker: speaker_name(turn.source, state)}
+
+    result =
+      case state.agent do
+        nil ->
+          Octoroom.Agent.decide(turn, state.decide_ctx)
+
+        module ->
+          try do
+            module.decide(turn, state.decide_ctx)
+          rescue
+            error ->
+              Logger.error(
+                "#{inspect(module)}.decide/2 raised: " <>
+                  Exception.format(:error, error, __STACKTRACE__)
+              )
+
+              Octoroom.Agent.decide(turn, state.decide_ctx)
+          end
+      end
+
+    case result do
+      outcome when outcome in [:reply, :wait, :listen] ->
+        {outcome, :decided}
+
+      {outcome, why} when outcome in [:reply, :wait, :listen] ->
+        {outcome, why}
+
+      other ->
+        Logger.error("decide/2 must return :reply, :wait or :listen, got: #{inspect(other)}")
+        Octoroom.Agent.decide(turn, state.decide_ctx)
+    end
+  end
+
+  defp speaker_name(input, state) do
+    case state.people[participant_id(input)] do
+      nil -> input
+      person -> display_name(person)
     end
   end
 
