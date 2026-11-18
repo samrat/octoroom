@@ -865,6 +865,7 @@ describe("leaving", () => {
     assert.deepEqual(ctx.emitted("local").at(-1), {})
     assert.deepEqual(ctx.emitted("error"), [])
     assert.deepEqual(browser.window.listeners.pagehide, [])
+    assert.deepEqual(browser.window.listeners.beforeunload, [])
   })
 
   test("doesn't stop a stream it was given", async () => {
@@ -895,6 +896,24 @@ describe("leaving", () => {
     browser.window.dispatch("pagehide")
     assert.equal(channel.left, true)
     assert.equal(room.state, "idle")
+  })
+
+  test("leaves before the page unloads, while the socket is still open", async () => {
+    // By pagehide, the Phoenix socket's own listener has closed the connection.
+    const {room, channel} = await join()
+    browser.window.dispatch("beforeunload")
+    assert.equal(channel.left, true)
+    assert.equal(room.state, "idle")
+  })
+
+  test("stays when the page asked to confirm leaving, and leaves on pagehide", async () => {
+    const {room, channel} = await join()
+    browser.window.dispatch("beforeunload", {defaultPrevented: true})
+    assert.equal(channel.left, false)
+    assert.equal(room.state, "joined")
+
+    browser.window.dispatch("pagehide")
+    assert.equal(channel.left, true)
   })
 
   test("removed by the server: tears down and says so, without leaving again", async () => {
