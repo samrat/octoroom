@@ -14,9 +14,9 @@ defmodule Octoroom.Agent.STT.AssemblyAITest do
 
   test "is registered, with its defaults" do
     assert {:ok, AssemblyAI, opts} =
-             STT.resolve(model: "assembly_ai:universal-streaming-multilingual")
+             STT.resolve(model: "assembly_ai:assemblyai-stt-3-7-realtime")
 
-    assert opts[:model] == "universal-streaming-multilingual"
+    assert opts[:model] == "assemblyai-stt-3-7-realtime"
     assert opts[:sample_rate] == 16_000 and opts[:format_turns] == false
   end
 

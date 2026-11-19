@@ -1,9 +1,13 @@
 defmodule Octoroom.Agent.STT.AssemblyAI do
   @moduledoc """
-  AssemblyAI Universal-Streaming speech-to-text over its v3 WebSocket API.
+  AssemblyAI realtime speech-to-text over its v3 WebSocket API.
 
-  Reads `ASSEMBLY_AI_API_KEY`. `:model` is AssemblyAI's `speech_model`
-  (`"universal-streaming-english"` or `"universal-streaming-multilingual"`).
+  Reads `ASSEMBLY_AI_API_KEY`. `:model` is AssemblyAI's `speech_model`:
+  `"assemblyai-stt-3-7-realtime-agent"` (the default) for an agent that
+  answers, which decides when a turn ends, or `"assemblyai-stt-3-7-realtime"`
+  for captions and transcripts, which ignores the endpointing settings
+  below. Both take 32 languages in one stream. The older Universal models
+  still work by name.
   Besides `Octoroom.Agent.STT`'s options it takes `:format_turns` (default
   `false`: punctuated, cased finals cost latency) and the endpointing
   settings `:end_of_turn_confidence_threshold`,
@@ -25,7 +29,7 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
 
   @impl STT
   def default_options,
-    do: [model: "universal-streaming-english", sample_rate: 16_000, format_turns: false]
+    do: [model: "assemblyai-stt-3-7-realtime-agent", sample_rate: 16_000, format_turns: false]
 
   @impl STT
   def start_link(opts) do
@@ -131,7 +135,8 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
 
   defp dispatch_event(%{"type" => "Termination"}, state), do: notify(state, :finished)
 
-  defp dispatch_event(%{"type" => "Begin"}, state), do: state
+  defp dispatch_event(%{"type" => type}, state) when type in ["Begin", "SpeechStarted"],
+    do: state
 
   defp dispatch_event(%{"error" => message}, state) when is_binary(message),
     do: notify(state, {:error, %{message: message}})
