@@ -64,6 +64,7 @@ defmodule Octoroom.Agent.TTS do
   @optional_callbacks stream: 3, synthesize: 2, default_options: 0, connect: 1
 
   @providers %{
+    assembly_ai: Octoroom.Agent.TTS.AssemblyAI,
     inworld: Octoroom.Agent.TTS.Inworld,
     openai: Octoroom.Agent.TTS.OpenAI
   }
@@ -137,6 +138,42 @@ defmodule Octoroom.Agent.TTS do
       {^ref, audio} -> collect(ref, [acc | audio])
     after
       0 -> IO.iodata_to_binary(acc)
+    end
+  end
+
+  @doc false
+  # Splits `text` into parts of at most `max` units, as `count` measures
+  # them, for providers that cap each message: on whitespace, and by
+  # graphemes inside a "word" over the limit.
+  def split_text(text, max, count) do
+    text
+    |> String.split(~r/(?<=\s)/u)
+    |> Enum.reduce([], fn
+      word, [current | rest] ->
+        if count.(current) + count.(word) <= max,
+          do: [current <> word | rest],
+          else: [word, current | rest]
+
+      word, [] ->
+        [word]
+    end)
+    |> Enum.reverse()
+    |> Enum.flat_map(&hard_split(&1, max, count))
+  end
+
+  defp hard_split(part, max, count) do
+    if count.(part) <= max do
+      [part]
+    else
+      part
+      |> String.graphemes()
+      |> Enum.chunk_while(
+        "",
+        fn g, acc ->
+          if count.(acc) + count.(g) <= max, do: {:cont, acc <> g}, else: {:cont, acc, g}
+        end,
+        fn acc -> {:cont, acc, ""} end
+      )
     end
   end
 end

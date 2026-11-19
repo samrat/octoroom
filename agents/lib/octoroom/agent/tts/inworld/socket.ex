@@ -15,6 +15,8 @@ defmodule Octoroom.Agent.TTS.Inworld.Socket do
 
   require Logger
 
+  alias Octoroom.Agent.TTS
+
   @endpoint "wss://api.inworld.ai/tts/v1/voice:streamBidirectional"
 
   # Inworld takes at most 2,000 characters (UTF-16 code units) per sendText.
@@ -202,7 +204,13 @@ defmodule Octoroom.Agent.TTS.Inworld.Socket do
     {:reply, message(id, :cancelContext, %{}), state}
   end
 
-  defp fail_context(nil, error, state), do: log_unhandled(error, state)
+  # An error for no context (out of credits, a bad key) is about the
+  # connection, and Inworld closes it next: every context in flight fails
+  # with it, rather than with the bare disconnect that follows.
+  defp fail_context(nil, error, state) do
+    Logger.warning("Inworld TTS error: #{inspect(error)}")
+    fail_all({:inworld_speech_failed, error}, state)
+  end
 
   defp fail_context(id, error, state) do
     case Map.fetch(state.contexts, id) do
@@ -261,40 +269,7 @@ defmodule Octoroom.Agent.TTS.Inworld.Socket do
 
   @doc false
   # Splits on whitespace so no part passes Inworld's limit.
-  def text_parts(text) do
-    text
-    |> String.split(~r/(?<=\s)/u)
-    |> Enum.reduce([], fn
-      word, [current | rest] ->
-        if utf16_units(current) + utf16_units(word) <= @max_text_units,
-          do: [current <> word | rest],
-          else: [word, current | rest]
-
-      word, [] ->
-        [word]
-    end)
-    |> Enum.reverse()
-    |> Enum.flat_map(&hard_split/1)
-  end
-
-  # A single "word" over the limit (no whitespace) is cut by graphemes.
-  defp hard_split(part) do
-    if utf16_units(part) <= @max_text_units do
-      [part]
-    else
-      part
-      |> String.graphemes()
-      |> Enum.chunk_while(
-        "",
-        fn g, acc ->
-          if utf16_units(acc) + utf16_units(g) <= @max_text_units,
-            do: {:cont, acc <> g},
-            else: {:cont, acc, g}
-        end,
-        fn acc -> {:cont, acc, ""} end
-      )
-    end
-  end
+  def text_parts(text), do: TTS.split_text(text, @max_text_units, &utf16_units/1)
 
   defp utf16_units(text),
     do: text |> :unicode.characters_to_binary(:utf8, :utf16) |> byte_size() |> div(2)

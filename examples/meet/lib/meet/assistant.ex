@@ -18,9 +18,10 @@ defmodule Meet.Assistant do
     """
   end
 
-  # Nemotron through OpenRouter: quicker to first text than Gemini.
+  # Nemotron through OpenRouter: quicker to first text than Gemini. It speaks
+  # with AssemblyAI's Kyla voice.
   @impl true
-  def backend(_ctx), do: %{llm: %{provider: :openrouter}}
+  def backend(_ctx), do: %{llm: %{provider: :openrouter}, tts: "assembly_ai"}
 
   @impl true
   def tools(_ctx) do
