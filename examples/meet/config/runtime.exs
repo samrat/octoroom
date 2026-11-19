@@ -8,11 +8,11 @@ import Config
 # The block below contains prod specific runtime configuration.
 
 # Octoroom needs a Cloudflare Realtime SFU app, and the assistants need
-# SONIOX_API_KEY, OPENROUTER_API_KEY (the LLM and the decision model) and
-# INWORLD_API_KEY; GOOGLE_API_KEY for the Gemini Live assistant, and
-# ASSEMBLY_AI_API_KEY only for AssemblyAI speech-to-text. They're read
-# from the environment, or from a `.env` file next to mix.exs (KEY=value
-# lines).
+# SONIOX_API_KEY, OPENROUTER_API_KEY (the LLM and the decision model),
+# ASSEMBLY_AI_API_KEY (their voices) and GOOGLE_API_KEY (the Gemini Live
+# assistant); INWORLD_API_KEY only to go back to Inworld's voices. They're
+# read from the environment, or from a `.env` file next to mix.exs
+# (KEY=value lines).
 env_file = Path.expand("../.env", __DIR__)
 
 # KEY=value, KEY="value" or KEY='value', as a shell reads them.
