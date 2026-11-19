@@ -320,7 +320,8 @@ defmodule Octoroom.Agent.WorkerTest do
              "[Alice] What's my name?"
            ]
 
-    assert length(Octoroom.Agent.conversation(ctx.room_id, "assistant")) == 4
+    # Saved just after the turn reaches the LLM.
+    wait_until(fn -> length(Octoroom.Agent.conversation(ctx.room_id, "assistant")) == 4 end)
   end
 
   test "talking over the agent flushes what it hasn't played yet", ctx do
@@ -867,6 +868,181 @@ defmodule Octoroom.Agent.WorkerTest do
       Server.worker_message(alice.server, alice.id, "assistant", %{"draw" => "a cat"}, :msg2)
       assert_receive {:client, "alice", {:octoroom_signal, :reply, :msg2, {:ok, %{}}}}
       refute_receive {:llm, _}, 100
+    end
+  end
+
+  describe "Gemini Live (mixed)" do
+    # The agent's back end is Gemini Live with its socket replaced: what it
+    # would send comes here as `{:to_gemini, message}`, and `live/2` plays
+    # the model's events.
+    defp live_args(test) do
+      back = processor(:gemini, Processors.GeminiLive, send: &send(test, {:to_gemini, &1}))
+      %{name: "Assistant", front_end: nil, back_end: back}
+    end
+
+    defp start_live(ctx) do
+      Octoroom.subscribe(ctx.room_id, scope: :room)
+      alice = join(ctx, "alice", %{name: "Alice", args: live_args(self())})
+      cf = agent_track(alice.mic)
+      wait_until(fn -> match?([%{connected: [_ | _]}], workers(ctx)) end)
+      live(ctx, :setup_complete)
+      %{alice: alice, cf_track: cf}
+    end
+
+    defp live(ctx, event),
+      do: :ok = Octoroom.Worker.send(ctx.room_id, "assistant", {:gemini_live_socket, event})
+
+    defp speak(ctx, client, frames),
+      do:
+        for(
+          _ <- 1..frames,
+          do: FakeCloudflare.egress(ctx.fake, client.session, client.mic, @frame)
+        )
+
+    # Chunks the model hears until one has `value` in it.
+    defp hears_sample(value) do
+      assert_receive {:to_gemini, {:audio, pcm}}, 1_000
+      assert byte_size(pcm) == 640
+      if value in for(<<s::signed-little-16 <- pcm>>, do: s), do: :ok, else: hears_sample(value)
+    end
+
+    test "hears everyone mixed into one stream", ctx do
+      %{alice: alice} = start_live(ctx)
+      speak(ctx, alice, 4)
+      hears_sample(1)
+
+      bob = join(ctx, "bob", %{name: "Bob"})
+      wait_until(fn -> bob.mic in hd(workers(ctx)).connected end)
+
+      for _ <- 1..5 do
+        speak(ctx, alice, 1)
+        speak(ctx, bob, 1)
+      end
+
+      # Both at once: their samples add up.
+      hears_sample(2)
+    end
+
+    test "passes on all of a speaker's audio, in real time", ctx do
+      # The fake client never answers signaling, which the room gives up on
+      # after `signal_timeout` and stops hearing Alice: longer than the test.
+      ctx = %{ctx | opts: Keyword.put(ctx.opts, :signal_timeout, 10_000)}
+      %{alice: alice} = start_live(ctx)
+      started = System.monotonic_time(:millisecond)
+
+      # Two seconds of Alice, a 20 ms frame every 20 ms.
+      for n <- 1..100 do
+        speak(ctx, alice, 1)
+        Process.sleep(max(started + n * 20 - System.monotonic_time(:millisecond), 0))
+      end
+
+      Process.sleep(200)
+      sent = count_audio(0)
+
+      # All of it but what's still buffered (under two 20 ms chunks).
+      assert sent >= 98 * 640 and sent <= 100 * 640,
+             "Gemini got #{div(sent, 32)} ms of 2000 ms"
+    end
+
+    defp count_audio(bytes) do
+      receive do
+        {:to_gemini, {:audio, pcm}} -> count_audio(bytes + byte_size(pcm))
+      after
+        0 -> bytes
+      end
+    end
+
+    test "speaks what the model says, with its state and transcript", ctx do
+      %{cf_track: cf} = start_live(ctx)
+
+      live(ctx, {:transcription, :user, "Hi!", true})
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent, {:conversation, %{role: "user", text: "Hi!"}}}}}
+
+      live(ctx, {:audio, :binary.copy(<<0, 0>>, 24 * 200), sample_rate: 24_000})
+      live(ctx, {:transcription, :assistant, "Hello.", false})
+      live(ctx, :turn_complete)
+
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "speaking"}}}, 1_000
+      assert_receive {:ingest, ^cf, frame}, 1_000
+      assert byte_size(frame) == 3_840
+
+      assert_receive {:octoroom, _,
+                      {:worker_notify, "assistant", "assistant", "transcript",
+                       %{role: "assistant", text: "Hello.", status: "completed"}}}
+
+      # Once its 200 ms has played.
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "listening"}}}, 1_000
+    end
+
+    test "someone talking over a reply that's still playing stops it", ctx do
+      start_live(ctx)
+
+      live(ctx, {:audio, :binary.copy(<<0, 0>>, 24 * 3_000), sample_rate: 24_000})
+      live(ctx, :turn_complete)
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "speaking"}}}, 1_000
+
+      live(ctx, {:transcription, :user, "Wait", false})
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "listening"}}}, 500
+    end
+
+    test "typed messages and the app's prompts reach the model as text", ctx do
+      %{alice: alice} = start_live(ctx)
+
+      Server.worker_message(alice.server, alice.id, "assistant", %{"text" => "What's up?"}, :msg)
+      assert_receive {:to_gemini, {:text, "[Alice] What's up?"}}
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent,
+                        {:conversation, %{role: "user", text: "What's up?", speaker: "Alice"}}}}}
+
+      :ok = Octoroom.Agent.prompt(ctx.room_id, "assistant", "Sum up.")
+
+      assert_receive {:to_gemini,
+                      {:text, "[From the app, not said by anyone on the call] Sum up."}}
+    end
+
+    test "a restarted agent resumes its Gemini session", ctx do
+      start_live(ctx)
+      assert_receive {:to_gemini, {:connect, [handle: nil, fallback_setup: _]}}
+
+      live(ctx, {:transcription, :user, "I'm Alice.", true})
+      live(ctx, {:resumption, "h1"})
+
+      wait_until(fn ->
+        match?(
+          %{gemini_handle: %{handle: "h1"}, items: [_]},
+          Octoroom.Worker.saved(ctx.room_id, "assistant")
+        )
+      end)
+
+      pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+      Process.exit(pid, :kill)
+
+      assert_receive {:to_gemini, {:connect, connect}}, 2_000
+      assert connect[:handle] == "h1"
+      assert connect[:fallback_setup][:system_instruction] =~ "[someone] I'm Alice."
+    end
+
+    test "a module picks it as its backend" do
+      defmodule LiveAgent do
+        use Octoroom.Agent
+
+        @impl true
+        def backend(_ctx), do: %{gemini_live: %{voice: "Puck", model: "gemini-live-x"}}
+      end
+
+      assert %Backend.GeminiLive{voice: "Puck", model: "models/gemini-live-x"} =
+               Backend.GeminiLive.from(LiveAgent.backend(%{}))
+
+      assert {:stop, :voice_false_needs_a_cascaded_backend} =
+               Octoroom.Agent.Worker.init(
+                 %{agent: LiveAgent, args: %{}, voice: false},
+                 %Octoroom.Worker.Context{room_id: "r", id: "a", inputs: [], outputs: []}
+               )
     end
   end
 

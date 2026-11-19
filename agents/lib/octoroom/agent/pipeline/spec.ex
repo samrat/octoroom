@@ -206,6 +206,19 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     {front, back}
   end
 
+  @doc """
+  The back end of a Gemini Live agent, one `:gemini` stage
+  (`Octoroom.Agent.Processors.GeminiLive`). It has no front end: the agent
+  mixes its inputs into it. Add stages around it with the editing helpers.
+  """
+  def gemini_live(%Octoroom.Agent.Backend.GeminiLive{} = backend) do
+    opts =
+      [model: backend.model, voice: backend.voice, api_key: backend.api_key]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    processor(:gemini, Octoroom.Agent.Processors.GeminiLive, opts)
+  end
+
   @doc "Names of the stages, in order."
   def names(%__MODULE__{stages: stages}), do: Enum.map(stages, & &1.name)
 

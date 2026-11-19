@@ -21,6 +21,7 @@ defmodule Call.Assistant do
 
   @impl true
   def backend(%{args: %{pipeline: :half}}), do: %{stt: false}
+  def backend(%{args: %{pipeline: :live}}), do: %Octoroom.Agent.Backend.GeminiLive{}
   def backend(_ctx), do: %{}
 
   @impl true
