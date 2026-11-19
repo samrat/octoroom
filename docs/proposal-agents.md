@@ -29,9 +29,7 @@ The proposal has three parts:
    isn't developed further; its pipeline runtime, processors, providers
    and tools are **copied in as each phase needs them** and changed for
    rooms, the way milestone 1 ported Subvocal's Cloudflare code
-   ([Where the code came from](decisions.md#where-the-code-came-from)).
-   Octoroom core still ships no AI
-   ([D5](decisions.md#d5-octoroom-ships-no-ai)).
+
 3. **Core grows five AI-free features** that agents need and that other
    workers can use: separate input and output rates, playback feedback from
    outlets, worker presence, policy-scoped worker events to clients, and
@@ -46,26 +44,12 @@ its Repo, PubSub and LiveViews in reach.
 
 These drive the design. Each one needs something a 1:1 voice agent doesn't.
 
-| Use case | What the agent does | What it needs beyond a 1:1 voice agent |
-| --- | --- | --- |
-| **Meeting notetaker** | Hears everyone, never speaks unless asked, writes notes and action items. | N speakers with names attached to their words. No reply at each end of turn. History that survives a deploy. |
-| **Collaboration call** | A team is on a call and asks the agent to do things, e.g. "add a row for Acme to the pipeline sheet". | Knowing when it is being addressed. Tools that change app state, with the caller's identity for authorization. LiveViews updating as tools run. |
-| **AI receptionist** | Greets a visitor, answers questions, then brings a human in and steps back. | 1:1 turn-taking at first, then a handoff that changes who hears whom. Later, a phone caller ([Telephony](roadmap.md#telephony)). |
-| **Gemini decision model** | Listens and answers calibrated questions about the audio (Subvocal's `VocalCues` already does this per turn): is the customer frustrated, was the agent addressed, is this a question. | An agent with no voice at all, whose output is events and room metadata. The same model as the "was I addressed?" gate for the other three. |
-
-## What LiveKit Agents is, and what carries over
-
-| LiveKit Agents | Octoroom agents |
-| --- | --- |
-| Agent server: a separate process pool that registers with LiveKit and receives jobs. | None. Agents are supervised processes in the app's node, under the room's supervisor. |
-| Dispatch: automatic for every room, or explicit by agent name through an API or token. | `workers/1` returns `agent(...)`. Changing a room assign adds, removes or swaps an agent on the next reconcile. |
-| The agent joins as a participant with `kind = AGENT`. | The agent is a worker with presence (see [Core changes](#core-changes)). |
-| `AgentSession` with STT, LLM, TTS, VAD and turn detection, or a realtime model. | A pipeline spec: `Spec.cascaded/2`, `Spec.gemini_live/1`, or the agent's own. |
-| `Agent`: instructions and tools. Handoff by returning another `Agent` from a tool. | `use Octoroom.Agent`: callbacks modelled on `Subvocal.Agent`. Handoff as a tool return, or as a policy change. |
-| `RoomIO` links the session to one participant. Multi-user is left to the developer. | Every input arrives labelled by participant. Multi-party is the default case. |
-| Subscriptions and permissions set imperatively. | `inputs:` for what the agent hears, `subscriptions/2` for who hears it. |
-| Transcripts over text streams, text input over a chat topic, RPC to clients, `lk.agent.state` attribute. | Worker events to clients scoped by policy, client messages to workers, presence state. |
-| Tools run in the agent process, away from the app. They reach the app over HTTP or RPC. | Tools are functions in the app. |
+| Use case                  | What the agent does                                                                                                                                                                    | What it needs beyond a 1:1 voice agent                                                                                                          |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Meeting notetaker**     | Hears everyone, never speaks unless asked, writes notes and action items.                                                                                                              | N speakers with names attached to their words. No reply at each end of turn. History that survives a deploy.                                    |
+| **Collaboration call**    | A team is on a call and asks the agent to do things, e.g. "add a row for Acme to the pipeline sheet".                                                                                  | Knowing when it is being addressed. Tools that change app state, with the caller's identity for authorization. LiveViews updating as tools run. |
+| **AI receptionist**       | Greets a visitor, answers questions, then brings a human in and steps back.                                                                                                            | 1:1 turn-taking at first, then a handoff that changes who hears whom. Later, a phone caller ([Telephony](roadmap.md#telephony)).                |
+| **Gemini decision model** | Listens and answers calibrated questions about the audio (Subvocal's `VocalCues` already does this per turn): is the customer frustrated, was the agent addressed, is this a question. | An agent with no voice at all, whose output is events and room metadata. The same model as the "was I addressed?" gate for the other three.     |
 
 ## Developer experience
 
@@ -126,14 +110,14 @@ inlets without restarting the agent (existing behaviour).
 
 Options:
 
-| Option | Values | Default | Meaning |
-| --- | --- | --- | --- |
-| `hears:` | audio tracks | required | The agent's inputs. |
-| `respond:` | `:always`, `:addressed`, `:never` | `:always` with one input, `:addressed` with more | When an end of turn starts a reply. See [Turn-taking](#turn-taking-in-a-group). |
-| `interrupt:` | `:anyone`, `:addressee`, `:nobody` | `:addressee` | Whose speech stops the agent mid-reply. |
-| `voice:` | boolean | `true` | `false` gives the agent no output track. |
-| `name:`, `attributes:` | string, map | id, `%{}` | Presence shown to clients. |
-| `args:` | term | `%{}` | Passed to the agent's callbacks. Changing it restarts the agent. |
+| Option                 | Values                             | Default                                          | Meaning                                                                         |
+| ---------------------- | ---------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `hears:`               | audio tracks                       | required                                         | The agent's inputs.                                                             |
+| `respond:`             | `:always`, `:addressed`, `:never`  | `:always` with one input, `:addressed` with more | When an end of turn starts a reply. See [Turn-taking](#turn-taking-in-a-group). |
+| `interrupt:`           | `:anyone`, `:addressee`, `:nobody` | `:addressee`                                     | Whose speech stops the agent mid-reply.                                         |
+| `voice:`               | boolean                            | `true`                                           | `false` gives the agent no output track.                                        |
+| `name:`, `attributes:` | string, map                        | id, `%{}`                                        | Presence shown to clients.                                                      |
+| `args:`                | term                               | `%{}`                                            | Passed to the agent's callbacks. Changing it restarts the agent.                |
 
 From outside the room:
 
@@ -232,14 +216,14 @@ the process that hosts it (`Runner` in Membrane, `Local` as a plain
 GenServer, `Test`). `octoroom_agents` copies the core and writes its own
 host, `Octoroom.Agent.Worker`, about the size of `Pipeline.Local`:
 
-| Worker side | Pipeline side |
-| --- | --- |
-| `handle_audio(input, pcm, state)` | `Core.push(%InputAudio{audio: pcm, source: input})` |
-| `{:output, %OutputAudio{}}` command | `play: {:default, audio}` |
-| `{:interrupted, _}` command | `flush: :default` |
-| `{:notify, event}` command, conversation items | `emit: event` |
-| `handle_info/2` | `Host.handle_message/3` for tasks and timers, then `Core.info/3` |
-| `{:octoroom, :inputs, names}` | A frame that adds or removes per-speaker branches |
+| Worker side                                    | Pipeline side                                                    |
+| ---------------------------------------------- | ---------------------------------------------------------------- |
+| `handle_audio(input, pcm, state)`              | `Core.push(%InputAudio{audio: pcm, source: input})`              |
+| `{:output, %OutputAudio{}}` command            | `play: {:default, audio}`                                        |
+| `{:interrupted, _}` command                    | `flush: :default`                                                |
+| `{:notify, event}` command, conversation items | `emit: event`                                                    |
+| `handle_info/2`                                | `Host.handle_message/3` for tasks and timers, then `Core.info/3` |
+| `{:octoroom, :inputs, names}`                  | A frame that adds or removes per-speaker branches                |
 
 Consequences:
 
@@ -356,8 +340,8 @@ Three things reach clients, all through core features that carry no AI:
 Client API, in the browser and Swift clients:
 
 ```js
-room.on("agents", (list) => render(list));           // [{id, name, state, attributes}]
-room.on("transcript", (item) => append(item));       // {agent, speaker, role, text, status}
+room.on("agents", (list) => render(list)); // [{id, name, state, attributes}]
+room.on("transcript", (item) => append(item)); // {agent, speaker, role, text, status}
 room.send("assistant", { text: "add Acme to the sheet" });
 ```
 
@@ -418,13 +402,13 @@ For agents the package does that job behind one behaviour:
 All five are useful without AI, which is the test for whether they belong in
 core under D5.
 
-| Change | Why agents need it | Size |
-| --- | --- | --- |
-| **Separate input and output rates.** `use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]`. | The pipeline takes 16 kHz and produces 24 kHz. Today a worker has one format for both. | Small: `Worker.Server` converts each direction already. |
-| **Outlet feedback.** `{:octoroom, :flushed, output, dropped_ms}` and `{:octoroom, :drained, output}` to the worker's `handle_info/2`. | Knowing what was played, for history and for `speaking` state. | Small. |
-| **Worker presence.** `worker/3` takes `presence: %{name:, attributes:}`. A worker action `presence: map` updates it. Clients get the list in the join reply and changes as `room_event`. | Showing the agent in the UI with its state. Also a recorder's "recording" indicator. | Medium: room server state, channel, both clients. |
-| **Worker events to clients, scoped by track.** `emit: {event, track: name}` forwards to participants subscribed to that track. Plain `emit` stays server-only. | Transcripts and captions. Already a [roadmap gap](roadmap.md#smaller-gaps). | Medium. |
-| **Client messages to workers.** A `message` channel event delivered to the worker's `handle_info/2` with the sender's participant. | Typed input to an agent. | Small, plus the authorization rule. |
+| Change                                                                                                                                                                                   | Why agents need it                                                                     | Size                                                    |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| **Separate input and output rates.** `use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]`.                                                                  | The pipeline takes 16 kHz and produces 24 kHz. Today a worker has one format for both. | Small: `Worker.Server` converts each direction already. |
+| **Outlet feedback.** `{:octoroom, :flushed, output, dropped_ms}` and `{:octoroom, :drained, output}` to the worker's `handle_info/2`.                                                    | Knowing what was played, for history and for `speaking` state.                         | Small.                                                  |
+| **Worker presence.** `worker/3` takes `presence: %{name:, attributes:}`. A worker action `presence: map` updates it. Clients get the list in the join reply and changes as `room_event`. | Showing the agent in the UI with its state. Also a recorder's "recording" indicator.   | Medium: room server state, channel, both clients.       |
+| **Worker events to clients, scoped by track.** `emit: {event, track: name}` forwards to participants subscribed to that track. Plain `emit` stays server-only.                           | Transcripts and captions. Already a [roadmap gap](roadmap.md#smaller-gaps).            | Medium.                                                 |
+| **Client messages to workers.** A `message` channel event delivered to the worker's `handle_info/2` with the sender's participant.                                                       | Typed input to an agent.                                                               | Small, plus the authorization rule.                     |
 
 Not needed for a first version, but agents make them more pressing:
 speaking events (the per-speaker VADs produce trustworthy ones as a side
@@ -449,24 +433,24 @@ tests for those modules, and changes it freely. Subvocal's `lib/` at
 `c12431f` has about 7,400 lines worth taking eventually and about 2,900
 that never come over.
 
-| When | Subvocal modules | Changes on the way in |
-| --- | --- | --- |
-| **Phase 1** (one speaker) | `Frame`, `Frames`, `Processor`, `Processor.StateMachine`; `Pipeline.Core`, `Host`, `Spec`, `Test`; processors `VAD`, `STT`, `STTTurns`, `Context`, `LLM`, `Tools`, `TextChunker`, `TTS`, `AssistantCollector`; `Tool*` and `ToolAdapters.*`; `VAD.Silero` and its model; `ConversationEvents`; `Backend.Cascaded`; one STT, one LLM and one TTS provider from `Cascaded.*` | `source` on audio, transcription and speaking frames from the start. `ToolExecutor` keeps `:inline` only. Comments about Membrane hosts rewritten. |
-| **Phase 3** (groups) | `Pipeline.Composite`, `Switch`, `Isolated`, `Subscriptions`; `Processors.SmartTurn`, `TurnDetection.SmartTurn` and its models | New `per_source/3` composite. `Context` labels speakers, `Tools` passes `speaker`, conversation items get `speaker`. New `Addressed` gate. |
-| **Phase 5** (decisions) | `Processors.VocalCues`, `AudioTurns`, `Transcriber` | `VocalCues` also becomes `Decisions`. |
-| **Phase 6 or when wanted** | `Processors.GeminiLive`, `GeminiLive.*`, `Backend.GeminiLive`; the remaining `Cascaded.*` providers; `Python`, `Python.Processor`, `Cascaded.Woof` | Mixed-input mode for Gemini Live. Python behind an optional Pythonx dependency. |
+| When                       | Subvocal modules                                                                                                                                                                                                                                                                                                                                                           | Changes on the way in                                                                                                                              |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 1** (one speaker)  | `Frame`, `Frames`, `Processor`, `Processor.StateMachine`; `Pipeline.Core`, `Host`, `Spec`, `Test`; processors `VAD`, `STT`, `STTTurns`, `Context`, `LLM`, `Tools`, `TextChunker`, `TTS`, `AssistantCollector`; `Tool*` and `ToolAdapters.*`; `VAD.Silero` and its model; `ConversationEvents`; `Backend.Cascaded`; one STT, one LLM and one TTS provider from `Cascaded.*` | `source` on audio, transcription and speaking frames from the start. `ToolExecutor` keeps `:inline` only. Comments about Membrane hosts rewritten. |
+| **Phase 3** (groups)       | `Pipeline.Composite`, `Switch`, `Isolated`, `Subscriptions`; `Processors.SmartTurn`, `TurnDetection.SmartTurn` and its models                                                                                                                                                                                                                                              | New `per_source/3` composite. `Context` labels speakers, `Tools` passes `speaker`, conversation items get `speaker`. New `Addressed` gate.         |
+| **Phase 5** (decisions)    | `Processors.VocalCues`, `AudioTurns`, `Transcriber`                                                                                                                                                                                                                                                                                                                        | `VocalCues` also becomes `Decisions`.                                                                                                              |
+| **Phase 6 or when wanted** | `Processors.GeminiLive`, `GeminiLive.*`, `Backend.GeminiLive`; the remaining `Cascaded.*` providers; `Python`, `Python.Processor`, `Cascaded.Woof`                                                                                                                                                                                                                         | Mixed-input mode for Gemini Live. Python behind an optional Pythonx dependency.                                                                    |
 
 A module can move earlier if a phase turns out to need it; the table is the
 expected order, not a rule.
 
 Never copied:
 
-| Left behind | Why |
-| --- | --- |
-| `Subvocal.Pipeline`, `Pipeline.Runner`, `Pipeline.Local`, `Audio.PlaybackQueue` | The Membrane host and its pacing. `Octoroom.Agent.Worker` replaces them. |
-| `Transport.*` (WebRTC, WebSocket, Cloudflare SFU) | Octoroom's peers, inlets and outlets are the transport. |
-| `Phoenix.*`, `Agent`, `AgentSpec` | Channel-per-session signaling. `use Octoroom.Agent` and the worker context replace them. |
-| The browser and Swift voice clients, the server protocol | Octoroom has its own clients and no server mode. A 1:1 voice agent is a room with one person and one agent. |
+| Left behind                                                                     | Why                                                                                                         |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `Subvocal.Pipeline`, `Pipeline.Runner`, `Pipeline.Local`, `Audio.PlaybackQueue` | The Membrane host and its pacing. `Octoroom.Agent.Worker` replaces them.                                    |
+| `Transport.*` (WebRTC, WebSocket, Cloudflare SFU)                               | Octoroom's peers, inlets and outlets are the transport.                                                     |
+| `Phoenix.*`, `Agent`, `AgentSpec`                                               | Channel-per-session signaling. `use Octoroom.Agent` and the worker context replace them.                    |
+| The browser and Swift voice clients, the server protocol                        | Octoroom has its own clients and no server mode. A 1:1 voice agent is a room with one person and one agent. |
 
 Dependencies: phase 1 brings `req_llm`, `websockex`, `ortex` and
 `nimble_options`. `membrane_core`, `membrane_webrtc_plugin` and the
@@ -475,10 +459,6 @@ release: Subvocal pins `req_llm` to a git commit for the Gemini Decisions
 API (only phase 5 needs that, so phase 1 can use a released version if one
 works), and `ortex` needs a Rust toolchain or a precompiled NIF on every
 target.
-
-`decisions.md` gets a row per module group in "Where the code came from"
-as each one lands, and D5's plan for an adapter inside Subvocal is marked
-superseded.
 
 ## Testing
 
