@@ -76,6 +76,35 @@ defmodule Octoroom.Agent.Worker do
 
   It hears at 16 kHz mono and speaks at 24 kHz mono on its first output.
 
+  ## Gemini Live
+
+  With `backend: %Octoroom.Agent.Backend.GeminiLive{}` (see
+  `Octoroom.Agent.Processors.GeminiLive`), one speech-to-speech model does
+  everything. It has one audio input, so there are no front ends: the
+  inputs are mixed (`Octoroom.Agent.Audio.Mixer`) and the back end hears a
+  20 ms chunk of the mix at a time. The model decides when to answer and
+  when it's been interrupted, so `:respond`, `:gate` and follow-ups don't
+  apply, and anyone can interrupt it. What it hears has no speakers: it
+  tells voices apart as best it can, the conversation's user items have no
+  `speaker`, and tools get `speaker: nil` (except for typed turns, which
+  are sent as `[speaker] text`). It needs a voice, and `GOOGLE_API_KEY`.
+
+  The model doesn't know when its audio has played, and generates faster
+  than real time. So when it hears someone start a turn while its reply is
+  still playing, the agent interrupts that reply itself, and the model
+  thinks the whole reply was heard. There are no `:transcription`,
+  `:decision`, `:waiting` or `:follow_up` events, and `say/3` asks the
+  model to say the words, which it may not do exactly.
+
+  It keeps its Gemini session through dropped connections (the server
+  closes each after 10 minutes or so) and through restarts: it saves the
+  session's latest resumption handle (`save:`), and a restarted agent
+  resumes with it. Gemini keeps a session for 2 hours after it ends. If the
+  handle is older than that, or Gemini rejects it, the new session's
+  instructions end with the conversation so far (the last 50 items), so
+  the model still knows what was said, but not how it sounded. Either way,
+  it doesn't greet again.
+
   ## Args (a map or keyword list)
 
   `Octoroom.Agent.agent/3` builds these from an `Octoroom.Agent` module:
@@ -85,10 +114,12 @@ defmodule Octoroom.Agent.Worker do
 
     * `:backend` - a `Octoroom.Agent.Backend.Cascaded` struct, or a map for
       `Octoroom.Agent.Backend.Cascaded.new/1` (default `%{}`: Soniox, Gemini
-      through ReqLLM, Inworld). Its text-to-speech must produce 24 kHz.
+      through ReqLLM, Inworld). Its text-to-speech must produce 24 kHz. Or
+      an `Octoroom.Agent.Backend.GeminiLive` (see above).
     * `:front_end`, `:back_end` - pipeline specs to run instead of the
       backend's (see `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`). Each
-      front end has its own host for tasks and timers.
+      front end has its own host for tasks and timers. `front_end: nil`
+      mixes the inputs into the back end, as for Gemini Live.
     * `:name` (default `"Assistant"`), `:respond`, `:follow_up_ms` (default
       10 s), `:gate` (`:name`, the default, or `:decision`), `:thresholds`,
       `:decisions` (options for the decision stage) - see above
@@ -176,12 +207,15 @@ defmodule Octoroom.Agent.Worker do
 
   require Logger
 
-  alias Octoroom.Agent.Backend.Cascaded
+  alias Octoroom.Agent.Audio.Mixer
+  alias Octoroom.Agent.Backend.{Cascaded, GeminiLive}
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.{Core, Host, Spec}
 
   @in_rate 16_000
   @out_rate 24_000
+  # A mixed back end hears a chunk of its inputs' mix this often.
+  @mix_ms 20
 
   # The decision gate's defaults (see "Deciding to answer" in the moduledoc).
   @thresholds %{reply_above: 0.7, wait_above: 0.35, answer_above: 0.7, wait_ms: 2_500}
@@ -203,6 +237,11 @@ defmodule Octoroom.Agent.Worker do
         },
         fronts: %{},
         front_spec: front_spec,
+        # Mixed (no front end, as for Gemini Live): every input goes into
+        # one mix, which the back end hears a chunk at a time. `mix_at` is
+        # when the next chunk is due.
+        mixer: if(front_spec == nil, do: Mixer.new(rate: @in_rate, chunk_ms: @mix_ms)),
+        mix_at: nil,
         people: people(ctx.participants),
         name_pattern: name_pattern(name),
         # The other agents' names: a turn naming one of them isn't a
@@ -243,9 +282,22 @@ defmodule Octoroom.Agent.Worker do
         snapshot_items: Map.get(args, :snapshot_items, 50)
       }
 
+      # `gate: nil` clears one shared by `agents/2`.
+      if state.mixer && (args[:gate] != nil or args[:respond] != nil) do
+        Logger.warning(
+          "agent #{ctx.id}: the model takes its own turns when it hears a mix; " <>
+            "gate: and respond: are ignored"
+        )
+      end
+
       {state, actions} = set_presence(state, "listening", [])
       {state, actions} = push_back(state, %Frames.Start{session_id: session_id(ctx)}, actions)
-      {state, actions} = Enum.reduce(ctx.inputs, {state, actions}, &add_front/2)
+
+      {state, actions} =
+        if state.mixer,
+          do: {schedule_mix(%{state | mix_at: now()}), actions},
+          else: Enum.reduce(ctx.inputs, {state, actions}, &add_front/2)
+
       result(state, actions)
     else
       {:error, reason} -> {:stop, reason}
@@ -253,6 +305,9 @@ defmodule Octoroom.Agent.Worker do
   end
 
   @impl true
+  def handle_audio(input, pcm, %{mixer: %Mixer{} = mixer} = state),
+    do: {:ok, %{state | mixer: Mixer.push(mixer, input, pcm)}}
+
   def handle_audio(input, pcm, state) do
     {state, actions} =
       if Map.has_key?(state.fronts, input), do: {state, []}, else: add_front(input, {state, []})
@@ -271,6 +326,11 @@ defmodule Octoroom.Agent.Worker do
   end
 
   @impl true
+  def handle_info({:octoroom, :inputs, inputs}, %{mixer: %Mixer{} = mixer} = state) do
+    gone = Map.keys(mixer.inputs) -- inputs
+    {:ok, %{state | mixer: Enum.reduce(gone, mixer, &Mixer.drop(&2, &1))}}
+  end
+
   def handle_info({:octoroom, :inputs, inputs}, state) do
     {state, actions} = Enum.reduce(inputs -- Map.keys(state.fronts), {state, []}, &add_front/2)
     state = Enum.reduce(Map.keys(state.fronts) -- inputs, state, &drop_front/2)
@@ -381,6 +441,28 @@ defmodule Octoroom.Agent.Worker do
 
   def handle_info({:voice_pipeline, _from, event}, state),
     do: {:ok, state, emit: {:agent, event}}
+
+  # The next chunk of the mix is due (and any that a late timer missed, up
+  # to 100 ms; past that the mix skips ahead rather than burst).
+  def handle_info(:octoroom_agent_mix, state) do
+    late = now() - state.mix_at
+    {chunks, mix_at} = if late >= 5 * @mix_ms, do: {1, now()}, else: {div(late, @mix_ms) + 1, nil}
+    mix_at = mix_at || state.mix_at + (chunks - 1) * @mix_ms
+
+    {state, actions} =
+      Enum.reduce(1..chunks, {%{state | mix_at: mix_at}, []}, fn _, {state, actions} ->
+        case Mixer.pull(state.mixer) do
+          {nil, mixer} ->
+            {%{state | mixer: mixer}, actions}
+
+          {pcm, mixer} ->
+            frame = %Frames.InputAudio{audio: pcm, sample_rate: @in_rate}
+            push_back(%{state | mixer: mixer}, frame, actions)
+        end
+      end)
+
+    result(schedule_mix(state), actions)
+  end
 
   # A held turn's wait ran out with nobody else speaking: answer it.
   def handle_info({:octoroom_agent_floor, ref}, %{waiting: %{ref: ref} = w} = state) do
@@ -535,6 +617,12 @@ defmodule Octoroom.Agent.Worker do
 
   defp with_questions(args, _ctx), do: args
 
+  defp schedule_mix(state) do
+    at = state.mix_at + @mix_ms
+    Process.send_after(self(), :octoroom_agent_mix, max(at - now(), 0))
+    %{state | mix_at: at}
+  end
+
   defp from_agent(%{agent: module} = args, ctx) when is_atom(module) do
     agent_ctx = agent_ctx(args, ctx)
 
@@ -547,7 +635,7 @@ defmodule Octoroom.Agent.Worker do
 
     from_module =
       case module.pipeline(agent_ctx) do
-        {%Spec{} = front, %Spec{} = back} ->
+        {front, %Spec{} = back} when is_struct(front, Spec) or is_nil(front) ->
           Map.merge(from_module, %{front_end: front, back_end: back})
 
         nil ->
@@ -562,7 +650,8 @@ defmodule Octoroom.Agent.Worker do
   # `voice: false`: no text-to-speech, so nothing to play, and the reply's
   # text is what was said.
   defp specs(args) do
-    with {:ok, front, back, silence_ms} <- voiced_specs(args) do
+    with {:ok, front, back, silence_ms} <- voiced_specs(args),
+         :ok <- voice_for_mixed(front, args) do
       back =
         if Map.get(args, :voice, true) == false and :tts in Spec.names(back),
           do: back |> Spec.remove(:tts) |> silent_collector(),
@@ -583,10 +672,24 @@ defmodule Octoroom.Agent.Worker do
       else: back
   end
 
+  # A speech-to-speech model can't be silent.
+  defp voice_for_mixed(nil, %{voice: false}), do: {:error, :voice_false_needs_a_cascaded_backend}
+  defp voice_for_mixed(_front, _args), do: :ok
+
   defp voiced_specs(%{front_end: %Spec{} = front, back_end: %Spec{} = back}),
     do: {:ok, front, back, 0}
 
+  # No front end: the back end hears the inputs mixed.
+  defp voiced_specs(%{front_end: nil, back_end: %Spec{} = back}), do: {:ok, nil, back, 0}
+
   defp voiced_specs(args) do
+    case GeminiLive.from(Map.get(args, :backend, %{})) do
+      %GeminiLive{} = backend -> {:ok, nil, Spec.gemini_live(backend), 0}
+      nil -> cascaded_specs(args)
+    end
+  end
+
+  defp cascaded_specs(args) do
     backend =
       case Map.get(args, :backend, %{}) do
         %Cascaded{} = backend -> backend
@@ -635,7 +738,10 @@ defmodule Octoroom.Agent.Worker do
       initial_text: if(restored?(ctx), do: nil, else: Map.get(args, :initial_text)),
       tools: Map.get(args, :tools, []),
       context: tool_context,
-      saved: if(restored?(ctx), do: Map.take(ctx.saved, [:history, :conversation]))
+      saved: if(restored?(ctx), do: Map.take(ctx.saved, [:history, :conversation])),
+      # For Gemini Live: its session to resume, and what was said, for a
+      # new session if it can't.
+      resume: resume(ctx.saved)
     }
   end
 
@@ -645,7 +751,7 @@ defmodule Octoroom.Agent.Worker do
 
   # What was saved, with a reply that was playing when the agent stopped
   # marked interrupted: the rest of it was never heard.
-  defp restored(%{history: history, conversation: conversation, items: items}) do
+  defp restored(%{history: history, conversation: conversation, items: items} = saved) do
     items =
       Enum.map(items, fn
         %{status: "playing"} = item ->
@@ -655,12 +761,38 @@ defmodule Octoroom.Agent.Worker do
           item
       end)
 
-    %{history: history, conversation: conversation, items: items}
+    # Gemini Live's handle stays until the model sends a new one.
+    Map.merge(Map.take(saved, [:gemini_handle]), %{
+      history: history,
+      conversation: conversation,
+      items: items
+    })
   end
 
   defp restored(_nothing), do: %{history: [], conversation: nil, items: []}
 
-  defp restored?(ctx), do: match?(%{history: [_ | _]}, ctx.saved)
+  # A cascaded agent's history, or a Gemini Live conversation.
+  defp restored?(ctx),
+    do: match?(%{history: [_ | _]}, ctx.saved) or resume(ctx.saved) != nil
+
+  # Gemini keeps a session for 2 hours after it ends; a minute's margin.
+  @handle_ms :timer.hours(2) - :timer.minutes(1)
+
+  defp resume(%{items: items} = saved) do
+    handle =
+      case saved do
+        %{gemini_handle: %{handle: handle, at: at}} ->
+          if System.system_time(:millisecond) - at < @handle_ms, do: handle
+
+        _ ->
+          nil
+      end
+
+    if handle || match?(%{gemini_handle: _}, saved),
+      do: %{handle: handle, items: items}
+  end
+
+  defp resume(_nothing), do: nil
 
   # The latest version of each item, in the order they started, with when
   # each was first seen (`at`, unix ms).
@@ -863,6 +995,8 @@ defmodule Octoroom.Agent.Worker do
       else: {state, actions}
   end
 
+  # Mixed: the model decides for itself.
+  defp mode(%{mixer: %Mixer{}}), do: :always
   defp mode(%{respond: nil, gate: :decision}), do: :addressed
   defp mode(%{respond: nil, fronts: fronts}) when map_size(fronts) > 1, do: :addressed
   defp mode(%{respond: nil}), do: :always
@@ -1073,6 +1207,14 @@ defmodule Octoroom.Agent.Worker do
   end
 
   defp back_command({:output_upstream, _frame}, state), do: {state, []}
+  # A mixed back end heard someone start a turn. If its reply is still
+  # playing, they're talking over it.
+  defp back_command({:notify, :user_speaking}, state) do
+    if now() < state.speaking_until,
+      do: push_back(state, %Frames.Interruption{}, []),
+      else: {state, []}
+  end
+
   defp back_command({:notify, event}, state), do: {state, [emit: {:agent, event}]}
 
   defp back_command({:interrupted, _generation}, state),

@@ -7,7 +7,8 @@ defmodule Call.Agent do
   """
 
   @defaults %{
-    # :cascaded (Soniox STT, the LLM reads text) or :half (the LLM hears audio)
+    # :cascaded (Soniox STT, the LLM reads text), :half (the LLM hears audio)
+    # or :live (Gemini Live hears everyone mixed, and takes its own turns)
     pipeline: :cascaded,
     # :name (its name or a follow-up) or :decision (a decision model on the audio)
     gate: :name,
@@ -24,6 +25,9 @@ defmodule Call.Agent do
   def config(assigns), do: Map.merge(@defaults, Map.get(assigns, :agent) || %{})
 
   @doc "`Octoroom.Agent.agent/3` options for `config` (`Call.Assistant` reads `args`)."
+  # Gemini Live decides for itself when to answer.
+  def opts(%{pipeline: :live}), do: [name: "Assistant", args: %{pipeline: :live}]
+
   def opts(config) do
     [
       name: "Assistant",
@@ -45,7 +49,11 @@ defmodule Call.Agent do
   def parse(params, current) do
     %{
       pipeline:
-        choice(params["pipeline"], %{"cascaded" => :cascaded, "half" => :half}, current.pipeline),
+        choice(
+          params["pipeline"],
+          %{"cascaded" => :cascaded, "half" => :half, "live" => :live},
+          current.pipeline
+        ),
       gate: choice(params["gate"], %{"name" => :name, "decision" => :decision}, current.gate),
       follow_up_s: number(params["follow_up_s"], 0, 30, current.follow_up_s),
       reply_above: number(params["reply_above"], 0, 1, current.reply_above),
@@ -381,6 +389,13 @@ defmodule Call.LabLive do
               Half-cascaded
               <small>
                 Each turn is recorded (Smart Turn ends it) and the LLM hears the audio. A transcript follows.
+              </small>
+            </label>
+            <label class="opt">
+              <input type="radio" name="pipeline" value="live" checked={@config.pipeline == :live} />
+              Gemini Live
+              <small>
+                One speech-to-speech model hears everyone mixed and decides when to answer. The settings below don't apply.
               </small>
             </label>
           </fieldset>

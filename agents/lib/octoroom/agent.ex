@@ -104,8 +104,14 @@ defmodule Octoroom.Agent do
   The providers: an `Octoroom.Agent.Backend.Cascaded` struct, or a map for
   `Octoroom.Agent.Backend.Cascaded.new/1`. Default `%{}`: Soniox, Gemini
   through ReqLLM, Inworld.
+
+  Or an `Octoroom.Agent.Backend.GeminiLive` struct (or
+  `%{gemini_live: opts}`): one speech-to-speech model that hears everyone
+  mixed and takes its own turns, so `respond:` and `gate:` don't apply (see
+  "Gemini Live" in `Octoroom.Agent.Worker`).
   """
-  @callback backend(ctx) :: %Octoroom.Agent.Backend.Cascaded{} | map
+  @callback backend(ctx) ::
+              %Octoroom.Agent.Backend.Cascaded{} | %Octoroom.Agent.Backend.GeminiLive{} | map
 
   @doc """
   Something to answer as soon as the agent starts, as if a person had said
@@ -118,9 +124,10 @@ defmodule Octoroom.Agent do
   @doc """
   `{front_end, back_end}` pipeline specs to run instead of the backend's
   (see `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`), for custom stages
-  or fake providers in tests. `nil` uses the backend's.
+  or fake providers in tests. A `nil` front end makes the back end hear
+  the inputs mixed, as with `Spec.gemini_live/1`. `nil` uses the backend's.
   """
-  @callback pipeline(ctx) :: {Spec.t(), Spec.t()} | nil
+  @callback pipeline(ctx) :: {Spec.t() | nil, Spec.t()} | nil
 
   @doc """
   The questions for the decision model, as for `ReqLLM.evaluate/4` (with

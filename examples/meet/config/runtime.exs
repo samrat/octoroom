@@ -9,7 +9,7 @@ import Config
 
 # Octoroom needs a Cloudflare Realtime SFU app, and the assistants need
 # SONIOX_API_KEY, OPENROUTER_API_KEY (the LLM and the decision model) and
-# INWORLD_API_KEY; GOOGLE_API_KEY only to go back to Gemini, and
+# INWORLD_API_KEY; GOOGLE_API_KEY for the Gemini Live assistant, and
 # ASSEMBLY_AI_API_KEY only for AssemblyAI speech-to-text. They're read
 # from the environment, or from a `.env` file next to mix.exs (KEY=value
 # lines).
