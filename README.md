@@ -25,7 +25,10 @@ config :bundlex, :disable_precompiled_os_deps, apps: [:ex_libsrtp]
 in your app's config: the precompiled libsrtp links a libcrypto that isn't
 on the default path.
 
-Try it: [examples/call](examples/call) is a LiveView group call with video.
+Try it: [examples/agent](examples/agent) is one person talking to a voice
+agent, and times its replies; [examples/meet](examples/meet) is a video call
+with three AI assistants; [examples/call](examples/call) is a LiveView group
+call with video and the testing tools.
 
 Native apps join the same rooms with the Swift client for iOS and macOS:
 see [swift/README.md](swift/README.md).

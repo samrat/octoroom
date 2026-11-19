@@ -15,8 +15,10 @@ Milestones 1–5, video steps 1–2 and the Swift client are done (see the
 6. **Interpretation demo**, on `octoroom_agents` rather than a Subvocal
    adapter (Example 2 in [architecture.md](architecture.md#example-2-live-interpretation);
    phase 2 of [proposal-agents.md](proposal-agents.md#phases)). Agents phase 1
-   (a cascaded agent as a worker) is built; its latency is still to be
-   measured against real providers.
+   (a cascaded agent as a worker) is built, and measured through a room in
+   [examples/agent](../examples/agent#measuring-latency): 1.6 s from the end
+   of speech to the reply heard in the browser, of which about 560 ms is
+   between the agent's outlet and the ear.
 7. **Phone callers** (see [Telephony](#telephony)): Twilio Media Streams,
    `kind: :phone` participants backed by a bridge worker with mixing, the
    phone router, DTMF events and outbound `dial`. The demo is Example 3
@@ -33,6 +35,14 @@ brief: [handoff-room-hardening.md](handoff-room-hardening.md).
 
 Things the first draft promised that the code doesn't do:
 
+- **A greeting that waits for its listener.** An agent's `initial_text/1`
+  starts 100 ms after the agent does, whether or not anyone is pulling its
+  track yet; only the LLM's time keeps the first words from being lost
+  ([examples/agent](../examples/agent#measuring-latency)). It could start
+  when the first subscriber's pull is live.
+- **The room path's extra 200 ms.** A reply takes about 560 ms from the
+  agent's outlet to the browser's ear, against about 350 ms for a round
+  trip through Cloudflare (`examples/call`'s echo). Find where the rest goes.
 - **Speaking events.** No `:speaking` event exists. See the open question
   below on where levels should come from.
 - **Events over Phoenix PubSub.** Events go through a local `Registry`
