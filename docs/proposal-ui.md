@@ -18,6 +18,11 @@ LiveView hooks. It has two layouts on a shared foundation:
 An agent in a group call uses the room layout, and the agent gets a tile that
 uses the agent visualizer. Neither layout tries to adapt into the other.
 
+A third piece, the **dock**, is a call toolbar for apps that already exist:
+a call that sits on top of the app's own pages and stays connected as the
+user navigates, like a Slack huddle. It reuses the room's parts, not its
+full-page layout. See [Dock for existing apps](#dock-for-existing-apps).
+
 The package is pulled out of real demos rather than designed up front.
 `examples/call` is rebuilt on it first, then a new 1:1 agent example, and
 the API counts as unstable until a third demo (interpretation, milestone 6)
@@ -192,6 +197,70 @@ pill in HEEx, not in JS.
   presence. Until then the example derives the state from those events and
   from the agent's audio level.
 
+## Dock for existing apps
+
+The room and agent layouts are pages. Most Phoenix apps that add calls
+want the call next to their own UI instead: a team edits a document or a
+pipeline sheet and talks over it, and the agent's tools change what's on
+the screen ([the collaboration call](proposal-agents.md#the-four-use-cases)).
+This is where Octoroom differs most from the hosted SDKs, and the dock is how
+a demo shows it.
+
+### Staying connected across pages
+
+The dock is only useful if the call survives navigation. In LiveView, a
+`live_render(@socket, Octoroom.UI.DockLive, id: "octo-dock", sticky: true)`
+in the root layout is a nested LiveView that isn't remounted on
+`live_navigate` between LiveViews in the same `live_session`. The hook, its
+`RoomClient` and the peer connection live there and survive. A full page
+load (a dead view, a different `live_session`, a reload) still tears the
+call down. The client's resume token brings it back, but with a gap, so
+the docs should say which navigations keep the call.
+
+The dock LiveView takes the room id and the user from the session. The app
+decides when it shows, for example in a project page's room, with no UI
+when there's no call.
+
+### Floating: when it's good and when it's bad
+
+Floating call controls are an established pattern: Slack huddles, Meet and
+Zoom's mini windows, and Discord's voice panel all do it. They become bad
+UX when they:
+
+- **cover content the user needs**, such as a fixed corner over a "Save"
+  button or a table's last column;
+- **can't be moved or shrunk**;
+- **fight the app's layers**, appearing above modals, under sticky headers,
+  or over toasts;
+- **take focus or keyboard shortcuts** from the page.
+
+The dock avoids those:
+
+- **Collapsed by default**: a pill with participants' avatars (each with
+  a speaking ring), mic toggle, a timer and leave. About 48 px tall.
+- **Expanded on click**: a small strip of video tiles plus the full control
+  bar, still well under a third of the viewport. Screen shares open a
+  larger draggable window, or pop out with the browser's Picture-in-Picture.
+- **Draggable, snapping to the four corners and bottom centre.** The
+  position is remembered per user in `localStorage`.
+- **Inline mode**: `<.call_dock mode={:inline}>` renders the same controls
+  as a normal element, for apps that would rather put the call in a header
+  or sidebar than float it. It's the same component, with no position:
+  fixed.
+- **Layering**: `--octo-dock-z` defaults below typical modal z-indexes,
+  and the dock honours `inert` on its container, so app modals cover it.
+- **No global shortcuts by default.** Optional ones (mute with a key) are
+  off unless the app turns them on.
+- **Mobile**: collapsed into a bottom bar above the safe area, with no
+  dragging.
+
+### Agent in the dock
+
+An agent in the call is another avatar in the pill, with the agent
+visualizer instead of a speaking ring, and its captions or replies show as
+a short line above the pill. The phase-3 agent states drive it, as in the
+agent layout.
+
 ## Phases
 
 Each phase ends with a demo that looks right in the browser at desktop and
@@ -222,13 +291,21 @@ phone widths, in both themes.
 4. **Agents in a room.** Agent tiles in the room layout with the agent
    visualizer and AI badge, and captions in the shared transcript. The
    `examples/call` assistant uses them.
-5. **Prove it with a third demo.** The interpretation demo (milestone 6) is
+5. **The dock, with a collaboration demo.** `<.call_dock>` as a sticky
+   LiveView, floating and inline modes, and `examples/collab`: a small
+   LiveView app (a shared list or sheet) with the dock, and an agent whose
+   tool edits the list while everyone watches it change.
+   *Done when* the call survives `live_navigate` between two pages with no
+   audio gap, the dock never covers the app's modal, and an agent tool call
+   updates every participant's page.
+6. **Prove it with another demo.** The interpretation demo (milestone 6) is
    built on the package with no CSS of its own. Whatever it needs that the
    package doesn't have, the package gains. After that, document the
    package in its README and stop calling it unstable.
 
 Phases 1 and 3 share only the foundation, so 3 can start once phase 1's
-shared components exist.
+shared components exist. Phase 5 needs phase 1's tiles and control bar and
+phase 3's agent states.
 
 ## Open questions
 
@@ -243,6 +320,10 @@ shared components exist.
   See the roadmap's speaking-indicators question.
 - **Agent visual**: bars, an orb, or something more Octoroom-specific? It's
   the most visible part of the agent demo.
+- **Dock across full page loads**: is a resumed call after a reload good
+  enough, or should the docs push apps to keep call pages in one
+  `live_session`? Two tabs of the same app are two participants today.
+  Should the dock notice and offer to move the call?
 - **Tailwind users**: is overriding custom properties enough, or should
   components take a `class` attribute everywhere so daisyUI apps can add
   their own utilities?
