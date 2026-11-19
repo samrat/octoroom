@@ -708,6 +708,7 @@ emit: event              # broadcast {:worker_event, worker_id, event} to scope:
 notify: {output, type, data}   # an event for the clients subscribed to output (audio or data);
                                # with a participant id as a 4th element, for that one only
 presence: %{state: s, attributes: a}   # what clients show for this worker
+save: term               # keep term in the store; the worker's next start gets it as ctx.saved
 ```
 
 - `use Octoroom.Worker, audio: [rate: 16_000, channels: 1]` picks the PCM
@@ -716,8 +717,10 @@ presence: %{state: s, attributes: a}   # what clients show for this worker
   the same format unless `output: [rate: ..., channels: ...]` gives another
   ([D38](decisions.md#d38-a-worker-can-speak-at-another-rate-than-it-hears)).
 - `ctx` contains the room id, the worker id, input and output names, the
-  room's participant list at start, and `resumed` (`%{gone_ms: ms}` when the
-  room is recovering, otherwise nil). The worker can call
+  room's participant list at start, `resumed` (`%{gone_ms: ms}` when the
+  room is recovering, otherwise nil) and `saved` (what it last returned in
+  a `save:` action, otherwise nil; see [Worker memory](#worker-memory)).
+  The worker can call
   `Octoroom.Room.state/1` for anything newer.
 - `Octoroom.Worker.send(room_id, id, message)` reaches a worker's
   `handle_info/2` from outside, for example to flush from a LiveView.
@@ -913,7 +916,7 @@ clients, and Octoroom rebuilds the rest from there
 | Each client's Cloudflare session and the tracks pulled into it     | Cloudflare              | Keeps working, as long as the peer connection stays up.                                                                        |
 | Phoenix channel (signaling)                                        | The node                | Drops. The client reconnects on its own, with backoff.                                                                         |
 | Room server state: participants, track directory, operation queues | The node's memory       | Lost, then rebuilt (below).                                                                                                    |
-| Worker processes and their in-memory state                         | The node                | Lost. Workers are restarted.                                                                                                   |
+| Worker processes and their in-memory state                         | The node                | Lost. Workers are restarted, with what they saved ([Worker memory](#worker-memory)).                                           |
 | Worker peer connections and their Cloudflare sessions              | The node and Cloudflare | Drop. The sessions end within a minute, so worker output tracks are dead to listeners. Nothing is left to close.               |
 | Room assigns                                                       | `Octoroom.Store`        | Survive.                                                                                                                       |
 
@@ -970,20 +973,35 @@ own when that peer connection closes.
 When only the room server crashes, the channel stays up and resumes on its
 own from the resume data it keeps.
 
-### What stays the developer's job
+### Worker memory
 
-Worker memory. An agent's conversation so far lives in the worker process,
-and Octoroom can't snapshot it. A worker that needs to survive restarts
-persists its own state, e.g. conversation history in the app's database
-keyed by room id, and reloads it when `ctx.resumed` is set.
+Octoroom can't snapshot a worker's process, so a worker says what it would
+need to carry on: it returns a `save: term` action, and the store keeps the
+term under `{room id, worker id}`, each save replacing the last. The
+worker's next start in that room gets it as `ctx.saved`, after a crash, a
+change of args, or the node restarting mid-call. `ctx.resumed` tells a
+recovery apart from the other two.
+
+What to save stays the developer's job. `Octoroom.Agent` saves its settled
+conversation (the last 200 items), so a restored agent continues the same
+conversation without greeting again; a reply that was playing comes back
+interrupted. Anything not saved, such as audio in flight, is lost. Keep the
+term small: it's written on every save.
+
+The saved term is deleted when the room stops the worker because
+`workers/1` no longer lists it, when the room stops because its last
+participant left, when a fresh room with that id starts, and by the janitor
+with the room's record.
 
 ### `Octoroom.Store`
 
 A key-value behaviour (`get`, `put`, `delete`, `all`, plus `child_spec`)
-with one table ([D18](decisions.md#d18-the-store-holds-room-records-and-no-participant-state)):
+with two tables ([D18](decisions.md#d18-the-store-holds-room-records-and-no-participant-state)):
 
 - `:rooms`: room id => `%{run, assigns, updated_at}`. Written when a room
   server starts, when its assigns change and on its heartbeat.
+- `:workers`: `{room id, worker id}` => what the worker last saved (see
+  [Worker memory](#worker-memory)).
 
 The store holds no participant state and no worker sessions. Participants
 come back through their resume tokens, and worker sessions end with their

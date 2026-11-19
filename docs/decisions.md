@@ -22,85 +22,85 @@ architecture.md in the same change.
 
 ## Timeline
 
-| Step                         | What was built                                                                                   | Commit    |
-| ---------------------------- | ------------------------------------------------------------------------------------------------ | --------- |
-| Milestones 1–2               | Primitives ported from Subvocal; browser-to-browser rooms: room server, reconciler, channel, JS client. | `f76d3f8` |
-| Milestone 3                  | Workers, on Cloudflare's WebSocket adapters: outlets, inlets, worker supervision.                | `71771a6` |
-| Inlet hold                   | Inlets held to real time.                                                                        | `ec38599` |
-| Milestone 5 (robustness)     | Store, resume tokens, recovery, retries, telemetry. Built before milestone 4, so on adapters.    | `a04c0d9` |
-| Milestone 4                  | Workers moved from WebSocket adapters to WebRTC peers. Adapter code removed.                     | `3e01fa5` |
-| Video steps 1–2              | Publications per source; cameras, screen shares and mute in browsers.                            | `5acfc60` |
-| Swift client                 | A port of the browser client for iOS and macOS.                                                  | `7871b60` |
-| Agents phase 1               | `agents/` (`octoroom_agents`): Subvocal's cascaded pipeline as a worker. Separate output rates in core. | uncommitted |
-| Worker events                | Workers' presence, events and messages reach clients by subscription; agents, meet, JS and Swift use them (D44). | `bb20857`–`9504213` |
+| Step                     | What was built                                                                                                   | Commit              |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------- | ------------------- |
+| Milestones 1–2           | Primitives ported from Subvocal; browser-to-browser rooms: room server, reconciler, channel, JS client.          | `f76d3f8`           |
+| Milestone 3              | Workers, on Cloudflare's WebSocket adapters: outlets, inlets, worker supervision.                                | `71771a6`           |
+| Inlet hold               | Inlets held to real time.                                                                                        | `ec38599`           |
+| Milestone 5 (robustness) | Store, resume tokens, recovery, retries, telemetry. Built before milestone 4, so on adapters.                    | `a04c0d9`           |
+| Milestone 4              | Workers moved from WebSocket adapters to WebRTC peers. Adapter code removed.                                     | `3e01fa5`           |
+| Video steps 1–2          | Publications per source; cameras, screen shares and mute in browsers.                                            | `5acfc60`           |
+| Swift client             | A port of the browser client for iOS and macOS.                                                                  | `7871b60`           |
+| Agents phase 1           | `agents/` (`octoroom_agents`): Subvocal's cascaded pipeline as a worker. Separate output rates in core.          | uncommitted         |
+| Worker events            | Workers' presence, events and messages reach clients by subscription; agents, meet, JS and Swift use them (D44). | `bb20857`–`9504213` |
 
 ## Index
 
-| #                                                                    | Decision                                                  | Status                |
-| -------------------------------------------------------------------- | --------------------------------------------------------- | --------------------- |
-| [D1](#d1-cloudflare-realtime-sfu-is-the-only-media-plane)            | Cloudflare Realtime SFU is the only media plane           | Current               |
-| [D2](#d2-routing-is-a-pure-policy-and-a-reconciler)                  | Routing is a pure policy and a reconciler                 | Current               |
-| [D3](#d3-the-room-server-is-the-single-writer)                       | The room server is the single writer                      | Current               |
-| [D4](#d4-one-cloudflare-session-per-browser)                         | One Cloudflare session per browser                        | Current, open question |
-| [D5](#d5-octoroom-ships-no-ai)                                       | Octoroom ships no AI                                      | Current, amended by D37 |
-| [D6](#d6-gain-is-applied-in-the-listeners-client)                    | Gain is applied in the listener's client                  | Current               |
-| [D7](#d7-closing-a-subscription-is-client-offered)                   | Closing a subscription is client-offered                  | Current               |
-| [D8](#d8-a-track-is-live-when-its-publisher-reports-connected)       | A track is live when its publisher reports connected      | Current               |
-| [D9](#d9-events-go-through-a-registry)                               | Events go through a Registry                              | Current, amended by D44 |
-| [D10](#d10-workers-connect-through-websocket-adapters)               | Workers connect through WebSocket adapters                | Superseded by D24     |
-| [D11](#d11-worker-media-lives-apart-from-the-worker)                 | Worker media lives apart from the worker                  | Current               |
-| [D12](#d12-the-room-server-restarts-crashed-workers)                 | The room server restarts crashed workers                  | Current               |
-| [D13](#d13-per-room-supervisor-with-the-room-server-first)           | Per-room supervisor with the room server first            | Superseded by D20     |
-| [D14](#d14-workers-are-reconciled-by-a-second-pure-diff)             | Workers are reconciled by a second pure diff              | Current               |
-| [D15](#d15-outlets-pace-to-real-time)                                | Outlets pace to real time                                 | Current               |
-| [D16](#d16-inlets-are-held-to-real-time)                             | Inlets are held to real time                              | Current               |
-| [D17](#d17-recover-by-adopting-sessions-through-resume-tokens)       | Recover by adopting sessions through resume tokens        | Current               |
-| [D18](#d18-the-store-holds-room-records-and-no-participant-state)    | The store holds room records and no participant state     | Current               |
-| [D19](#d19-adapter-records-and-a-janitor-that-closes-adapters)       | Adapter records and a janitor that closes adapters        | Superseded by D24     |
-| [D20](#d20-the-room-server-is-the-last-child)                        | The room server is the last child                         | Current               |
-| [D21](#d21-a-dropped-connection-is-not-a-leave)                      | A dropped connection is not a leave                       | Current               |
-| [D22](#d22-stale-worker-output-pulls-are-closed-and-pulled-again)    | Stale worker output pulls are closed and pulled again     | Current               |
-| [D23](#d23-retries-and-giving-up)                                    | Retries and giving up                                     | Current               |
-| [D24](#d24-workers-move-to-webrtc-peers)                             | Workers move to WebRTC peers                              | Current               |
-| [D25](#d25-each-peer-makes-its-own-cloudflare-calls)                 | Each peer makes its own Cloudflare calls                  | Current               |
-| [D26](#d26-peers-come-and-go-with-media)                             | Peers come and go with media                              | Current               |
-| [D27](#d27-no-startup-check-for-outbound-udp)                        | No startup check for outbound UDP                         | Current               |
-| [D28](#d28-host-candidates-only-with-workarounds-for-cloudflare)     | Host candidates only, with workarounds for Cloudflare     | Current               |
-| [D29](#d29-libsrtp-comes-from-the-system)                            | libsrtp comes from the system                             | Current, open question |
-| [D30](#d30-crashed-inlets-and-outlets-back-off)                      | Crashed inlets and outlets back off                       | Current               |
-| [D31](#d31-publications-are-a-map-keyed-by-source)                   | Publications are a map keyed by source                    | Current               |
-| [D32](#d32-publishing-after-joining-is-server-paced)                 | Publishing after joining is server-paced                  | Current               |
-| [D33](#d33-unpublish-closes-pulls-first)                             | Unpublish closes pulls first                              | Current               |
-| [D34](#d34-mute-is-a-flag-and-not-an-unpublish)                      | Mute is a flag and not an unpublish                       | Current               |
-| [D35](#d35-remote-video-gets-no-element)                             | Remote video gets no element                              | Current               |
-| [D36](#d36-the-swift-client-is-a-port-of-the-browser-client)         | The Swift client is a port of the browser client          | Current               |
-| [D37](#d37-agents-are-a-package-in-this-repository-copied-from-subvocal) | Agents are a package in this repository, copied from Subvocal | Current           |
-| [D38](#d38-a-worker-can-speak-at-another-rate-than-it-hears)         | A worker can speak at another rate than it hears          | Current               |
-| [D39](#d39-an-agent-runs-a-front-end-per-speaker)                    | An agent runs a front end per speaker                     | Current               |
-| [D40](#d40-a-decision-model-hears-each-turn-and-the-agent-may-wait-for-the-floor) | A decision model hears each turn, and the agent may wait for the floor | Current |
-| [D41](#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room) | The app asks the decision model its own questions, and several agents share a room | Current |
-| [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate) | Clients send their offer at the first ICE candidate | Current |
-| [D43](#d43-inlets-decode-to-the-workers-format) | Inlets decode to the worker's format | Current |
-| [D44](#d44-workers-reach-clients-through-their-outputs) | Workers reach clients through their outputs | Current |
+| #                                                                                             | Decision                                                                           | Status                  |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------- |
+| [D1](#d1-cloudflare-realtime-sfu-is-the-only-media-plane)                                     | Cloudflare Realtime SFU is the only media plane                                    | Current                 |
+| [D2](#d2-routing-is-a-pure-policy-and-a-reconciler)                                           | Routing is a pure policy and a reconciler                                          | Current                 |
+| [D3](#d3-the-room-server-is-the-single-writer)                                                | The room server is the single writer                                               | Current                 |
+| [D4](#d4-one-cloudflare-session-per-browser)                                                  | One Cloudflare session per browser                                                 | Current, open question  |
+| [D5](#d5-octoroom-ships-no-ai)                                                                | Octoroom ships no AI                                                               | Current, amended by D37 |
+| [D6](#d6-gain-is-applied-in-the-listeners-client)                                             | Gain is applied in the listener's client                                           | Current                 |
+| [D7](#d7-closing-a-subscription-is-client-offered)                                            | Closing a subscription is client-offered                                           | Current                 |
+| [D8](#d8-a-track-is-live-when-its-publisher-reports-connected)                                | A track is live when its publisher reports connected                               | Current                 |
+| [D9](#d9-events-go-through-a-registry)                                                        | Events go through a Registry                                                       | Current, amended by D44 |
+| [D10](#d10-workers-connect-through-websocket-adapters)                                        | Workers connect through WebSocket adapters                                         | Superseded by D24       |
+| [D11](#d11-worker-media-lives-apart-from-the-worker)                                          | Worker media lives apart from the worker                                           | Current                 |
+| [D12](#d12-the-room-server-restarts-crashed-workers)                                          | The room server restarts crashed workers                                           | Current                 |
+| [D13](#d13-per-room-supervisor-with-the-room-server-first)                                    | Per-room supervisor with the room server first                                     | Superseded by D20       |
+| [D14](#d14-workers-are-reconciled-by-a-second-pure-diff)                                      | Workers are reconciled by a second pure diff                                       | Current                 |
+| [D15](#d15-outlets-pace-to-real-time)                                                         | Outlets pace to real time                                                          | Current                 |
+| [D16](#d16-inlets-are-held-to-real-time)                                                      | Inlets are held to real time                                                       | Current                 |
+| [D17](#d17-recover-by-adopting-sessions-through-resume-tokens)                                | Recover by adopting sessions through resume tokens                                 | Current                 |
+| [D18](#d18-the-store-holds-room-records-and-no-participant-state)                             | The store holds room records and no participant state                              | Current                 |
+| [D19](#d19-adapter-records-and-a-janitor-that-closes-adapters)                                | Adapter records and a janitor that closes adapters                                 | Superseded by D24       |
+| [D20](#d20-the-room-server-is-the-last-child)                                                 | The room server is the last child                                                  | Current                 |
+| [D21](#d21-a-dropped-connection-is-not-a-leave)                                               | A dropped connection is not a leave                                                | Current                 |
+| [D22](#d22-stale-worker-output-pulls-are-closed-and-pulled-again)                             | Stale worker output pulls are closed and pulled again                              | Current                 |
+| [D23](#d23-retries-and-giving-up)                                                             | Retries and giving up                                                              | Current                 |
+| [D24](#d24-workers-move-to-webrtc-peers)                                                      | Workers move to WebRTC peers                                                       | Current                 |
+| [D25](#d25-each-peer-makes-its-own-cloudflare-calls)                                          | Each peer makes its own Cloudflare calls                                           | Current                 |
+| [D26](#d26-peers-come-and-go-with-media)                                                      | Peers come and go with media                                                       | Current                 |
+| [D27](#d27-no-startup-check-for-outbound-udp)                                                 | No startup check for outbound UDP                                                  | Current                 |
+| [D28](#d28-host-candidates-only-with-workarounds-for-cloudflare)                              | Host candidates only, with workarounds for Cloudflare                              | Current                 |
+| [D29](#d29-libsrtp-comes-from-the-system)                                                     | libsrtp comes from the system                                                      | Current, open question  |
+| [D30](#d30-crashed-inlets-and-outlets-back-off)                                               | Crashed inlets and outlets back off                                                | Current                 |
+| [D31](#d31-publications-are-a-map-keyed-by-source)                                            | Publications are a map keyed by source                                             | Current                 |
+| [D32](#d32-publishing-after-joining-is-server-paced)                                          | Publishing after joining is server-paced                                           | Current                 |
+| [D33](#d33-unpublish-closes-pulls-first)                                                      | Unpublish closes pulls first                                                       | Current                 |
+| [D34](#d34-mute-is-a-flag-and-not-an-unpublish)                                               | Mute is a flag and not an unpublish                                                | Current                 |
+| [D35](#d35-remote-video-gets-no-element)                                                      | Remote video gets no element                                                       | Current                 |
+| [D36](#d36-the-swift-client-is-a-port-of-the-browser-client)                                  | The Swift client is a port of the browser client                                   | Current                 |
+| [D37](#d37-agents-are-a-package-in-this-repository-copied-from-subvocal)                      | Agents are a package in this repository, copied from Subvocal                      | Current                 |
+| [D38](#d38-a-worker-can-speak-at-another-rate-than-it-hears)                                  | A worker can speak at another rate than it hears                                   | Current                 |
+| [D39](#d39-an-agent-runs-a-front-end-per-speaker)                                             | An agent runs a front end per speaker                                              | Current                 |
+| [D40](#d40-a-decision-model-hears-each-turn-and-the-agent-may-wait-for-the-floor)             | A decision model hears each turn, and the agent may wait for the floor             | Current                 |
+| [D41](#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room) | The app asks the decision model its own questions, and several agents share a room | Current                 |
+| [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate)                               | Clients send their offer at the first ICE candidate                                | Current                 |
+| [D43](#d43-inlets-decode-to-the-workers-format)                                               | Inlets decode to the worker's format                                               | Current                 |
+| [D44](#d44-workers-reach-clients-through-their-outputs)                                       | Workers reach clients through their outputs                                        | Current                 |
 
 ## Removed code
 
 Names that appear in old commits and in superseded entries below, and no
 longer exist:
 
-| Name                                             | Was                                                                 | Removed by |
-| ------------------------------------------------ | ------------------------------------------------------------------- | ---------- |
-| `Octoroom.Plug`                                  | The WebSocket endpoint Cloudflare dialed for each adapter.          | D24        |
-| `Octoroom.Adapter`, `Octoroom.Adapter.Socket`    | Adapter bookkeeping and the socket handler for one adapter.         | D24        |
-| `Octoroom.Cloudflare.Packet`                     | Hand-rolled protobuf codec for the adapters' PCM `Packet`.          | D24        |
-| Adapter calls in `Octoroom.Cloudflare`           | `adapters/websocket/new` and `close`.                               | D24        |
-| `config :octoroom, public_ws_url:`               | The public `wss://` URL Cloudflare dialed.                          | D24        |
-| The store's `:adapters` table                    | Adapter ids recorded so a later run could close them.               | D24        |
-| The janitor's adapter sweep                      | Closed adapters whose room wasn't running.                          | D24        |
-| `plug`, `websock_adapter` dependencies           | For `Octoroom.Plug`.                                                | D24        |
-| Telemetry `[:octoroom, :adapter, :create]`       | Became `[:octoroom, :peer, :connect]`.                              | D24        |
-| A participant's `mic` field in the room server   | `:none \| :publishing \| :pending \| :live`, one track per participant. | D31    |
-| The room server as the supervisor's first child  | The process order of milestone 3.                                   | D20        |
+| Name                                            | Was                                                                     | Removed by |
+| ----------------------------------------------- | ----------------------------------------------------------------------- | ---------- |
+| `Octoroom.Plug`                                 | The WebSocket endpoint Cloudflare dialed for each adapter.              | D24        |
+| `Octoroom.Adapter`, `Octoroom.Adapter.Socket`   | Adapter bookkeeping and the socket handler for one adapter.             | D24        |
+| `Octoroom.Cloudflare.Packet`                    | Hand-rolled protobuf codec for the adapters' PCM `Packet`.              | D24        |
+| Adapter calls in `Octoroom.Cloudflare`          | `adapters/websocket/new` and `close`.                                   | D24        |
+| `config :octoroom, public_ws_url:`              | The public `wss://` URL Cloudflare dialed.                              | D24        |
+| The store's `:adapters` table                   | Adapter ids recorded so a later run could close them.                   | D24        |
+| The janitor's adapter sweep                     | Closed adapters whose room wasn't running.                              | D24        |
+| `plug`, `websock_adapter` dependencies          | For `Octoroom.Plug`.                                                    | D24        |
+| Telemetry `[:octoroom, :adapter, :create]`      | Became `[:octoroom, :peer, :connect]`.                                  | D24        |
+| A participant's `mic` field in the room server  | `:none \| :publishing \| :pending \| :live`, one track per participant. | D31        |
+| The room server as the supervisor's first child | The process order of milestone 3.                                       | D20        |
 
 ## Decisions
 
@@ -854,7 +854,7 @@ since tools run next to the app. One provider each: Soniox, ReqLLM (Gemini
 by default) and Inworld. `Spec` lost isolation, composites, Gemini Live and
 `describe/1`; `Spec.cascaded/2` raises for audio input and Smart Turn
 rather than ignoring them. `req_llm` is the released 1.30, not Subvocal's
-git pin. See [Where the code came from](#where-the-code-came-from).
+git pin.
 
 **Consequences.** No Membrane: the outlet paces, so the agent hands audio
 over as fast as TTS makes it, and an interruption is one `flush`. A crashed
@@ -1130,53 +1130,6 @@ agent with no inputs can't be messaged, since `message/3` only narrows.
 Meet's LiveView stays on `scope: :room`, because it shows decisions and
 latency, which stay server-side.
 
-## Where the code came from
-
-Milestone 1 ported code from Subvocal (`lib/subvocal/transport/cloudflare_sfu/`),
-renamed, with its tests:
-
-| Subvocal module                        | Became                                     | Still exists                                                              |
-| -------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------- |
-| `CloudflareSFU.API`                    | `Octoroom.Cloudflare.HTTP`                 | Yes. Error mapping for top-level and per-track errors.                    |
-| `CloudflareSFU.Packet`                 | `Octoroom.Cloudflare.Packet`               | No (D24). Hand-rolled protobuf for three fields.                          |
-| `CloudflareSFU.AdapterSocket`, `.Plug` | `Octoroom.Adapter.Socket`, `Octoroom.Plug` | No (D24). Ingest sockets needed `timeout: :infinity`.                     |
-| `CloudflareSFU.Audio`                  | `Octoroom.Audio`                           | Yes, generalized to any rate and channel count a worker asks for.         |
-| `CloudflareSFU` (signaling)            | Room server and reconciler                 | Yes. Single-peer logic became multi-peer; the ingest "wait for first frames" handshake became track status. |
-| `subvocal.mjs` `connectCloudflare`     | `octoroom.mjs`                             | Yes. Full-SDP gathering with no trickle, plus timeouts.                   |
-
-The peer (D24) started from Subvocal's WebRTC transport
-(`lib/subvocal/transport/webrtc*`), which runs `ex_webrtc` and
-`membrane_opus_plugin` with ICE options for Fly.io.
-
-Agents phase 1 (D37) copied from Subvocal at `c12431f`, renamed
-`Subvocal.*` → `Octoroom.Agent.*`, with their tests:
-
-| Subvocal modules | Changes |
-| ---------------- | ------- |
-| `Frame`, `Frames` | `source` on audio, speaking and transcription frames. |
-| `Processor`, `Processor.StateMachine` | None. |
-| `Pipeline.Core`, `Host`, `Test` | Docs only. |
-| `Pipeline.Spec` | No isolation, composites, Gemini Live or `describe/1`; `cascaded/2` builds only the STT-turns chain. |
-| `Processors.VAD`, `STT`, `STTTurns` | Stamp `source`. STT is Soniox only. |
-| `Processors.Context`, `LLM`, `Tools`, `TextChunker`, `TTS`, `AssistantCollector` | `Tools` drops the owner executor. |
-| `Tool`, `ToolCall`, `ToolResult`, `ToolDispatcher`, `ToolAdapters.*` | None. |
-| `ToolExecutor` | `:inline` only. |
-| `VAD`, `VAD.Silero` and `silero_vad.onnx` | Model path under `:octoroom_agents`. |
-| `ConversationEvents`, `Audio.PCM`, `Backend.Cascaded` | Default STT is Soniox. |
-| `Cascaded.LLM`, `ReqLLMChat`, `AudioTurn`, `SonioxSocket`, `Inworld`, `TextToSpeech`, `TextChunker` | Dispatchers cut to the copied providers. `AudioTurn` came early because `Context` uses it. |
-
-`Pipeline.Local` was the model for `Octoroom.Agent.Worker`.
-
-For D40: `Processors.AudioTurns`, `Processors.Transcriber`,
-`TurnDetection.SmartTurn` and its two models came over with `source` and an
-`interrupt: false` option; `Processors.VocalCues` became
-`Processors.Decisions`, answering who a turn is for instead of how it
-sounded.
-
-Also read before writing the reconciler: Software Mansion's archived
-`membrane_rtc_engine` and `fishjam`, Elixir room engines with their own SFU,
-for their room, peer and track bookkeeping.
-
 ## Evidence
 
 Runs against real Cloudflare. Each describes the code as it was at that
@@ -1326,16 +1279,16 @@ Two tabs of `examples/call` in one Chromium, with test patterns (640×360 at
 
 `agents/bench/turn_latency.exs`: a question synthesized by Inworld, fed to
 `Octoroom.Agent.Worker` in 20 ms frames at real time, with Soniox
-(`stt-rt-v5`), Gemini (`gemini-3.5-flash`, minimal reasoning, streaming)
+(`stt-rt-v6`), Gemini (`gemini-3.5-flash`, minimal reasoning, streaming)
 and Inworld (`inworld-tts-2`, 24 kHz). Times are ms from the end of speech
 (the VAD's stop minus its 300 ms of silence), on a Mac:
 
-| Question                            | Transcript | First LLM text | First audio to the outlet |
-| ----------------------------------- | ---------- | -------------- | ------------------------- |
-| What is the capital of France?      | 552        | 3,360          | 3,877                     |
-| How many legs does a spider have?   | 1,817      | 4,805          | 5,328                     |
-| Name a primary colour.              | 790        | 4,310          | 4,536                     |
-| What is two plus two?               | 637        | 5,561          | 6,077                     |
+| Question                          | Transcript | First LLM text | First audio to the outlet |
+| --------------------------------- | ---------- | -------------- | ------------------------- |
+| What is the capital of France?    | 552        | 3,360          | 3,877                     |
+| How many legs does a spider have? | 1,817      | 4,805          | 5,328                     |
+| Name a primary colour.            | 790        | 4,310          | 4,536                     |
+| What is two plus two?             | 637        | 5,561          | 6,077                     |
 
 Findings:
 

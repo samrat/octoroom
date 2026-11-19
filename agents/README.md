@@ -82,12 +82,12 @@ and a box to type to it. `priv/static/octoroom_agents.mjs` does it in the
 browser, and the Swift package's `OctoroomAgents` product on iOS and macOS:
 
 ```js
-import {agents} from "octoroom_agents"
+import { agents } from "octoroom_agents";
 
-const ai = agents(room) // a RoomClient
-ai.on("agents", (list) => render(list)) // [{id, name, description, state}]
-ai.on("transcript", ({agent, items}) => render(agent, items))
-await ai.say("assistant", "add Acme to the sheet")
+const ai = agents(room); // a RoomClient
+ai.on("agents", (list) => render(list)); // [{id, name, description, state}]
+ai.on("transcript", ({ agent, items }) => render(agent, items));
+await ai.say("assistant", "add Acme to the sheet");
 ```
 
 A typed message is always answered, whatever `respond:` and the gate say.
@@ -118,14 +118,6 @@ add one, implement the behaviour and register it, or pass the module as
 ```elixir
 config :octoroom_agents, stt_providers: [acme: MyApp.AcmeSTT], tts_providers: [acme: MyApp.AcmeTTS]
 ```
-
-## Where the code came from
-
-The pipeline (frames, processors, the pure `Pipeline.Core`, providers,
-tools) is copied from Subvocal, an earlier experiment, and renamed under
-`Octoroom.Agent`. Each phase copies what it needs and changes it freely;
-nothing goes back. The list is in
-[decisions.md](../docs/decisions.md#where-the-code-came-from).
 
 ## Building
 
