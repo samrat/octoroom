@@ -49,7 +49,7 @@ defmodule Octoroom.Agent.TTSTest do
   end
 
   test "no provider picks a model" do
-    for provider <- [:inworld, :assembly_ai, :openai] do
+    for provider <- [:inworld, :assembly_ai, :openai, :tiny_voca] do
       assert {:error, {:no_model, _module}} = TTS.resolve(provider: provider)
     end
 

@@ -66,7 +66,8 @@ defmodule Octoroom.Agent.TTS do
   @providers %{
     assembly_ai: Octoroom.Agent.TTS.AssemblyAI,
     inworld: Octoroom.Agent.TTS.Inworld,
-    openai: Octoroom.Agent.TTS.OpenAI
+    openai: Octoroom.Agent.TTS.OpenAI,
+    tiny_voca: Octoroom.Agent.TTS.TinyVoca
   }
 
   @doc "The registered providers, by name."

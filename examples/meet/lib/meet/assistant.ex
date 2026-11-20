@@ -20,7 +20,7 @@ defmodule Meet.Assistant do
   end
 
   # Reson8's rumble-2 hears the call. Nemotron through OpenRouter: quicker
-  # to first text than Gemini. It speaks with AssemblyAI's Kyla voice.
+  # to first text than Gemini. It speaks locally with tiny-voca's F2 voice.
   @impl true
   def pipeline(_ctx) do
     Spec.default(
@@ -32,7 +32,7 @@ defmodule Meet.Assistant do
         reasoning_effort: :none,
         provider_options: [openrouter_provider: %{sort: "latency"}]
       ],
-      tts: "assembly_ai:assemblyai-tts-1"
+      tts: [provider: :tiny_voca, model: "tiny-voca", voice: "F2"]
     )
   end
 

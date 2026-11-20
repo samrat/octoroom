@@ -20,8 +20,8 @@ defmodule Meet.Atlas do
 
   # Soniox hears the call: Reson8 allows one connection at a time, and
   # Assistant has it. Nemotron through OpenRouter: quicker to first text than
-  # Gemini. It speaks with AssemblyAI's Titus voice, so it doesn't sound like
-  # Assistant.
+  # Gemini. It speaks locally with tiny-voca's M2 voice, so it doesn't sound
+  # like Assistant.
   @impl true
   def pipeline(_ctx) do
     Octoroom.Agent.Pipeline.Spec.default(
@@ -32,7 +32,7 @@ defmodule Meet.Atlas do
         reasoning_effort: :none,
         provider_options: [openrouter_provider: %{sort: "latency"}]
       ],
-      tts: [provider: :assembly_ai, model: "assemblyai-tts-1", voice: "aai-titus"]
+      tts: [provider: :tiny_voca, model: "tiny-voca", voice: "M2"]
     )
   end
 

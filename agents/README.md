@@ -148,8 +148,11 @@ does.
 
 Built in: STT from Soniox (`soniox`), AssemblyAI
 (`assembly_ai`) and Reson8 (`reson8`), and TTS from
-Inworld (`inworld`), AssemblyAI (`assembly_ai`) and OpenAI
-(`openai`). Keys come from `SONIOX_API_KEY`, `ASSEMBLY_AI_API_KEY`,
+Inworld (`inworld`), AssemblyAI (`assembly_ai`), OpenAI
+(`openai`) and TinyVoca (`tiny_voca`, local on ONNX Runtime — no API key,
+voices `"F2"` and `"M2"`, model `"tiny-voca"`, weights downloaded on demand
+from Hugging Face to the user cache or `TINY_VOCA_DIR`). Keys come from
+`SONIOX_API_KEY`, `ASSEMBLY_AI_API_KEY`,
 `RESON8_API_KEY`, `INWORLD_API_KEY` and `OPENAI_API_KEY`. Inworld and
 AssemblyAI speak over their WebSockets, one connection per agent: each
 Inworld reply is a context on it, and AssemblyAI answers replies in order
