@@ -28,12 +28,15 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   have no `speaker` unless typed.
 
   Options: `:model` (needed, such as `"gemini-3.1-flash-live-preview"`),
-  `:voice`, `:api_key` (default `GOOGLE_API_KEY`, then
-  `GEMINI_API_KEY`), and, defaulting to the runner context's,
-  `:instructions`, `:initial_text`, `:tools` and `:context`. The socket
-  starts only under a runner; for tests, pass `send: fn message -> ... end`
-  to capture what would go to Gemini, and feed its events with
-  `{:gemini_live_socket, event}` messages.
+  `:voice`, `:api_key` (default `GOOGLE_API_KEY`, then `GEMINI_API_KEY`),
+  `:context_window_compression` (`false` to disable, or
+  `[trigger_tokens: ..., target_tokens: ...]`; defaults to `104_857` / `52_428`),
+  `:input_audio_transcription` (default `true`), `:output_audio_transcription`
+  (default `true`), `:response_modalities` (default `["AUDIO"]`), and,
+  defaulting to the runner context's, `:instructions`, `:initial_text`,
+  `:tools` and `:context`. The socket starts only under a runner; for tests,
+  pass `send: fn message -> ... end` to capture what would go to Gemini, and
+  feed its events with `{:gemini_live_socket, event}` messages.
   """
 
   use Octoroom.Agent.Processor
@@ -65,12 +68,23 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     instructions = Keyword.get(opts, :instructions, Map.get(ctx, :instructions))
     resume = Map.get(ctx, :resume) || %{}
 
-    setup = [
-      model: model,
-      voice: Keyword.get(opts, :voice, Protocol.default_voice()),
-      system_instruction: instructions,
-      tools: GeminiTools.to_declarations(tools)
-    ]
+    if Keyword.has_key?(opts, :context_window_compression) do
+      Protocol.context_window_compression(opts[:context_window_compression])
+    end
+
+    setup =
+      [
+        model: model,
+        voice: Keyword.get(opts, :voice, Protocol.default_voice()),
+        system_instruction: instructions,
+        tools: GeminiTools.to_declarations(tools)
+      ] ++
+        Keyword.take(opts, [
+          :context_window_compression,
+          :input_audio_transcription,
+          :output_audio_transcription,
+          :response_modalities
+        ])
 
     # A new session after a restart: the model is told what was said.
     fallback_setup =

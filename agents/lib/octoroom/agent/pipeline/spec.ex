@@ -188,12 +188,26 @@ defmodule Octoroom.Agent.Pipeline.Spec do
   @doc """
   The pipeline of a Gemini Live agent: no front end (the agent mixes its
   inputs) and one `:gemini` stage, `Octoroom.Agent.Processors.GeminiLive`,
-  which takes `opts`: `:model` (needed), `:voice`, `:api_key`.
+  which takes `opts`: `:model` (needed), `:voice`, `:api_key`,
+  `:context_window_compression` (`false` or `[trigger_tokens: ..., target_tokens: ...]`),
+  `:input_audio_transcription`, `:output_audio_transcription`, and
+  `:response_modalities`.
 
-      Spec.gemini_live(model: "gemini-3.1-flash-live-preview", voice: "Puck")
+      Spec.gemini_live(
+        model: "gemini-3.8-live",
+        voice: "Puck",
+        context_window_compression: [trigger_tokens: 24_000, target_tokens: 12_000]
+      )
   """
   def gemini_live(opts) do
     if not is_binary(opts[:model]), do: raise(ArgumentError, "gemini_live needs a :model")
+
+    if Keyword.has_key?(opts, :context_window_compression) do
+      Octoroom.Agent.GeminiLive.Protocol.context_window_compression(
+        opts[:context_window_compression]
+      )
+    end
+
     {nil, processor(:gemini, Octoroom.Agent.Processors.GeminiLive, opts)}
   end
 

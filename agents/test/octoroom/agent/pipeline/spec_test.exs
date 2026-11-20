@@ -121,5 +121,24 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
     assert names(back) == [:gemini]
     assert opts(back, :gemini) == [model: "gemini-live-x", voice: "Puck"]
     assert_raise ArgumentError, fn -> gemini_live(voice: "Puck") end
+
+    compression = [trigger_tokens: 24_000, target_tokens: 12_000]
+
+    assert {nil, back} =
+             gemini_live(model: "gemini-live-x", context_window_compression: compression)
+
+    assert opts(back, :gemini) == [
+             model: "gemini-live-x",
+             context_window_compression: compression
+           ]
+
+    assert {nil, _} = gemini_live(model: "gemini-live-x", context_window_compression: false)
+
+    assert_raise ArgumentError, fn ->
+      gemini_live(
+        model: "gemini-live-x",
+        context_window_compression: [trigger_tokens: 10_000, target_tokens: 20_000]
+      )
+    end
   end
 end

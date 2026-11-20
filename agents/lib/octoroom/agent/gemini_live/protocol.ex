@@ -8,6 +8,10 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
 
   @default_voice "Zephyr"
   @send_sample_rate 16_000
+  @default_compression %{
+    triggerTokens: 104_857,
+    slidingWindow: %{targetTokens: 52_428}
+  }
 
   def default_voice, do: @default_voice
   def send_sample_rate, do: @send_sample_rate
@@ -15,15 +19,15 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
   @doc """
   The setup frame, the first thing sent on a connection. Options: `:model`
   (needed), `:voice`, `:response_modalities`, `:system_instruction`, `:tools` (Gemini
-  declarations) and `:resumption_handle` (from a `{:resumption, handle}`
-  event, to carry on the same session on a new connection).
+  declarations), `:resumption_handle` (from a `{:resumption, handle}`
+  event, to carry on the same session on a new connection),
+  `:context_window_compression` (`false` to disable, or `[trigger_tokens: ..., target_tokens: ...]`),
+  `:input_audio_transcription` (default `true`), and `:output_audio_transcription` (default `true`).
   """
   def setup_frame(opts) do
     setup =
       %{
         model: model_name(Keyword.fetch!(opts, :model)),
-        inputAudioTranscription: %{},
-        outputAudioTranscription: %{},
         generationConfig: %{
           responseModalities: Keyword.get(opts, :response_modalities, ["AUDIO"]),
           speechConfig: %{
@@ -32,19 +36,59 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
             }
           }
         },
-        # Without compression, an audio session ends after about 15 minutes.
-        contextWindowCompression: %{
-          triggerTokens: 104_857,
-          slidingWindow: %{targetTokens: 52_428}
-        },
         # Asks for resumption handles, so a dropped connection (the server
         # closes each one after about 10 minutes) carries on the session.
         sessionResumption: resumption(Keyword.get(opts, :resumption_handle))
       }
+      |> put_transcription(
+        :inputAudioTranscription,
+        Keyword.get(opts, :input_audio_transcription, true)
+      )
+      |> put_transcription(
+        :outputAudioTranscription,
+        Keyword.get(opts, :output_audio_transcription, true)
+      )
+      |> put_context_window_compression(Keyword.get(opts, :context_window_compression, true))
       |> put_system_instruction(Keyword.get(opts, :system_instruction))
       |> put_tools(Keyword.get(opts, :tools, []))
 
     %{setup: setup}
+  end
+
+  @doc false
+  def context_window_compression(false), do: nil
+  def context_window_compression(value) when value in [nil, true, []], do: @default_compression
+
+  def context_window_compression(opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:trigger_tokens, :target_tokens])
+    trigger = opts[:trigger_tokens]
+    target = opts[:target_tokens]
+
+    if trigger != nil and not (is_integer(trigger) and trigger > 0) do
+      raise ArgumentError, "trigger_tokens must be a positive integer, got: #{inspect(trigger)}"
+    end
+
+    if target != nil and not (is_integer(target) and target > 0) do
+      raise ArgumentError, "target_tokens must be a positive integer, got: #{inspect(target)}"
+    end
+
+    if trigger != nil and target != nil and target >= trigger do
+      raise ArgumentError,
+            "target_tokens (#{target}) must be less than trigger_tokens (#{trigger})"
+    end
+
+    if trigger == nil and target == nil do
+      @default_compression
+    else
+      sliding_window = if target, do: %{targetTokens: target}, else: %{}
+      compression = %{slidingWindow: sliding_window}
+      if trigger, do: Map.put(compression, :triggerTokens, trigger), else: compression
+    end
+  end
+
+  def context_window_compression(other) do
+    raise ArgumentError,
+          "context_window_compression expects false, true, or [trigger_tokens: ..., target_tokens: ...], got: #{inspect(other)}"
   end
 
   def audio_input_frame(audio, opts \\ []) when is_binary(audio) do
@@ -80,6 +124,21 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
 
   defp resumption(handle) when is_binary(handle), do: %{handle: handle}
   defp resumption(_none), do: %{}
+
+  # Without compression, an audio session ends after about 15 minutes.
+  defp put_context_window_compression(setup, config) do
+    case context_window_compression(config) do
+      nil -> setup
+      compression -> Map.put(setup, :contextWindowCompression, compression)
+    end
+  end
+
+  defp put_transcription(setup, _key, false), do: setup
+  defp put_transcription(setup, key, true), do: Map.put(setup, key, %{})
+
+  defp put_transcription(_setup, key, other) do
+    raise ArgumentError, "#{key} expects a boolean, got: #{inspect(other)}"
+  end
 
   defp put_system_instruction(setup, text) when is_binary(text) and text != "",
     do: Map.put(setup, :systemInstruction, %{parts: [%{text: text}]})
