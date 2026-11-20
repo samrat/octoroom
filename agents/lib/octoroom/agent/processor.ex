@@ -20,7 +20,14 @@ defmodule Octoroom.Agent.Processor do
     * `{:notify, event}` - send `event` to the session owner
     * `{:error, reason, fatal?}` - push a `Octoroom.Agent.Frames.Error` upstream
 
-  `use Octoroom.Agent.Processor` defines every callback: frames pass through
+  A processor whose options can change while it runs implements the
+  optional `handle_update/2`. An `Octoroom.Agent.Frames.UpdateStage` frame
+  naming the stage arrives there with the new options, instead of at
+  `handle_frame/3`. It returns effects like any callback; one that can't
+  take an option returns an `{:error, ...}` effect.
+
+  `use Octoroom.Agent.Processor` defines every callback but
+  `handle_update/2`: frames pass through
   unchanged and other messages are ignored, so a processor only needs to
   match what it cares about.
 
@@ -59,6 +66,9 @@ defmodule Octoroom.Agent.Processor do
   @callback handle_timer(key :: term(), state()) :: {[effect()], state()}
   @callback handle_info(message :: term(), state()) :: {[effect()], state()}
   @callback terminate(reason :: term(), state()) :: term()
+  @callback handle_update(opts :: keyword(), state()) :: {[effect()], state()}
+
+  @optional_callbacks handle_update: 2
 
   defmacro __using__(_opts) do
     quote do

@@ -26,6 +26,11 @@ defmodule Octoroom.Agent.Pipeline.Core do
     * `{:observe, frame}` - a frame of an observed type was pushed (see
       `observe/2`)
 
+  An `Octoroom.Agent.Frames.UpdateStage` frame goes to the `handle_update/2`
+  of the stage it names, not its `handle_frame/3`, and goes no further. A
+  stage without `handle_update/2` reports an error instead. One that names
+  no stage here leaves the pipeline like any other frame.
+
   Task and timer ids are opaque. The core drops reports for ids it no longer
   knows, so the host doesn't have to track generations.
   """
@@ -257,11 +262,30 @@ defmodule Octoroom.Agent.Pipeline.Core do
       {{index, frame, direction}, core} ->
         core
         |> Map.put(:current, frame)
-        |> call(index, :handle_frame, [frame, direction])
+        |> deliver(index, frame, direction)
         |> Map.put(:current, nil)
         |> drain()
     end
   end
+
+  # An `UpdateStage` for this stage goes to `handle_update/2` and stops here.
+  defp deliver(core, index, %Frames.UpdateStage{stage: name, opts: opts} = frame, direction) do
+    stage = elem(core.stages, index)
+
+    cond do
+      stage.name != name ->
+        call(core, index, :handle_frame, [frame, direction])
+
+      function_exported?(stage.module, :handle_update, 2) ->
+        call(core, index, :handle_update, [opts])
+
+      true ->
+        effect(core, index, {:error, {:not_updatable, Keyword.keys(opts)}, false})
+    end
+  end
+
+  defp deliver(core, index, frame, direction),
+    do: call(core, index, :handle_frame, [frame, direction])
 
   # System frames go first.
   defp next(core) do

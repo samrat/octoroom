@@ -82,6 +82,7 @@ architecture.md in the same change.
 | [D42](#d42-clients-send-their-offer-at-the-first-ice-candidate)                               | Clients send their offer at the first ICE candidate                                | Current                 |
 | [D43](#d43-inlets-decode-to-the-workers-format)                                               | Inlets decode to the worker's format                                               | Current                 |
 | [D44](#d44-workers-reach-clients-through-their-outputs)                                       | Workers reach clients through their outputs                                        | Current                 |
+| [D45](#d45-a-frame-changes-a-stages-options-by-name)                                          | A frame changes a stage's options, by name                                         | Current                 |
 
 ## Removed code
 
@@ -1129,6 +1130,41 @@ A worker whose outputs change while seen sends no `updated`. A text-only
 agent with no inputs can't be messaged, since `message/3` only narrows.
 Meet's LiveView stays on `scope: :room`, because it shows decisions and
 latency, which stay server-side.
+
+#### D45. A frame changes a stage's options, by name
+
+**Status:** Current.
+
+**Context.** An agent that isn't STT -> LLM -> TTS, such as one that
+answers from a script, moves through parts of a conversation, and each part
+wants different settings on other stages: above all different questions for
+the decision model. Asking every part's questions on every turn doesn't
+work: today's decision models get worse with each question they're asked.
+
+**Decision.** `Frames.UpdateStage{stage, opts}`, a control frame that
+can't be interrupted. The runner hands it to the named stage's optional
+`handle_update/2` instead of `handle_frame/3`, and it goes no further;
+stages with other names pass it on, and a stage without the callback
+reports `{:not_updatable, keys}`. A `StateMachine` processor gets it as an
+`{:update, opts}` event. In an agent, one that leaves the back end goes to
+every front end, and the Worker keeps the latest options per stage for
+front ends that start later. `Processors.Decisions` takes `:questions` and
+`:questions_id`, and each decision carries the `questions_id` of the
+questions it answered, so a turn judged while the questions changed can be
+told apart.
+
+**Why not one frame per setting** (`SetQuestions`). Other stages will want
+changes too, and the routing is the same for all of them.
+
+**Why not a scripted agent in core.** It's one product, so it's an example
+of writing a processor: `examples/agent`'s `Hello.Booking.Script`, a
+`StateMachine` whose states are the script's.
+
+**Open.** Only `Decisions` takes updates. TTS could take `:voice`: Inworld
+and OpenAI send it with each request, but AssemblyAI fixes it for a session,
+so it would reconnect. Neither STT provider here takes anything that could
+change mid-stream. Stages don't declare which options they take, so a
+script naming one that can't change only fails when it gets there.
 
 ## Evidence
 

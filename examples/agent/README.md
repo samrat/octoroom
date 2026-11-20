@@ -13,6 +13,15 @@ What Octoroom adds to the generated app:
 - [lib/hello/assistant.ex](lib/hello/assistant.ex): `Hello.Assistant`, the
   agent: a system prompt, a greeting, and its providers (Soniox for
   speech-to-text, Nemotron through OpenRouter, AssemblyAI's voice).
+- [lib/hello/booking.ex](lib/hello/booking.ex) and
+  [lib/hello/booking/script.ex](lib/hello/booking/script.ex):
+  `Hello.Booking`, a second agent that books appointments from a script
+  instead of an LLM, and the processor that runs the script. It's the
+  example of writing your own pipeline stage: a decision model judges each
+  turn against the questions of the script's current state, and the script
+  picks what to say. Start the app with `HELLO_AGENT=booking` to talk to
+  it; [test/hello/booking_test.exs](test/hello/booking_test.exs) runs a
+  booking with no audio or providers.
 - [lib/hello_web/channels](lib/hello_web/channels): a channel for signaling
   (`use Octoroom.Phoenix.Channel`) and the socket it's on.
 - [assets/js/agent.js](assets/js/agent.js): the `Agent` hook. It joins with

@@ -325,6 +325,65 @@ defmodule Octoroom.Agent.Pipeline.CoreTest do
     assert_received {:octoroom_agent_processor_info, [:a], :ping}
   end
 
+  describe "UpdateStage" do
+    defmodule Settable do
+      use Octoroom.Agent.Processor
+
+      @impl true
+      def init(opts, _ctx), do: {:ok, Map.new(opts)}
+
+      @impl true
+      def handle_update(opts, state), do: {[], Map.merge(state, Map.new(opts))}
+    end
+
+    test "reaches the named stage's handle_update and goes no further" do
+      harness =
+        processor(:a, Recorder)
+        |> processor(:b, Settable, voice: "old")
+        |> processor(:c, Recorder)
+        |> Harness.start!()
+        |> Harness.push(%Frames.UpdateStage{stage: :b, opts: [voice: "new"]})
+
+      assert Harness.state(harness, :b) == %{voice: "new"}
+      # :a passed it on as a frame; :c never saw it.
+      assert Harness.state(harness, :a) == [Frames.UpdateStage]
+      assert Harness.state(harness, :c) == []
+      assert Harness.outputs(harness) == []
+    end
+
+    test "travels upstream to the named stage too" do
+      harness =
+        processor(:b, Settable, voice: "old")
+        |> processor(:c, Recorder)
+        |> Harness.start!()
+        |> Harness.push(%Frames.UpdateStage{stage: :b, opts: [voice: "new"]}, :upstream)
+
+      assert Harness.state(harness, :b) == %{voice: "new"}
+      assert Harness.upstream(harness) == []
+    end
+
+    test "naming no stage here, it leaves the pipeline" do
+      update = %Frames.UpdateStage{stage: :elsewhere, opts: [voice: "new"]}
+
+      harness =
+        processor(:b, Settable)
+        |> Harness.start!()
+        |> Harness.push(update)
+
+      assert [%Frames.UpdateStage{stage: :elsewhere}] = Harness.outputs(harness)
+    end
+
+    test "a stage without handle_update reports an error" do
+      harness =
+        processor(:a, Upcase)
+        |> Harness.start!()
+        |> Harness.push(%Frames.UpdateStage{stage: :a, opts: [voice: "new"]})
+
+      assert Harness.errors(harness) == [{{:not_updatable, [:voice]}, false}]
+      assert Harness.outputs(harness) == []
+    end
+  end
+
   defp task_id(harness) do
     [{id, _fun}] = harness.tasks
     id

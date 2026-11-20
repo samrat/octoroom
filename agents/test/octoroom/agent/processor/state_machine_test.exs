@@ -82,4 +82,35 @@ defmodule Octoroom.Agent.Processor.StateMachineTest do
     harness = Harness.push(start(), %Frames.LLMText{text: "x"})
     assert [%Frames.LLMText{text: "x"}] = Harness.outputs(harness)
   end
+
+  describe "UpdateStage" do
+    defmodule Voice do
+      use Octoroom.Agent.Processor.StateMachine
+
+      @impl true
+      def init(_opts, _ctx), do: {:ok, :idle, %{voice: "old"}}
+
+      @impl true
+      def handle_event({:update, [voice: voice]}, _state, data),
+        do: {:keep_state, %{data | voice: voice}}
+    end
+
+    test "arrives as an {:update, opts} event" do
+      harness =
+        processor(:voice, Voice)
+        |> Harness.start!()
+        |> Harness.push(%Frames.UpdateStage{stage: :voice, opts: [voice: "new"]})
+
+      assert %{data: %{voice: "new"}} = Harness.state(harness, :voice)
+    end
+
+    test "unmatched, it reports an error" do
+      harness =
+        processor(:turns, Turns)
+        |> Harness.start!()
+        |> Harness.push(%Frames.UpdateStage{stage: :turns, opts: [voice: "new"]})
+
+      assert Harness.errors(harness) == [{{:not_updatable, [:voice]}, false}]
+    end
+  end
 end

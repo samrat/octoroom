@@ -723,6 +723,56 @@ defmodule Octoroom.Agent.WorkerTest do
     end
   end
 
+  describe "UpdateStage from the back end" do
+    # In a front end: tells the test about each update.
+    defmodule UpdateSpy do
+      use Octoroom.Agent.Processor
+
+      @impl true
+      def init(opts, _ctx), do: {:ok, Keyword.fetch!(opts, :test)}
+
+      @impl true
+      def handle_update(opts, test) do
+        send(test, {:updated, opts})
+        {[], test}
+      end
+    end
+
+    # In the back end: "update <value>" sets `value` on the front ends' spy.
+    defmodule Updater do
+      use Octoroom.Agent.Processor
+
+      @impl true
+      def handle_frame(%Frames.Transcription{text: "update " <> value} = frame, :downstream, s) do
+        update = %Frames.UpdateStage{stage: :spy, opts: [value: value]}
+        {[{:push, frame, :downstream}, {:push, update, :upstream}], s}
+      end
+
+      def handle_frame(frame, direction, s), do: {[{:push, frame, direction}], s}
+    end
+
+    test "reaches every front end, and front ends that start later", ctx do
+      base = args(self(), 200)
+
+      extra = %{
+        front_end: insert_after(base.front_end, :turns, processor(:spy, UpdateSpy, test: self())),
+        back_end: insert_before(base.back_end, :context, processor(:updater, Updater))
+      }
+
+      %{alice: alice} = start(ctx, 200, extra)
+      say(ctx, alice, {:final, "update calm"})
+      assert_receive {:updated, [value: "calm"]}
+
+      say(ctx, alice, {:final, "update brisk"})
+      assert_receive {:updated, [value: "brisk"]}
+
+      # Bob's front end starts with the latest value.
+      _bob = join(ctx, "bob", %{name: "Bob"}) |> then(&hear(ctx, &1))
+      assert_receive {:updated, [value: "brisk"]}
+      refute_receive {:updated, _}, 100
+    end
+  end
+
   describe "agent/3" do
     import Octoroom.Room, only: [track: 1]
 

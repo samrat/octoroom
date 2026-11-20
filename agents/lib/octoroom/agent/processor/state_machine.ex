@@ -24,6 +24,8 @@ defmodule Octoroom.Agent.Processor.StateMachine do
     * `{:timer, key}` for timers started with `{:timer, key, ms}`
     * `{:state_timeout, key}` for state timeouts
     * `{:info, message}` for other messages
+    * `{:update, opts}` for an `UpdateStage` frame naming the stage (see
+      `Octoroom.Agent.Processor`). Unmatched, it reports an error.
 
   Results: `{:next_state, name, data}`, `{:next_state, name, data, actions}`,
   `{:keep_state, data}`, `{:keep_state, data, actions}`,
@@ -74,6 +76,9 @@ defmodule Octoroom.Agent.Processor.StateMachine do
       def handle_event(frame, _state_name, _data) when is_struct(frame),
         do: {:keep_state_and_data, [{:push, frame, :downstream}]}
 
+      def handle_event({:update, opts}, _state_name, _data),
+        do: {:keep_state_and_data, [{:error, {:not_updatable, Keyword.keys(opts)}, false}]}
+
       def handle_event(_event, _state_name, _data), do: :keep_state_and_data
 
       # The `Octoroom.Agent.Processor` callbacks. (`init/2` is the state machine's;
@@ -89,6 +94,9 @@ defmodule Octoroom.Agent.Processor.StateMachine do
 
       def handle_info(message, state),
         do: Octoroom.Agent.Processor.StateMachine.event(__MODULE__, {:info, message}, state)
+
+      def handle_update(opts, state),
+        do: Octoroom.Agent.Processor.StateMachine.event(__MODULE__, {:update, opts}, state)
 
       def terminate(_reason, _state), do: :ok
     end

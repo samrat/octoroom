@@ -156,4 +156,50 @@ defmodule Octoroom.Agent.Processors.DecisionsTest do
                Harness.outputs(harness, Frames.Transcription)
     end
   end
+
+  describe "changing the questions" do
+    test "each decision carries the questions_id of the questions it answered" do
+      harness =
+        start(fn _text -> {:ok, @answers} end, input: :transcript, questions_id: "greet")
+        |> Harness.push(%Frames.Transcription{text: "Hello?", turn_id: 1})
+
+      # The update arrives while turn 1 is being judged: it keeps the old id.
+      day = %{
+        "day" => %{type: :choice, instructions: "Which day?", criteria: %{"monday" => "Monday."}}
+      }
+
+      update = %Frames.UpdateStage{stage: :decisions, opts: [questions: day, questions_id: "day"]}
+      harness = Harness.push(harness, update, :upstream)
+      harness = Harness.push(harness, %Frames.Transcription{text: "Tuesday", turn_id: 2})
+      harness = Harness.run_tasks(harness)
+
+      assert [%{decision: %{questions_id: "greet"}}, %{decision: %{questions_id: "day"}}] =
+               Harness.outputs(harness, Frames.Transcription)
+
+      assert Harness.errors(harness) == []
+    end
+
+    test "with no questions, turns go on at once without a call" do
+      test = self()
+
+      harness =
+        start(fn _text -> send(test, :evaluated) && {:ok, @answers} end, input: :transcript)
+        |> Harness.push(%Frames.UpdateStage{stage: :decisions, opts: [questions: %{}]}, :upstream)
+        |> Harness.push(%Frames.Transcription{text: "Thanks, bye!", turn_id: 1})
+
+      assert [%Frames.Transcription{decision: nil}] =
+               Harness.outputs(harness, Frames.Transcription)
+
+      assert harness.tasks == []
+      refute_received :evaluated
+    end
+
+    test "other options can't change" do
+      harness =
+        start(fn _text -> {:ok, @answers} end, input: :transcript)
+        |> Harness.push(%Frames.UpdateStage{stage: :decisions, opts: [model: "x"]}, :upstream)
+
+      assert Harness.errors(harness) == [{{:not_updatable, [:model]}, false}]
+    end
+  end
 end

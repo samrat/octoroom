@@ -74,6 +74,13 @@ defmodule Octoroom.Agent.Worker do
   and `:always`, that's always them). Two people talking over it don't cut
   it off.
 
+  ## Changing front-end stages
+
+  An `Octoroom.Agent.Frames.UpdateStage` that leaves the back end, from
+  either end, goes to every front end, and to each one that starts later
+  (with the latest options per stage). That's how a back-end stage changes
+  the decision model's questions as a conversation moves on.
+
   It hears at 16 kHz mono and speaks at 24 kHz mono on its first output.
 
   ## Gemini Live
@@ -237,6 +244,9 @@ defmodule Octoroom.Agent.Worker do
         },
         fronts: %{},
         front_spec: front_spec,
+        # Options the back end set on front-end stages with `UpdateStage`,
+        # by stage name, for front ends started later.
+        front_updates: %{},
         # Mixed (no front end, as for Gemini Live): every input goes into
         # one mix, which the back end hears a chunk at a time. `mix_at` is
         # when the next chunk is due.
@@ -821,7 +831,11 @@ defmodule Octoroom.Agent.Worker do
         state = put_in(state.fronts[input], %{core: core, host: Host.new()})
         {commands, core} = Core.push(core, %Frames.Start{session_id: ctx.session_id})
         state = put_in(state.fronts[input].core, core)
-        front_commands(input, commands, state, actions)
+        acc = front_commands(input, commands, state, actions)
+
+        Enum.reduce(state.front_updates, acc, fn {name, opts}, acc ->
+          push_front(input, %Frames.UpdateStage{stage: name, opts: opts}, acc)
+        end)
 
       {:error, reason} ->
         Logger.warning("agent #{state.id} can't hear #{input}: #{inspect(reason)}")
@@ -843,6 +857,13 @@ defmodule Octoroom.Agent.Worker do
         Host.stop(host)
         %{state | fronts: fronts, vad_stop: Map.delete(state.vad_stop, input)}
     end
+  end
+
+  # Into a front end from the back end's side.
+  defp push_front(input, frame, {state, actions}) do
+    {commands, core} = Core.push(state.fronts[input].core, frame, :upstream)
+    state = put_in(state.fronts[input].core, core)
+    front_commands(input, commands, state, actions)
   end
 
   defp front_commands(input, commands, state, actions),
@@ -896,6 +917,11 @@ defmodule Octoroom.Agent.Worker do
 
     event = {:agent, {:error, %{stage: error.processor, fatal: error.fatal?, source: input}}}
     {state, actions ++ [emit: event] ++ error_to_clients(state, error)}
+  end
+
+  defp front_command(input, {:output_upstream, %Frames.UpdateStage{stage: name}}, acc) do
+    Logger.warning("agent #{elem(acc, 0).id} (#{input}): no stage #{inspect(name)} to update")
+    acc
   end
 
   defp front_command(_input, {:output_upstream, _frame}, acc), do: acc
@@ -1193,6 +1219,16 @@ defmodule Octoroom.Agent.Worker do
   defp back_command({:output, %Frames.OutputAudio{sample_rate: rate}}, state) do
     Logger.warning("agent #{state.id} dropped #{rate} Hz audio; it plays #{@out_rate} Hz")
     {state, []}
+  end
+
+  # Options for a stage that isn't in the back end (the decision model's
+  # questions, say): every front end gets them, now and when it starts.
+  defp back_command({direction, %Frames.UpdateStage{} = frame}, state)
+       when direction in [:output, :output_upstream] do
+    merge = &Keyword.merge(&1, frame.opts)
+    state = update_in(state.front_updates, &Map.update(&1, frame.stage, frame.opts, merge))
+
+    Enum.reduce(Map.keys(state.fronts), {state, []}, &push_front(&1, frame, &2))
   end
 
   defp back_command({:output, _frame}, state), do: {state, []}

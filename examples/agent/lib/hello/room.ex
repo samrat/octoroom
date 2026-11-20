@@ -3,7 +3,8 @@ defmodule Hello.Room do
   One person and a voice agent. Each page opens its own room, so the agent
   only ever talks to one person.
 
-  The agent joins with the person (`workers/1`), hears their mic, and
+  The agent (`Hello.Assistant`, or `Hello.Booking` with
+  `HELLO_AGENT=booking`) joins with the person (`workers/1`), hears their mic, and
   answers every turn (`respond: :always`). The person hears only the
   agent (`subscriptions/2`).
   """
@@ -18,7 +19,7 @@ defmodule Hello.Room do
 
   def workers(room) do
     [
-      agent("assistant", Hello.Assistant,
+      agent("assistant", Application.get_env(:hello, :agent, Hello.Assistant),
         hears: Enum.map(room.participants, &mic/1),
         respond: :always
       )
