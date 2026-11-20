@@ -189,4 +189,24 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
     Test.fire_timer(harness, :gemini, :initial_text)
     assert_received {:to_gemini, {:text, "Greet them."}}
   end
+
+  test "forwards compression, transcription and modality options to setup" do
+    processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+      model: "gemini-live-x",
+      send: &send(self(), {:sent, &1}),
+      context_window_compression: [trigger_tokens: 24_000, target_tokens: 12_000],
+      input_audio_transcription: false,
+      output_audio_transcription: false,
+      response_modalities: ["AUDIO"]
+    )
+    |> Test.start!()
+
+    assert_received {:sent, {:connect, connect}}
+    setup = connect[:fallback_setup]
+
+    assert setup[:context_window_compression] == [trigger_tokens: 24_000, target_tokens: 12_000]
+    assert setup[:input_audio_transcription] == false
+    assert setup[:output_audio_transcription] == false
+    assert setup[:response_modalities] == ["AUDIO"]
+  end
 end

@@ -28,6 +28,75 @@ defmodule Octoroom.Agent.GeminiLive.ProtocolTest do
     refute Map.has_key?(Protocol.setup_frame(model: "gemini-3.8-live").setup, :systemInstruction)
   end
 
+  test "context window compression and transcription can be configured or disabled" do
+    %{setup: default} = Protocol.setup_frame(model: "gemini-3.8-live")
+
+    assert default.contextWindowCompression == %{
+             triggerTokens: 104_857,
+             slidingWindow: %{targetTokens: 52_428}
+           }
+
+    assert default.inputAudioTranscription == %{}
+    assert default.outputAudioTranscription == %{}
+
+    %{setup: custom} =
+      Protocol.setup_frame(
+        model: "gemini-3.8-live",
+        context_window_compression: [trigger_tokens: 24_000, target_tokens: 12_000],
+        input_audio_transcription: false,
+        output_audio_transcription: false,
+        response_modalities: ["TEXT"]
+      )
+
+    assert custom.contextWindowCompression == %{
+             triggerTokens: 24_000,
+             slidingWindow: %{targetTokens: 12_000}
+           }
+
+    refute Map.has_key?(custom, :inputAudioTranscription)
+    refute Map.has_key?(custom, :outputAudioTranscription)
+    assert custom.generationConfig.responseModalities == ["TEXT"]
+
+    %{setup: trigger_only} =
+      Protocol.setup_frame(
+        model: "gemini-3.8-live",
+        context_window_compression: [trigger_tokens: 30_000]
+      )
+
+    assert trigger_only.contextWindowCompression == %{
+             triggerTokens: 30_000,
+             slidingWindow: %{}
+           }
+
+    %{setup: target_only} =
+      Protocol.setup_frame(
+        model: "gemini-3.8-live",
+        context_window_compression: [target_tokens: 15_000]
+      )
+
+    assert target_only.contextWindowCompression == %{
+             slidingWindow: %{targetTokens: 15_000}
+           }
+
+    %{setup: disabled} =
+      Protocol.setup_frame(model: "gemini-3.8-live", context_window_compression: false)
+
+    refute Map.has_key?(disabled, :contextWindowCompression)
+
+    for bad <- [
+          [trigger_tokens: 10_000, target_tokens: 10_000],
+          [trigger_tokens: 10_000, target_tokens: 20_000],
+          [trigger_tokens: 0],
+          [target_tokens: -5],
+          [unknown: 1],
+          :invalid
+        ] do
+      assert_raise ArgumentError, fn ->
+        Protocol.setup_frame(model: "gemini-3.8-live", context_window_compression: bad)
+      end
+    end
+  end
+
   test "audio goes up base64 at 16 kHz" do
     assert %{realtimeInput: %{audio: %{mimeType: "audio/pcm;rate=16000", data: data}}} =
              Protocol.audio_input_frame(<<1, 2, 3, 4>>)
