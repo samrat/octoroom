@@ -8,9 +8,9 @@ import Config
 # The block below contains prod specific runtime configuration.
 
 # Octoroom needs a Cloudflare Realtime SFU app, and the assistants need
-# SONIOX_API_KEY, OPENROUTER_API_KEY (the LLM and the decision model),
-# ASSEMBLY_AI_API_KEY (their voices) and GOOGLE_API_KEY (the Gemini Live
-# assistant); INWORLD_API_KEY only to go back to Inworld's voices. They're
+# RESON8_API_KEY and SONIOX_API_KEY (speech-to-text), OPENROUTER_API_KEY
+# (the LLM and the decision model), ASSEMBLY_AI_API_KEY (their voices) and
+# GOOGLE_API_KEY (the Gemini Live assistant); INWORLD_API_KEY only to go back to Inworld's voices. They're
 # read from the environment, or from a `.env` file next to mix.exs
 # (KEY=value lines).
 env_file = Path.expand("../.env", __DIR__)
@@ -44,7 +44,7 @@ config :octoroom,
 # The assistant's speech-to-text, LLM and text-to-speech read their keys
 # from the environment.
 for key <-
-      ~w(SONIOX_API_KEY ASSEMBLY_AI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY INWORLD_API_KEY),
+      ~w(RESON8_API_KEY SONIOX_API_KEY ASSEMBLY_AI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY INWORLD_API_KEY),
     value = env.(key),
     value not in [nil, ""],
     do: System.put_env(key, value)
