@@ -1115,6 +1115,101 @@ defmodule Octoroom.Agent.WorkerTest do
     end
   end
 
+  describe "OpenAI Live (mixed)" do
+    defp openai_live_args(test) do
+      back =
+        processor(:openai, Processors.OpenAILive,
+          model: "gpt-live-1.1",
+          send: &send(test, {:to_openai, &1})
+        )
+
+      %{name: "Assistant", front_end: nil, back_end: back}
+    end
+
+    defp start_openai_live(ctx) do
+      Octoroom.subscribe(ctx.room_id, scope: :room)
+      alice = join(ctx, "alice", %{name: "Alice", args: openai_live_args(self())})
+      cf = agent_track(alice.mic)
+      wait_until(fn -> match?([%{connected: [_ | _]}], workers(ctx)) end)
+      openai_live(ctx, {:session_started, %{"id" => "live_1"}})
+      %{alice: alice, cf_track: cf}
+    end
+
+    defp openai_live(ctx, event),
+      do: :ok = Octoroom.Worker.send(ctx.room_id, "assistant", {:openai_live_socket, event})
+
+    test "mixes inputs and resamples 16 kHz to 24 kHz for OpenAI Live", ctx do
+      %{alice: alice} = start_openai_live(ctx)
+      speak(ctx, alice, 4)
+
+      assert_receive {:to_openai, {:audio, pcm}}, 1_000
+      # 20 ms at 24 kHz mono s16le = 480 samples = 960 bytes.
+      assert byte_size(pcm) == 960
+    end
+
+    test "speaks what the model says, with its state and transcript", ctx do
+      %{cf_track: cf} = start_openai_live(ctx)
+
+      openai_live(ctx, {:transcription, :user, "Hi!"})
+      openai_live(ctx, {:audio, :binary.copy(<<0, 0>>, 24 * 200), sample_rate: 24_000})
+      openai_live(ctx, {:transcription, :assistant, "Hello."})
+
+      assert_receive {:octoroom, _,
+                      {:worker_event, "assistant",
+                       {:agent, {:conversation, %{role: "user", text: "Hi!"}}}}}
+
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "speaking"}}}, 1_000
+      assert_receive {:ingest, ^cf, frame}, 1_000
+      assert byte_size(frame) == 3_840
+
+      assert_receive {:octoroom, _,
+                      {:worker_notify, "assistant", "assistant", "transcript",
+                       %{role: "assistant", text: "Hello.", status: "completed"}}},
+                     1_500
+
+      assert_receive {:octoroom, _, {:worker, :updated, %{state: "listening"}}}, 1_500
+    end
+
+    test "typed messages, prompts and restart transcript carry over", ctx do
+      %{alice: alice} = start_openai_live(ctx)
+      assert_receive {:to_openai, {:connect, [setup: _]}}
+
+      Server.worker_message(alice.server, alice.id, "assistant", %{"text" => "What's up?"}, :msg)
+      assert_receive {:to_openai, {:commentary, "[Alice] What's up?"}}
+
+      wait_until(fn ->
+        match?(%{items: [_]}, Octoroom.Worker.saved(ctx.room_id, "assistant"))
+      end)
+
+      :ok = Octoroom.Agent.prompt(ctx.room_id, "assistant", "Sum up.")
+
+      assert_receive {:to_openai,
+                      {:commentary, "[From the app, not said by anyone on the call] Sum up."}}
+
+      pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+      Process.exit(pid, :kill)
+
+      assert_receive {:to_openai, {:connect, connect}}, 2_000
+      assert connect[:setup][:instructions] =~ "[Alice] What's up?"
+    end
+
+    test "a module picks openai_live as its pipeline, and it can't be silent" do
+      defmodule OpenAILiveAgent do
+        use Octoroom.Agent
+
+        @impl true
+        def pipeline(_ctx),
+          do: Octoroom.Agent.Pipeline.Spec.openai_live(voice: "marin", model: "gpt-live-1.1")
+      end
+
+      assert {:stop, :voice_false_needs_text_to_speech} =
+               Octoroom.Agent.Worker.init(
+                 %{agent: OpenAILiveAgent, args: %{}, voice: false},
+                 %Octoroom.Worker.Context{room_id: "r", id: "a", inputs: [], outputs: []}
+               )
+    end
+  end
+
   test "a pipeline that can't speak at 24 kHz or hear 16 kHz doesn't start", ctx do
     worker_ctx = %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
     tts = [provider: :inworld, model: "inworld-tts-2", output_sample_rate: 16_000]

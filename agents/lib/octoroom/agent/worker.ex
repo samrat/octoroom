@@ -83,18 +83,21 @@ defmodule Octoroom.Agent.Worker do
 
   It hears at 16 kHz mono and speaks at 24 kHz mono on its first output.
 
-  ## Gemini Live
+  ## Gemini Live and OpenAI Live
 
-  With `Octoroom.Agent.Pipeline.Spec.gemini_live/1` as the pipeline (see
-  `Octoroom.Agent.Processors.GeminiLive`), one speech-to-speech model does
-  everything. It has one audio input, so there are no front ends: the
-  inputs are mixed (`Octoroom.Agent.Audio.Mixer`) and the back end hears a
-  20 ms chunk of the mix at a time. The model decides when to answer and
-  when it's been interrupted, so `:respond`, `:gate` and follow-ups don't
-  apply, and anyone can interrupt it. What it hears has no speakers: it
-  tells voices apart as best it can, the conversation's user items have no
-  `speaker`, and tools get `speaker: nil` (except for typed turns, which
-  are sent as `[speaker] text`). It needs a voice, and `GOOGLE_API_KEY`.
+  With `Octoroom.Agent.Pipeline.Spec.gemini_live/1`
+  (`Octoroom.Agent.Processors.GeminiLive`) or
+  `Octoroom.Agent.Pipeline.Spec.openai_live/1`
+  (`Octoroom.Agent.Processors.OpenAILive`) as the pipeline, one
+  speech-to-speech model does everything. It has one audio input, so there
+  are no front ends: the inputs are mixed (`Octoroom.Agent.Audio.Mixer`) and
+  the back end hears a 20 ms chunk of the mix at a time. The model decides
+  when to answer and when it's been interrupted, so `:respond`, `:gate` and
+  follow-ups don't apply, and anyone can interrupt it. What it hears has no
+  speakers: it tells voices apart as best it can, the conversation's user
+  items have no `speaker`, and tools get `speaker: nil` (except for typed
+  turns, which are sent as `[speaker] text`). It needs a voice, and
+  `GOOGLE_API_KEY` (Gemini Live) or `OPENAI_API_KEY` (OpenAI Live).
 
   The model doesn't know when its audio has played, and generates faster
   than real time. So when it hears someone start a turn while its reply is
@@ -103,14 +106,14 @@ defmodule Octoroom.Agent.Worker do
   `:decision`, `:waiting` or `:follow_up` events, and `say/3` asks the
   model to say the words, which it may not do exactly.
 
-  It keeps its Gemini session through dropped connections (the server
+  Gemini Live keeps its session through dropped connections (the server
   closes each after 10 minutes or so) and through restarts: it saves the
   session's latest resumption handle (`save:`), and a restarted agent
   resumes with it. Gemini keeps a session for 2 hours after it ends. If the
-  handle is older than that, or Gemini rejects it, the new session's
-  instructions end with the conversation so far (the last 50 items), so
-  the model still knows what was said, but not how it sounded. Either way,
-  it doesn't greet again.
+  handle is older than that, or Gemini rejects it (or on OpenAI Live, which
+  starts a new session on restart), the new session's instructions end with
+  the conversation so far (the last 50 items), so the model still knows what
+  was said, but not how it sounded. Either way, it doesn't greet again.
 
   ## Args (a map or keyword list)
 
@@ -796,7 +799,7 @@ defmodule Octoroom.Agent.Worker do
           nil
       end
 
-    if handle || match?(%{gemini_handle: _}, saved),
+    if handle || match?(%{gemini_handle: _}, saved) || items != [],
       do: %{handle: handle, items: items}
   end
 

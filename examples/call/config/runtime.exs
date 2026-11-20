@@ -38,7 +38,7 @@ config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
 # environment, so values from `.env` are put there.
 assistant_keys = ~w(SONIOX_API_KEY GOOGLE_API_KEY INWORLD_API_KEY)
 
-for key <- assistant_keys,
+for key <- assistant_keys ++ ["OPENAI_API_KEY"],
     value = fetch.(key),
     value not in [nil, ""],
     do: System.put_env(key, value)

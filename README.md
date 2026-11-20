@@ -27,7 +27,7 @@ on the default path.
 
 Try it: [examples/agent](examples/agent) is one person talking to a voice
 agent, and times its replies; [examples/meet](examples/meet) is a video call
-with three AI assistants; [examples/call](examples/call) is a LiveView group
+with four AI assistants; [examples/call](examples/call) is a LiveView group
 call with video and the testing tools.
 
 Native apps join the same rooms with the Swift client for iOS and macOS:

@@ -60,26 +60,37 @@ stopped, using the outlet's flush report (see
 the outlet's `:drained` message, the history store, and the receptionist
 example.
 
-### Gemini Live
+### Gemini Live and OpenAI Live
 
-An agent can also be one speech-to-speech model, Gemini Live, instead of
-STT, an LLM and TTS:
+An agent can also be one speech-to-speech model, Gemini Live or OpenAI Live
+(`gpt-live-1.1`), instead of STT, an LLM and TTS:
 
 ```elixir
 def pipeline(_ctx),
   do: Octoroom.Agent.Pipeline.Spec.gemini_live(model: "gemini-3.1-flash-live-preview", voice: "Puck")
 ```
 
+```elixir
+def pipeline(_ctx) do
+  Octoroom.Agent.Pipeline.Spec.openai_live(
+    model: "gpt-live-1.1",
+    voice: "marin",
+    delegation: [model: "gpt-5.4-mini"]
+  )
+end
+```
+
 It has one audio input, so the agent mixes everyone it hears into it, and
 the model takes its own turns: `respond:` and `gate:` don't apply, and it
-tells speakers apart only by voice. Typing to it, `prompt/3`, tools,
+tells speakers apart only by voice. Typing to it, `prompt/3`, tools
+(via `delegation: [model: "..."]` on OpenAI Live),
 presence and transcripts work as for the cascaded agent, and a restarted
-agent resumes its Gemini session. The key is
-`GOOGLE_API_KEY`. `Octoroom.Agent.Worker`'s moduledoc has what's
-different.
+agent carries on with its Gemini session handle or saved transcript. The
+keys are `GOOGLE_API_KEY` (Gemini Live) and `OPENAI_API_KEY` (OpenAI Live).
+`Octoroom.Agent.Worker`'s moduledoc has what's different.
 
 `examples/call` has an agent lab at `/lab/<room>` for trying it: switch
-between the cascaded, half-cascaded and Gemini Live pipelines and between the name gate
+between the cascaded, half-cascaded, Gemini Live and OpenAI Live pipelines and between the name gate
 and a decision model (`gate: :decision`), and watch each turn's decision. Keys come from the
 environment: `SONIOX_API_KEY`, `GOOGLE_API_KEY` (Gemini, its LLM)
 and `INWORLD_API_KEY`. See `Octoroom.Agent.Worker` for the args, what it

@@ -1,6 +1,6 @@
 # Meet
 
-A video call with three AI assistants, in a plain Phoenix app: `mix phx.new meet
+A video call with four AI assistants, in a plain Phoenix app: `mix phx.new meet
 --no-ecto --no-mailer --no-dashboard`, plus Octoroom. The layout, the core
 components (`.button`, `.input`, `.header`, `.icon`) and the Tailwind/daisyUI
 styling are the generator's own.
@@ -8,7 +8,7 @@ styling are the generator's own.
 What Octoroom adds:
 
 - [lib/meet/room.ex](lib/meet/room.ex): `Meet.Room`, the room's policy.
-  Everyone hears and sees everyone, and three assistants join as soon as the
+  Everyone hears and sees everyone, and four assistants join as soon as the
   first person does (`agents/2`). The first two use the decision model
   (`gate: :decision`) on each turn's audio to tell whether someone's talking
   to them, so nobody has to say their names; their `name:` and
@@ -24,6 +24,10 @@ What Octoroom adds:
   answer (its proactive audio lets it stay quiet), so it isn't gated and
   makes no decision rows: its replies show up in the transcript on their
   own. Its key is `GOOGLE_API_KEY`.
+- [lib/meet/open_ai.ex](lib/meet/open_ai.ex): OpenAI, an OpenAI Live model
+  (`gpt-live-1.1`), full-duplex speech-to-speech. Like Gemini, it hears
+  everyone mixed into one stream and decides for itself when to answer, so
+  it isn't gated and makes no decision rows. Its key is `OPENAI_API_KEY`.
 - [lib/meet_web/channels](lib/meet_web/channels): a channel for signaling
   (`use Octoroom.Phoenix.Channel`) and the socket it's on.
 - [assets/js/call.js](assets/js/call.js): the `Call` hook, which joins with
@@ -50,6 +54,7 @@ OCTOROOM_CLOUDFLARE_APP_SECRET=...
 RESON8_API_KEY=...
 SONIOX_API_KEY=...
 GOOGLE_API_KEY=...
+OPENAI_API_KEY=...
 OPENROUTER_API_KEY=...
 ASSEMBLY_AI_API_KEY=...
 ```

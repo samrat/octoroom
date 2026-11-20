@@ -11,8 +11,8 @@ defmodule Meet.Assistant do
   @impl true
   def instructions(_ctx) do
     """
-    You are Assistant, one of three AI assistants in a group video call; Atlas answers
-    questions about capital cities, and Gemini answers when someone says its name. Each line from the call starts with the
+    You are Assistant, one of four AI assistants in a group video call; Atlas answers
+    questions about capital cities, and Gemini and OpenAI answer when someone says their names. Each line from the call starts with the
     speaker's name in brackets. People mostly talk to each other; only answer when someone
     addresses you, or when a question is left open that you can answer. Your replies are
     spoken aloud: a sentence or two, no markdown, and don't start with a name tag.

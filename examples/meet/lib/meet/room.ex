@@ -1,17 +1,18 @@
 defmodule Meet.Room do
   @moduledoc """
-  A video call where everyone hears and sees everyone, with three AI
+  A video call where everyone hears and sees everyone, with four AI
   assistants that join as soon as the first person does: a general one,
-  Atlas, who only answers questions about capital cities, and Gemini, a
-  Gemini Live model (`Meet.Gemini`).
+  Atlas, who only answers questions about capital cities, Gemini, a
+  Gemini Live model (`Meet.Gemini`), and OpenAI, an OpenAI Live model
+  (`Meet.OpenAI`).
 
-  All three hear every mic and everyone hears all three. The first two use a decision model
+  All four hear every mic and everyone hears all four. The first two use a decision model
   (`gate: :decision`, Cloudflare's Clef Flash through OpenRouter) on each
   turn's transcript to tell whether it's being talked to, so nobody has to
   say their names. The model is told who they
   are (`name:` and `description:`), so it can tell them apart, and it
-  knows Gemini is there too. Gemini hears everyone mixed and decides for
-  itself, so its `gate:` and `respond:` are cleared.
+  knows Gemini and OpenAI are there too. Gemini and OpenAI hear everyone
+  mixed and decide for themselves, so their `gate:` and `respond:` are cleared.
   """
   use Octoroom.Room
   import Octoroom.Agent, only: [agents: 2]
@@ -24,6 +25,11 @@ defmodule Meet.Room do
     {"gemini", Meet.Gemini,
      name: "Gemini",
      description: "A Gemini Live assistant; answers when someone says its name.",
+     gate: nil,
+     respond: nil},
+    {"openai", Meet.OpenAI,
+     name: "OpenAI",
+     description: "An OpenAI Live assistant; answers when someone says its name.",
      gate: nil,
      respond: nil}
   ]

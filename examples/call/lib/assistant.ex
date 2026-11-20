@@ -29,6 +29,9 @@ defmodule Call.Assistant do
   def pipeline(%{args: %{pipeline: :live}}),
     do: Spec.gemini_live(model: "gemini-3.1-flash-live-preview")
 
+  def pipeline(%{args: %{pipeline: :openai_live}}),
+    do: Spec.openai_live(model: "gpt-live-1.1", delegation: [model: "gpt-5.4-mini"])
+
   def pipeline(%{args: %{pipeline: :half}}),
     do: Spec.default([stt: false, transcriber: [model: "gemini-3.1-flash-lite"]] ++ @llm_and_tts)
 

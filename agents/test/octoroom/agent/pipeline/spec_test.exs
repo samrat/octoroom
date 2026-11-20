@@ -141,4 +141,34 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
       )
     end
   end
+
+  test "openai_live has no front end, needs a model, and validates options" do
+    assert {nil, back} =
+             openai_live(
+               model: "gpt-live-1.1",
+               voice: "marin",
+               delegation: [model: "gpt-5.4-mini"]
+             )
+
+    assert names(back) == [:openai]
+
+    assert opts(back, :openai) == [
+             model: "gpt-live-1.1",
+             voice: "marin",
+             delegation: [model: "gpt-5.4-mini"]
+           ]
+
+    assert {nil, _} = openai_live(model: "gpt-live-1.1", delegation: :client)
+    assert {nil, _} = openai_live(model: "gpt-live-1.1", sample_rate: 16_000)
+
+    assert_raise ArgumentError, fn -> openai_live(voice: "marin") end
+
+    assert_raise ArgumentError, fn ->
+      openai_live(model: "gpt-live-1.1", sample_rate: 8_000)
+    end
+
+    assert_raise ArgumentError, fn ->
+      openai_live(model: "gpt-live-1.1", delegation: [type: :responses])
+    end
+  end
 end

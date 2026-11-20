@@ -127,9 +127,9 @@ defmodule Octoroom.Agent do
 
   Each input runs its own front end, and their turns go into the one back
   end. A `nil` front end makes the back end hear the inputs mixed, as
-  `Spec.gemini_live/1` does: one speech-to-speech model that takes its own
-  turns, so `respond:` and `gate:` don't apply (see "Gemini Live" in
-  `Octoroom.Agent.Worker`).
+  `Spec.gemini_live/1` and `Spec.openai_live/1` do: one speech-to-speech
+  model that takes its own turns, so `respond:` and `gate:` don't apply
+  (see "Gemini Live and OpenAI Live" in `Octoroom.Agent.Worker`).
   """
   @callback pipeline(ctx) :: {Spec.t() | nil, Spec.t()}
 

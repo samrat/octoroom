@@ -211,6 +211,36 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     {nil, processor(:gemini, Octoroom.Agent.Processors.GeminiLive, opts)}
   end
 
+  @doc """
+  The pipeline of an OpenAI Live agent: no front end (the agent mixes its
+  inputs) and one `:openai` stage, `Octoroom.Agent.Processors.OpenAILive`,
+  which takes `opts`: `:model` (needed, such as `"gpt-live-1.1"`), `:voice`
+  (default `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:sample_rate`
+  (`24_000` default, or `16_000`), `:delegation` (`:client`,
+  `[model: "...", ...]`, or a delegation map), and `:initial_items`.
+
+      Spec.openai_live(
+        model: "gpt-live-1.1",
+        voice: "marin",
+        delegation: [model: "gpt-5.4-mini"]
+      )
+  """
+  def openai_live(opts) do
+    alias Octoroom.Agent.OpenAILive.Protocol
+
+    if not is_binary(opts[:model]), do: raise(ArgumentError, "openai_live needs a :model")
+
+    if Keyword.has_key?(opts, :sample_rate) do
+      Protocol.sample_rate(opts[:sample_rate])
+    end
+
+    if Keyword.has_key?(opts, :delegation) do
+      Protocol.delegation(opts[:delegation])
+    end
+
+    {nil, processor(:openai, Octoroom.Agent.Processors.OpenAILive, opts)}
+  end
+
   @doc "The options of the stage named `name`, or nil when there's none."
   def opts(%__MODULE__{stages: stages}, name) do
     Enum.find_value(stages, fn stage -> if stage.name == name, do: stage.opts end)

@@ -25,8 +25,9 @@ defmodule Call.Agent do
   def config(assigns), do: Map.merge(@defaults, Map.get(assigns, :agent) || %{})
 
   @doc "`Octoroom.Agent.agent/3` options for `config` (`Call.Assistant` reads `args`)."
-  # Gemini Live decides for itself when to answer.
-  def opts(%{pipeline: :live}), do: [name: "Assistant", args: %{pipeline: :live}]
+  # Live speech-to-speech models decide for themselves when to answer.
+  def opts(%{pipeline: pipeline}) when pipeline in [:live, :openai_live],
+    do: [name: "Assistant", args: %{pipeline: pipeline}]
 
   def opts(config) do
     [
@@ -52,7 +53,12 @@ defmodule Call.Agent do
       pipeline:
         choice(
           params["pipeline"],
-          %{"cascaded" => :cascaded, "half" => :half, "live" => :live},
+          %{
+            "cascaded" => :cascaded,
+            "half" => :half,
+            "live" => :live,
+            "openai_live" => :openai_live
+          },
           current.pipeline
         ),
       gate: choice(params["gate"], %{"name" => :name, "decision" => :decision}, current.gate),
@@ -397,6 +403,17 @@ defmodule Call.LabLive do
               Gemini Live
               <small>
                 One speech-to-speech model hears everyone mixed and decides when to answer. The settings below don't apply.
+              </small>
+            </label>
+            <label class="opt">
+              <input
+                type="radio"
+                name="pipeline"
+                value="openai_live"
+                checked={@config.pipeline == :openai_live}
+              /> OpenAI Live (gpt-live-1.1)
+              <small>
+                Full-duplex speech-to-speech model (needs OPENAI_API_KEY); hears everyone mixed and decides when to answer. The settings below don't apply.
               </small>
             </label>
           </fieldset>
