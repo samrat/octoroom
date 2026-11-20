@@ -96,4 +96,9 @@ defmodule Octoroom.Agent.Frames do
   defframe(FinalizeTranscript, :control)
   # Makes the `switch` stage named `stage` use branch `branch`.
   defframe(SwitchBranch, :control, fields: [:stage, :branch])
+  # Changes options of the stage named `stage`: the runner hands `opts` to
+  # its `handle_update/2` instead of `handle_frame/3`, and the frame stops
+  # there. Stages with other names pass it on. In an agent, one that leaves
+  # the back end goes to every front end (see `Octoroom.Agent.Worker`).
+  defframe(UpdateStage, :control, fields: [:stage, opts: []], uninterruptible: true)
 end

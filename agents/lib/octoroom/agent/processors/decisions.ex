@@ -10,7 +10,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
       %{addressee: "assistant" | "person" | "group" | "nobody",
         confidence: 0.81, probabilities: %{...}, answerable: 0.95,
-        answers: %{...}, latency_ms: 430, audio_ms: 2100}
+        answers: %{...}, latency_ms: 430, audio_ms: 2100, questions_id: nil}
 
   where `answers` are the model's raw answers by question (custom
   questions included), and the other fields read the `"addressee"` and
@@ -51,6 +51,19 @@ defmodule Octoroom.Agent.Processors.Decisions do
   that replaces the API call (for tests). Under a host, it warms the
   connection with one call when it starts (on half a second of silence, or
   a short line of text).
+
+  ## Changing the questions
+
+  An `Octoroom.Agent.Frames.UpdateStage` naming this stage can change
+  `:questions` while it runs, so each part of a conversation asks only what
+  it needs. Pass `:questions_id` with them (any term, such as the name of
+  the part of the conversation they're for): every decision carries the
+  `questions_id` of the questions it answered, so whoever reads it can tell
+  answers to old questions, from a turn that was being judged when they
+  changed. `:questions_id` is also an option here, `nil` by default.
+
+  With no questions (`%{}`), nothing is asked: turns go on at once, with
+  `decision: nil`.
   """
 
   use Octoroom.Agent.Processor
@@ -123,6 +136,10 @@ defmodule Octoroom.Agent.Processors.Decisions do
     {:ok,
      %{
        input: input,
+       opts: opts,
+       questions_id: Keyword.get(opts, :questions_id),
+       # No questions: nothing to ask, and turns go on without a decision.
+       ask?: questions != %{},
        evaluate: Keyword.get(opts, :evaluate) || api_evaluate(input, questions, opts),
        max_wait_ms: Keyword.get(opts, :max_wait_ms, 1_500),
        preroll_bytes: bytes(Keyword.get(opts, :preroll_ms, 1_000)),
@@ -144,7 +161,8 @@ defmodule Octoroom.Agent.Processors.Decisions do
         :downstream,
         state
       )
-      when state.input == :transcript and not is_nil(turn_id) and is_binary(text) do
+      when state.input == :transcript and state.ask? and not is_nil(turn_id) and
+             is_binary(text) do
     case String.trim(text) do
       "" -> {[{:push, frame, :downstream}], state}
       text -> hold_and_evaluate(frame, text_task(state.seq + 1, text, state), state)
@@ -193,6 +211,33 @@ defmodule Octoroom.Agent.Processors.Decisions do
   def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
 
   @impl true
+  def handle_update(opts, state) do
+    case Keyword.split(opts, [:questions, :questions_id]) do
+      {update, []} ->
+        state = %{state | questions_id: Keyword.get(update, :questions_id, state.questions_id)}
+
+        # A test's `:evaluate` has no questions to change.
+        state =
+          case Keyword.fetch(update, :questions) do
+            {:ok, questions} ->
+              state = %{state | ask?: questions != %{}}
+
+              if Keyword.has_key?(state.opts, :evaluate),
+                do: state,
+                else: %{state | evaluate: api_evaluate(state.input, questions, state.opts)}
+
+            :error ->
+              state
+          end
+
+        {[], state}
+
+      {_update, other} ->
+        {[{:error, {:not_updatable, Keyword.keys(other)}, false}], state}
+    end
+  end
+
+  @impl true
   def handle_async({:evaluate, seq}, {:done, {:ok, answers, timing}}, state),
     do: finish_eval(state, seq, decision(answers, timing))
 
@@ -238,7 +283,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
   defp speech_started(%{rec: rec} = state), do: {[], %{state | rec: %{rec | eval: nil}}}
 
   defp start_eval(%{rec: %{eval: nil} = rec} = state)
-       when byte_size(rec.audio) >= state.min_audio_bytes do
+       when state.ask? and byte_size(rec.audio) >= state.min_audio_bytes do
     {[eval_task(rec.seq, rec.audio, state)], %{state | rec: %{rec | eval: :running}}}
   end
 
@@ -246,10 +291,12 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   defp eval_task(seq, pcm, state) do
     wav = AudioTurn.wav(pcm, @sample_rate)
-    timed_task(seq, state.evaluate, wav, %{audio_ms: AudioTurn.duration_ms(pcm, @sample_rate)})
+    timing = %{audio_ms: AudioTurn.duration_ms(pcm, @sample_rate)}
+    timed_task(seq, state.evaluate, wav, Map.put(timing, :questions_id, state.questions_id))
   end
 
-  defp text_task(seq, text, state), do: timed_task(seq, state.evaluate, text, %{})
+  defp text_task(seq, text, state),
+    do: timed_task(seq, state.evaluate, text, %{questions_id: state.questions_id})
 
   defp timed_task(seq, evaluate, input, timing) do
     task = fn _emit ->
@@ -274,7 +321,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   # A `UserAudio` turn nobody recorded: evaluate its own audio, holding it.
   defp evaluate_frame(%Frames.UserAudio{audio: audio} = frame, state)
-       when byte_size(audio) >= state.min_audio_bytes,
+       when state.ask? and byte_size(audio) >= state.min_audio_bytes,
        do: hold_and_evaluate(frame, eval_task(state.seq + 1, audio, state), state)
 
   defp evaluate_frame(frame, state), do: {[{:push, frame, :downstream}], state}
@@ -320,11 +367,24 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   defp release(frame, decision) do
     Logger.info(
-      "DECISIONS turn=#{frame.turn_id} addressee=#{decision.addressee}(#{decision.confidence}) " <>
-        "answerable=#{decision.answerable} latency_ms=#{decision.latency_ms}"
+      "DECISIONS turn=#{frame.turn_id} #{summary(decision)} latency_ms=#{decision.latency_ms}"
     )
 
     [{:push, %{frame | decision: decision}, :downstream}]
+  end
+
+  # The default questions' answers, or else each answer's choice or probability.
+  defp summary(%{addressee: addressee} = d) when addressee != nil,
+    do: "addressee=#{addressee}(#{d.confidence}) answerable=#{d.answerable}"
+
+  defp summary(decision) do
+    answers =
+      Enum.map_join(decision.answers, " ", fn {question, answer} ->
+        "#{question}=#{answer["choice"] || answer["probability"]}" <>
+          if(answer["confidence"], do: "(#{round2(answer["confidence"])})", else: "")
+      end)
+
+    if id = decision[:questions_id], do: "questions=#{inspect(id)} #{answers}", else: answers
   end
 
   defp drop_turn(state, seq), do: %{state | turns: Map.delete(state.turns, seq)}

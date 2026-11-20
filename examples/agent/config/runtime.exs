@@ -37,6 +37,11 @@ for key <- ~w(SONIOX_API_KEY OPENROUTER_API_KEY ASSEMBLY_AI_API_KEY),
     value not in [nil, ""],
     do: System.put_env(key, value)
 
+# Which agent the page talks to: `Hello.Assistant` (an LLM), or with
+# HELLO_AGENT=booking, `Hello.Booking` (a script).
+config :hello,
+  agent: if(env.("HELLO_AGENT") == "booking", do: Hello.Booking, else: Hello.Assistant)
+
 # ## Using releases
 #
 # If you use `mix release`, you need to explicitly enable the server
