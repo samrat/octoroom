@@ -163,9 +163,9 @@ config :octoroom_agents, stt_providers: [acme: MyApp.AcmeSTT], tts_providers: [a
 
 ## Building
 
-Silero VAD runs on ONNX Runtime through `ortex`, which needs a Rust
-toolchain. Octoroom's own WebRTC stack needs the system's libsrtp
-(`brew install srtp`).
+Silero VAD and Smart Turn run on ONNX Runtime through `onnxruntime` (which
+downloads precompiled NIFs on macOS arm64 and Linux x86_64/arm64). Octoroom's
+own WebRTC stack needs the system's libsrtp (`brew install srtp`).
 
 ```sh
 mix deps.get

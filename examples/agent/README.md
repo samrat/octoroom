@@ -50,8 +50,8 @@ mix phx.server
 
 Open <http://localhost:4000> and press Join. Use headphones: with speakers,
 the agent's voice leaks into your mic and sounds like you talking.
-Building needs the system's libsrtp (`brew install srtp`) and a Rust
-toolchain (for Silero VAD); see the [Octoroom README](../../README.md).
+Building needs the system's libsrtp (`brew install srtp`); see the
+[Octoroom README](../../README.md).
 
 ## Measuring latency
 

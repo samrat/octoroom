@@ -66,5 +66,5 @@ mix phx.server
 
 Open <http://localhost:4000> (or `/r/<name>` for another room). Use
 headphones: the assistants' voices leaking into your mic sound like you.
-Building needs the system's libsrtp (`brew install srtp`) and a Rust
-toolchain (for Silero VAD); see the [Octoroom README](../../README.md).
+Building needs the system's libsrtp (`brew install srtp`); see the
+[Octoroom README](../../README.md).

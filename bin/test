@@ -7,7 +7,7 @@
 #
 # Suites:
 #   elixir  mix test
-#   agents  mix test in agents/ (octoroom_agents; its first build needs Rust)
+#   agents  mix test in agents/ (octoroom_agents)
 #   js      the browser client (priv/static/octoroom.mjs) on Node's test runner
 #   swift   swift test: the core against fakes, the WebRTC engine over loopback
 #   ios     builds examples/ios for the simulator (needs xcodegen; slow)
@@ -41,9 +41,6 @@ suite_elixir() {
 
 suite_agents() {
   need mix "install Elixir (see .tool-versions or mix.exs)" || return 1
-  if [ ! -d agents/_build ]; then
-    need cargo "install Rust (rustup.rs): ortex builds ONNX Runtime bindings" || return 1
-  fi
   (cd agents && mix deps.get >/dev/null && mix test)
 }
 

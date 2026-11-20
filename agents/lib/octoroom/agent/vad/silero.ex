@@ -74,7 +74,7 @@ defmodule Octoroom.Agent.VAD.Silero do
 
     sr = Nx.tensor(@sample_rate, type: :s64)
 
-    {output, next_state} = Ortex.run(model, {input, state, sr})
+    {output, next_state} = OnnxRuntime.run(model, {input, state, sr})
 
     probability =
       output
@@ -94,7 +94,7 @@ defmodule Octoroom.Agent.VAD.Silero do
       nil ->
         if File.regular?(path) do
           try do
-            model = Ortex.load(path)
+            model = OnnxRuntime.load(path)
             :persistent_term.put(key, model)
             {:ok, model}
           rescue

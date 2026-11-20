@@ -87,8 +87,8 @@ defmodule Octoroom.Agent.TurnDetection.SmartTurn do
     # Elixir would cost more than both models combined.
     audio = (padding <> pcm) |> Nx.from_binary(:s16) |> Nx.reshape({1, @window_samples})
 
-    {input_features} = Ortex.run(features, {audio})
-    {probability} = Ortex.run(model, {input_features})
+    {input_features} = OnnxRuntime.run(features, {audio})
+    {probability} = OnnxRuntime.run(model, {input_features})
 
     probability
     |> Nx.backend_transfer(Nx.BinaryBackend)
@@ -108,7 +108,7 @@ defmodule Octoroom.Agent.TurnDetection.SmartTurn do
       nil ->
         if File.regular?(path) do
           try do
-            model = Ortex.load(path)
+            model = OnnxRuntime.load(path)
             :persistent_term.put(key, model)
             {:ok, model}
           rescue
