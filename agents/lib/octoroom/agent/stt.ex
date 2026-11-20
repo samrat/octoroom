@@ -82,7 +82,8 @@ defmodule Octoroom.Agent.STT do
 
   @providers %{
     soniox: Octoroom.Agent.STT.Soniox,
-    assembly_ai: Octoroom.Agent.STT.AssemblyAI
+    assembly_ai: Octoroom.Agent.STT.AssemblyAI,
+    reson8: Octoroom.Agent.STT.Reson8
   }
 
   @doc "The registered providers, by name."

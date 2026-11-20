@@ -18,8 +18,10 @@ defmodule Meet.Atlas do
     """
   end
 
-  # Nemotron through OpenRouter: quicker to first text than Gemini. It speaks
-  # with AssemblyAI's Titus voice, so it doesn't sound like Assistant.
+  # Soniox hears the call: Reson8 allows one connection at a time, and
+  # Assistant has it. Nemotron through OpenRouter: quicker to first text than
+  # Gemini. It speaks with AssemblyAI's Titus voice, so it doesn't sound like
+  # Assistant.
   @impl true
   def backend(_ctx),
     do: %{llm: %{provider: :openrouter}, tts: %{provider: :assembly_ai, voice: "aai-titus"}}
