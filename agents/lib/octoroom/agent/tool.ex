@@ -7,13 +7,13 @@ defmodule Octoroom.Agent.Tool do
   @schedulings [:interrupt, :when_idle, :silent]
 
   # `progress_message` is spoken while a blocking tool runs, if the result
-  # has not arrived within `progress_delay_ms`. Only the cascaded backend
+  # has not arrived within `progress_delay_ms`. Only the cascaded pipeline
   # speaks it.
   #
   # `behavior: :non_blocking` lets the conversation continue while the tool
   # runs; when the result arrives, `scheduling` decides what happens:
   # `:interrupt` (speak about it now), `:when_idle` (after the current reply)
-  # or `:silent` (add it to the context only). Only the cascaded backend
+  # or `:silent` (add it to the context only). Only the cascaded pipeline
   # supports it; Gemini Live runs non-blocking tools as blocking.
   defstruct [
     :name,

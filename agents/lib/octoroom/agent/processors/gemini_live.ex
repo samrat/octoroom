@@ -27,7 +27,8 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   the model's transcripts of what it heard and what it said. User items
   have no `speaker` unless typed.
 
-  Options: `:model`, `:voice`, `:api_key` (default `GOOGLE_API_KEY`, then
+  Options: `:model` (needed, such as `"gemini-3.1-flash-live-preview"`),
+  `:voice`, `:api_key` (default `GOOGLE_API_KEY`, then
   `GEMINI_API_KEY`), and, defaulting to the runner context's,
   `:instructions`, `:initial_text`, `:tools` and `:context`. The socket
   starts only under a runner; for tests, pass `send: fn message -> ... end`
@@ -52,13 +53,20 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
   @impl true
   def init(opts, ctx) do
+    case Keyword.get(opts, :model) do
+      model when is_binary(model) -> start(model, opts, ctx)
+      _none -> {:error, {:no_model, __MODULE__}}
+    end
+  end
+
+  defp start(model, opts, ctx) do
     tools = Keyword.get(opts, :tools, Map.get(ctx, :tools, []))
 
     instructions = Keyword.get(opts, :instructions, Map.get(ctx, :instructions))
     resume = Map.get(ctx, :resume) || %{}
 
     setup = [
-      model: Keyword.get(opts, :model, Protocol.default_model()),
+      model: model,
       voice: Keyword.get(opts, :voice, Protocol.default_voice()),
       system_instruction: instructions,
       tools: GeminiTools.to_declarations(tools)

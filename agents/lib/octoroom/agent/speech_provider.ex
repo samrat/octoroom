@@ -12,6 +12,10 @@ defmodule Octoroom.Agent.SpeechProvider do
   implements `behaviour`. Without one, a `:model` like `"soniox:stt-rt-v6"`
   names both. The provider's `default_options/0` fill in what `opts` leaves
   out. Returns the module and the merged options, without `:provider`.
+
+  Nothing is picked for the caller: no provider is `{:no_provider, behaviour}`
+  and no `:model` is `{:no_model, module}`. The built-in providers have no
+  default model.
   """
   def resolve(opts, behaviour, registry) do
     opts = opts |> Enum.reject(fn {_key, value} -> is_nil(value) end) |> Map.new()
@@ -21,7 +25,12 @@ defmodule Octoroom.Agent.SpeechProvider do
       defaults =
         if function_exported?(module, :default_options, 0), do: module.default_options(), else: []
 
-      {:ok, module, Keyword.merge(defaults, opts |> Map.delete(:provider) |> Map.to_list())}
+      opts = Keyword.merge(defaults, opts |> Map.delete(:provider) |> Map.to_list())
+
+      case Keyword.get(opts, :model) do
+        model when is_binary(model) and model != "" -> {:ok, module, opts}
+        _none -> {:error, {:no_model, module}}
+      end
     end
   end
 

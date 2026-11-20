@@ -7,7 +7,8 @@ defmodule Octoroom.Agent.Processors.Transcriber do
   started. `UserAudio` is uninterruptible, so a transcription survives the
   user interrupting the reply.
 
-  Options: `:model` (default `"gemini-3.1-flash-lite"`), and `:transcribe`, a
+  Options: `:model` (a Gemini model, such as `"gemini-3.1-flash-lite"`;
+  needed), and `:transcribe`, a
   `fn pcm, sample_rate -> {:ok, text} | {:error, reason} end` that replaces
   the model (for tests).
   """
@@ -21,14 +22,16 @@ defmodule Octoroom.Agent.Processors.Transcriber do
 
   @impl true
   def init(opts, _ctx) do
-    model = Keyword.get(opts, :model, "gemini-3.1-flash-lite")
+    case {Keyword.get(opts, :transcribe), Keyword.get(opts, :model)} do
+      {transcribe, _model} when is_function(transcribe, 2) ->
+        {:ok, %{transcribe: transcribe}}
 
-    {:ok,
-     %{
-       transcribe:
-         Keyword.get(opts, :transcribe) ||
-           fn pcm, sample_rate -> AudioTurn.transcribe(pcm, sample_rate, model) end
-     }}
+      {nil, model} when is_binary(model) ->
+        {:ok, %{transcribe: fn pcm, rate -> AudioTurn.transcribe(pcm, rate, model) end}}
+
+      _neither ->
+        {:error, {:no_model, __MODULE__}}
+    end
   end
 
   @impl true

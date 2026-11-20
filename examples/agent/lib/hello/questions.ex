@@ -33,7 +33,9 @@ defmodule Hello.Questions do
 
     for {text, index} <- Enum.with_index(@questions) do
       if index > 0, do: Process.sleep(15_000)
-      {:ok, audio} = Octoroom.Agent.TTS.synthesize("assembly_ai", text, sample_rate: @rate)
+
+      {:ok, audio} =
+        Octoroom.Agent.TTS.synthesize("assembly_ai:assemblyai-tts-1", text, sample_rate: @rate)
 
       file = Path.join(dir, "#{index}.wav")
       File.write!(file, to_wav(audio))

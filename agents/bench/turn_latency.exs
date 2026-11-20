@@ -79,7 +79,22 @@ ctx = %Octoroom.Worker.Context{
 }
 
 t0 = System.monotonic_time(:millisecond)
-{:ok, state} = Worker.init(%{instructions: "You are a voice assistant. Be very brief."}, ctx)
+{front, back} =
+  Octoroom.Agent.Pipeline.Spec.default(
+    stt: "soniox:stt-rt-v6",
+    llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+    tts: "inworld:inworld-tts-2"
+  )
+
+{:ok, state} =
+  Worker.init(
+    %{
+      instructions: "You are a voice assistant. Be very brief.",
+      front_end: front,
+      back_end: back
+    },
+    ctx
+  )
 
 IO.puts(
   "question: #{inspect(question)}, speech ends at ~#{lead_ms + div(byte_size(speech16), 32)} ms"

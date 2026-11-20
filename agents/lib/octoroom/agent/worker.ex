@@ -27,11 +27,11 @@ defmodule Octoroom.Agent.Worker do
   name: the LLM sees
   `[Priya] can you add Acme to the sheet`. People joining and leaving add
   and drop front ends without restarting the agent. Two pipelines (see
-  `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`):
+  `Octoroom.Agent.Pipeline.Spec.default/1`):
 
     * **cascaded** (default): each front end streams to speech-to-text, and
       turns arrive as text.
-    * **half-cascaded** (`backend: %{stt: false}`): each front end records
+    * **half-cascaded** (`Spec.default(stt: false)`): each front end records
       whole turns as audio (Smart Turn decides when a turn ends), and the
       LLM hears them, after a `[speaker]` label. A transcriber turns each
       into text in the background, for the history and the transcript.
@@ -85,7 +85,7 @@ defmodule Octoroom.Agent.Worker do
 
   ## Gemini Live
 
-  With `backend: %Octoroom.Agent.Backend.GeminiLive{}` (see
+  With `Octoroom.Agent.Pipeline.Spec.gemini_live/1` as the pipeline (see
   `Octoroom.Agent.Processors.GeminiLive`), one speech-to-speech model does
   everything. It has one audio input, so there are no front ends: the
   inputs are mixed (`Octoroom.Agent.Audio.Mixer`) and the back end hears a
@@ -116,17 +116,16 @@ defmodule Octoroom.Agent.Worker do
 
   `Octoroom.Agent.agent/3` builds these from an `Octoroom.Agent` module:
   `:agent` (the module) and `:args` (its `ctx.args`), whose callbacks fill
-  in `:instructions`, `:tools`, `:backend`, `:initial_text` and the
-  pipelines. Given directly:
+  in `:instructions`, `:tools`, `:initial_text` and the pipelines. Given
+  directly:
 
-    * `:backend` - a `Octoroom.Agent.Backend.Cascaded` struct, or a map for
-      `Octoroom.Agent.Backend.Cascaded.new/1` (default `%{}`: Soniox, Gemini
-      through ReqLLM, Inworld). Its text-to-speech must produce 24 kHz. Or
-      an `Octoroom.Agent.Backend.GeminiLive` (see above).
-    * `:front_end`, `:back_end` - pipeline specs to run instead of the
-      backend's (see `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`). Each
-      front end has its own host for tasks and timers. `front_end: nil`
-      mixes the inputs into the back end, as for Gemini Live.
+    * `:front_end`, `:back_end` - the pipeline specs, both needed (see
+      `Octoroom.Agent.Pipeline.Spec.default/1`). Each front end has its own host for tasks
+      and timers. `front_end: nil` mixes the inputs into the back end, as
+      for Gemini Live. A `:tts` stage must produce 24 kHz and an `:stt`
+      stage hear 16 kHz. With `gate: :decision`, a front end with no
+      `:decisions` stage gets one at its end, with `:decisions` as its
+      options: they must name a `:model`.
     * `:name` (default `"Assistant"`), `:respond`, `:follow_up_ms` (default
       10 s), `:gate` (`:name`, the default, or `:decision`), `:thresholds`,
       `:decisions` (options for the decision stage) - see above
@@ -215,7 +214,6 @@ defmodule Octoroom.Agent.Worker do
   require Logger
 
   alias Octoroom.Agent.Audio.Mixer
-  alias Octoroom.Agent.Backend.{Cascaded, GeminiLive}
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.{Core, Host, Spec}
 
@@ -639,20 +637,18 @@ defmodule Octoroom.Agent.Worker do
     from_module = %{
       instructions: module.instructions(agent_ctx),
       tools: module.tools(agent_ctx),
-      backend: module.backend(agent_ctx),
       initial_text: if(ctx.resumed, do: nil, else: module.initial_text(agent_ctx))
     }
 
-    from_module =
-      case module.pipeline(agent_ctx) do
-        {front, %Spec{} = back} when is_struct(front, Spec) or is_nil(front) ->
-          Map.merge(from_module, %{front_end: front, back_end: back})
+    case module.pipeline(agent_ctx) do
+      {front, %Spec{} = back} when is_struct(front, Spec) or is_nil(front) ->
+        args |> Map.merge(from_module) |> Map.merge(%{front_end: front, back_end: back})
 
-        nil ->
-          from_module
-      end
-
-    Map.merge(args, from_module)
+      other ->
+        raise ArgumentError,
+              "#{inspect(module)}.pipeline/1 must return {front_end | nil, back_end}, " <>
+                "got: #{inspect(other)}"
+    end
   end
 
   defp from_agent(args, _ctx), do: args
@@ -660,14 +656,62 @@ defmodule Octoroom.Agent.Worker do
   # `voice: false`: no text-to-speech, so nothing to play, and the reply's
   # text is what was said.
   defp specs(args) do
-    with {:ok, front, back, silence_ms} <- voiced_specs(args),
-         :ok <- voice_for_mixed(front, args) do
+    with {:ok, front, back} <- pipeline(args),
+         :ok <- voice_for_mixed(front, args),
+         :ok <- rate(back, :tts, :output_sample_rate, @out_rate, :unsupported_output_sample_rate),
+         :ok <- rate(front, :stt, :sample_rate, @in_rate, :unsupported_input_sample_rate) do
       back =
         if Map.get(args, :voice, true) == false and :tts in Spec.names(back),
           do: back |> Spec.remove(:tts) |> silent_collector(),
           else: back
 
-      {:ok, front, back, silence_ms}
+      with {:ok, front} <- with_decisions(front, args),
+           do: {:ok, front, back, silence_ms(front)}
+    end
+  end
+
+  defp pipeline(%{front_end: front, back_end: %Spec{} = back})
+       when is_struct(front, Spec) or is_nil(front),
+       do: {:ok, front, back}
+
+  defp pipeline(_args), do: {:error, :no_pipeline}
+
+  # The agent speaks at one rate and hears at another: a stage set to
+  # anything else can't run. Left unset, the providers' defaults are these.
+  defp rate(nil, _stage, _key, _rate, _error), do: :ok
+
+  defp rate(spec, stage, key, rate, error) do
+    case Keyword.get(Spec.opts(spec, stage) || [], key, rate) do
+      ^rate -> :ok
+      other -> {:error, {error, other}}
+    end
+  end
+
+  # `gate: :decision` needs a decision stage in each front end.
+  defp with_decisions(%Spec{} = front, %{gate: :decision} = args) do
+    opts = Map.get(args, :decisions, [])
+
+    cond do
+      :decisions in Spec.names(front) ->
+        {:ok, front}
+
+      is_binary(opts[:model]) or is_function(opts[:evaluate]) ->
+        {:ok, Spec.processor(front, :decisions, Octoroom.Agent.Processors.Decisions, opts)}
+
+      true ->
+        {:error, :decisions_need_a_model}
+    end
+  end
+
+  defp with_decisions(front, _args), do: {:ok, front}
+
+  # How long after someone stops talking the VAD says so.
+  defp silence_ms(nil), do: 0
+
+  defp silence_ms(front) do
+    case Spec.opts(front, :vad) do
+      nil -> 0
+      opts -> Keyword.get(opts, :min_silence_ms, Octoroom.Agent.VAD.defaults().min_silence_ms)
     end
   end
 
@@ -683,54 +727,8 @@ defmodule Octoroom.Agent.Worker do
   end
 
   # A speech-to-speech model can't be silent.
-  defp voice_for_mixed(nil, %{voice: false}), do: {:error, :voice_false_needs_a_cascaded_backend}
+  defp voice_for_mixed(nil, %{voice: false}), do: {:error, :voice_false_needs_text_to_speech}
   defp voice_for_mixed(_front, _args), do: :ok
-
-  defp voiced_specs(%{front_end: %Spec{} = front, back_end: %Spec{} = back}),
-    do: {:ok, front, back, 0}
-
-  # No front end: the back end hears the inputs mixed.
-  defp voiced_specs(%{front_end: nil, back_end: %Spec{} = back}), do: {:ok, nil, back, 0}
-
-  defp voiced_specs(args) do
-    case GeminiLive.from(Map.get(args, :backend, %{})) do
-      %GeminiLive{} = backend -> {:ok, nil, Spec.gemini_live(backend), 0}
-      nil -> cascaded_specs(args)
-    end
-  end
-
-  defp cascaded_specs(args) do
-    backend =
-      case Map.get(args, :backend, %{}) do
-        %Cascaded{} = backend -> backend
-        opts -> Cascaded.new(opts)
-      end
-
-    rate = Map.get(backend.text_to_speech, :output_sample_rate)
-    stt_rate = Map.get(backend.speech_to_text, :sample_rate)
-
-    cond do
-      rate != @out_rate ->
-        {:error, {:unsupported_output_sample_rate, rate}}
-
-      stt_rate != @in_rate ->
-        {:error, {:unsupported_input_sample_rate, stt_rate}}
-
-      true ->
-        vad? = backend.vad.enabled or Cascaded.audio_input?(backend)
-        silence_ms = if vad?, do: backend.vad.min_silence_ms, else: 0
-
-        split_opts =
-          if Map.get(args, :gate) == :decision,
-            do: [decisions: Map.get(args, :decisions, [])],
-            else: []
-
-        {front, back} = Spec.cascaded_split(backend, split_opts)
-        {:ok, front, back, silence_ms}
-    end
-  rescue
-    error in ArgumentError -> {:error, Exception.message(error)}
-  end
 
   defp back_ctx(args, ctx) do
     tool_context =

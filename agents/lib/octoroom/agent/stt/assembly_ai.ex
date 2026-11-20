@@ -3,7 +3,7 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
   AssemblyAI realtime speech-to-text over its v3 WebSocket API.
 
   Reads `ASSEMBLY_AI_API_KEY`. `:model` is AssemblyAI's `speech_model`:
-  `"assemblyai-stt-3-7-realtime-agent"` (the default) for an agent that
+  `"assemblyai-stt-3-7-realtime-agent"` for an agent that
   answers, which decides when a turn ends, or `"assemblyai-stt-3-7-realtime"`
   for captions and transcripts, which ignores the endpointing settings
   below. Both take 32 languages in one stream. The older Universal models
@@ -29,7 +29,7 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
 
   @impl STT
   def default_options,
-    do: [model: "assemblyai-stt-3-7-realtime-agent", sample_rate: 16_000, format_turns: false]
+    do: [sample_rate: 16_000, format_turns: false]
 
   @impl STT
   def start_link(opts) do

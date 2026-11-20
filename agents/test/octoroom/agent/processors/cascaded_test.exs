@@ -1,10 +1,9 @@
 defmodule Octoroom.Agent.Processors.CascadedTest do
-  # The default cascaded spec, end to end, with fake providers.
+  # The cascaded stages as one chain, end to end, with fake providers.
   use ExUnit.Case, async: true
 
   import Octoroom.Agent.Pipeline.Spec
 
-  alias Octoroom.Agent.Backend
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.Test, as: Harness
   alias Octoroom.Agent.Processors
@@ -48,20 +47,23 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     end
   end
 
-  defp spec(backend, test_pid) do
-    cascaded(backend)
-    |> replace(:vad, processor(:vad, Processors.VAD, analyzer: :none))
-    |> replace(:llm, processor(:llm, Processors.LLM, request: fake_llm(test_pid)))
-    |> replace(:tts, processor(:tts, Processors.TTS, synthesize: fake_tts()))
+  defp spec(test_pid) do
+    processor(:vad, Processors.VAD, analyzer: :none)
+    |> processor(:stt, Processors.STT, provider: :soniox, model: "stt-rt-v6")
+    |> processor(:turns, Processors.STTTurns, vad: true)
+    |> processor(:context, Processors.Context)
+    |> processor(:llm, Processors.LLM, request: fake_llm(test_pid))
+    |> processor(:tools, Processors.Tools)
+    |> processor(:chunker, Processors.TextChunker)
+    |> processor(:tts, Processors.TTS, synthesize: fake_tts())
+    |> processor(:collector, Processors.AssistantCollector)
   end
 
   defp ctx, do: %{owner: self(), instructions: "Be brief.", tools: [@weather], context: %{}}
 
   test "a spoken question, a tool round, and the answer" do
-    backend = Backend.Cascaded.new(%{stt: %{provider: :soniox}})
-
     harness =
-      spec(backend, self())
+      spec(self())
       |> Harness.start!(ctx: ctx())
       |> Harness.push(%Frames.VADUserStartedSpeaking{})
       |> Harness.info(:stt, {:stt, {:partial, "what's the"}})
@@ -104,10 +106,8 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
   end
 
   test "barge-in before any audio kills the reply, and nothing was said" do
-    backend = Backend.Cascaded.new(%{stt: %{provider: :soniox}})
-
     harness =
-      spec(backend, self())
+      spec(self())
       |> Harness.start!(ctx: ctx(), async: :manual)
       |> Harness.info(:stt, {:stt, {:final, "Tell me a story."}})
 
@@ -137,8 +137,6 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
   end
 
   test "a when_idle result waits until the reply is done" do
-    backend = Backend.Cascaded.new(%{stt: %{provider: :soniox}})
-
     test_pid = self()
 
     plain_llm = fn opts, emit ->
@@ -148,7 +146,7 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     end
 
     harness =
-      spec(backend, self())
+      spec(self())
       |> replace(:llm, processor(:llm, Processors.LLM, request: plain_llm))
       |> Harness.start!(ctx: %{ctx() | tools: []}, async: :manual)
       |> Harness.info(:stt, {:stt, {:final, "Plan my trip."}})

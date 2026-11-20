@@ -19,7 +19,7 @@ defmodule Octoroom.Agent.TTS.OpenAI do
 
   @impl true
   def default_options,
-    do: [model: "gpt-4o-mini-tts", voice: "alloy", sample_rate: @sample_rate, stream: true]
+    do: [voice: "alloy", sample_rate: @sample_rate, stream: true]
 
   @impl true
   def synthesize(text, opts) do

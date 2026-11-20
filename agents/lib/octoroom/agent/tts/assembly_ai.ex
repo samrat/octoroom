@@ -8,7 +8,7 @@ defmodule Octoroom.Agent.TTS.AssemblyAI do
   and sample rate are fixed for a session.
 
   Reads `ASSEMBLY_AI_API_KEY`. `:voice` is a voice slug such as `"aai-kyla"`
-  (the default) or a cloned voice's id, and `:model` defaults to
+  (the default) or a cloned voice's id, and `:model` is
   `"assemblyai-tts-1"`. Besides `Octoroom.Agent.TTS`'s options it takes
   `:language` (`"english"`, `"spanish"`, `"german"`, `"italian"`,
   `"portuguese"` or `"french"`; by default the voice's), `:region` (`:us`,
@@ -25,7 +25,7 @@ defmodule Octoroom.Agent.TTS.AssemblyAI do
 
   @impl true
   def default_options,
-    do: [model: "assemblyai-tts-1", voice: "aai-kyla", sample_rate: 24_000]
+    do: [voice: "aai-kyla", sample_rate: 24_000]
 
   @doc """
   Opens a session for calls to share, closed when the calling process

@@ -2,7 +2,7 @@ defmodule Octoroom.Agent.STT.Reson8 do
   @moduledoc """
   Reson8 realtime speech-to-text over its WebSocket API.
 
-  Reads `RESON8_API_KEY`. `:model` is `"rumble-2"` (the default) or
+  Reads `RESON8_API_KEY`. `:model` is `"rumble-2"` or
   `"resonant-1"`. Interim results are on, so the owner gets partials.
   `:language_hints` become Reson8's `language` (auto-detected without
   them). Besides `Octoroom.Agent.STT`'s options it takes Reson8's
@@ -29,7 +29,7 @@ defmodule Octoroom.Agent.STT.Reson8 do
   @close_id "close"
 
   @impl STT
-  def default_options, do: [model: "rumble-2", sample_rate: 16_000]
+  def default_options, do: [sample_rate: 16_000]
 
   @impl STT
   def start_link(opts) do

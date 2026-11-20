@@ -34,6 +34,7 @@ defmodule Call.Agent do
       # Even alone in the call, so it behaves the same with one person or ten.
       respond: :addressed,
       gate: config.gate,
+      decisions: [model: "google:gemini-decision-1"],
       follow_up_ms: round(config.follow_up_s * 1_000),
       thresholds: %{
         reply_above: config.reply_above,

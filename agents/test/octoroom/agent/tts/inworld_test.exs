@@ -23,6 +23,7 @@ defmodule Octoroom.Agent.TTS.InworldTest do
              Inworld.stream("Hello", &send(parent, {:audio, &1}),
                api_key: "key",
                connection: fake_socket(parent),
+               model: "inworld-tts-2",
                voice: "Dennis",
                delivery_mode: "STABLE"
              )

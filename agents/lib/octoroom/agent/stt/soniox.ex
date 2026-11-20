@@ -26,7 +26,6 @@ defmodule Octoroom.Agent.STT.Soniox do
   @impl STT
   def default_options do
     [
-      model: "stt-rt-v6",
       sample_rate: 16_000,
       audio_format: "pcm_s16le",
       num_channels: 1,
@@ -223,7 +222,7 @@ defmodule Octoroom.Agent.STT.Soniox do
 
     %{
       api_key: api_key,
-      model: Keyword.get(opts, :model, "stt-rt-v6"),
+      model: Keyword.fetch!(opts, :model),
       audio_format: audio_format,
       sample_rate: maybe_raw_audio_value(audio_format, Keyword.get(opts, :sample_rate, 16_000)),
       num_channels: maybe_raw_audio_value(audio_format, Keyword.get(opts, :num_channels, 1)),

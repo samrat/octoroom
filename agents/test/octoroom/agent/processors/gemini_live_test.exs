@@ -23,7 +23,12 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
     processor(
       :gemini,
       Octoroom.Agent.Processors.GeminiLive,
-      [send: &send(test, {:to_gemini, &1}), tools: tools, context: %{room_id: "r"}] ++ opts
+      [
+        model: "gemini-live-x",
+        send: &send(test, {:to_gemini, &1}),
+        tools: tools,
+        context: %{room_id: "r"}
+      ] ++ opts
     )
     |> Test.start!(ctx: %{owner: test})
     |> Test.push(%Frames.Start{})
@@ -34,7 +39,10 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
 
   test "sends audio once set up, and plays what the model says" do
     harness =
-      processor(:gemini, Octoroom.Agent.Processors.GeminiLive, send: &send(self(), {:sent, &1}))
+      processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+        model: "gemini-live-x",
+        send: &send(self(), {:sent, &1})
+      )
       |> Test.start!()
       |> Test.push(%Frames.InputAudio{audio: <<1, 1>>})
 
@@ -162,6 +170,7 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
     ]
 
     processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+      model: "gemini-live-x",
       send: &send(self(), {:sent, &1}),
       instructions: "Be brief."
     )

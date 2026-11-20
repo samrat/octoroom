@@ -7,9 +7,9 @@ defmodule Octoroom.Agent.Processors.LLM do
   call isn't spoken: what came before it is the preamble ("let me check").
   An interruption kills the request.
 
-  Options: `:provider` (`:google`, `:openrouter`, `:openai`), `:model`,
-  `:reasoning_effort`, `:max_tokens`, `:provider_options`, `:stream`
-  (default `true`), `:token` (defaults to `OPENAI_API_KEY` for `:openai`;
+  Options: `:provider` (`:google`, `:openrouter`, `:openai`) and `:model`,
+  both needed; `:reasoning_effort`, `:max_tokens`, `:provider_options`,
+  `:stream` (default `true`), `:token` (defaults to `OPENAI_API_KEY` for `:openai`;
   ReqLLM providers read their own keys), and `:request`, a
   `fn opts, emit -> {:ok, response} | {:error, reason} end` that replaces the
   provider (for tests; `emit.({:text_delta, text})` streams text, as the
@@ -26,17 +26,29 @@ defmodule Octoroom.Agent.Processors.LLM do
   @impl true
   def init(opts, _ctx) do
     opts = Map.new(opts)
-    provider = Map.get(opts, :provider, :google)
 
-    {:ok,
-     %{
-       provider: provider,
-       request: Map.get(opts, :request) || provider_request(provider, opts),
-       stream?: Map.get(opts, :stream, true),
-       tool_call_seen?: false,
-       spoke?: false
-     }}
+    with {:ok, request} <- request(opts) do
+      {:ok,
+       %{
+         provider: Map.get(opts, :provider),
+         request: request,
+         stream?: Map.get(opts, :stream, true),
+         tool_call_seen?: false,
+         spoke?: false
+       }}
+    end
   end
+
+  defp request(%{request: request}) when is_function(request, 2), do: {:ok, request}
+
+  defp request(%{provider: provider, model: model} = opts)
+       when is_atom(provider) and not is_nil(provider) and is_binary(model),
+       do: {:ok, provider_request(provider, opts)}
+
+  defp request(%{provider: provider}) when is_atom(provider) and not is_nil(provider),
+    do: {:error, {:no_model, __MODULE__}}
+
+  defp request(_opts), do: {:error, {:no_provider, __MODULE__}}
 
   defp provider_request(provider, opts) do
     token = Map.get(opts, :token) || if(provider == :openai, do: System.get_env("OPENAI_API_KEY"))
@@ -44,7 +56,7 @@ defmodule Octoroom.Agent.Processors.LLM do
     base = [
       provider: provider,
       token: token,
-      model: Map.get(opts, :model, "gemini-3.5-flash"),
+      model: Map.fetch!(opts, :model),
       max_tokens: Map.get(opts, :max_tokens),
       reasoning_effort: Map.get(opts, :reasoning_effort),
       provider_options: Map.get(opts, :provider_options)

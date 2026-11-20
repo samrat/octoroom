@@ -70,153 +70,136 @@ defmodule Octoroom.Agent.Pipeline.Spec do
   defp append(%__MODULE__{stages: stages} = spec, stage), do: %{spec | stages: stages ++ [stage]}
 
   @doc """
-  The default cascaded pipeline for a `Octoroom.Agent.Backend.Cascaded` config:
+  The usual pipeline of an agent, in two parts: `{front_end, back_end}`.
+  Each input runs its own front end, and their turns go into one back end:
 
-      vad -> stt -> turns -> context -> llm -> tools -> chunker -> tts -> collector
-
-  Without the VAD, turn taking and barge-in fall back to the STT provider.
-
-  Options: `:context` (options for the context stage, such as
-  `instructions:`).
-  """
-  def cascaded(%Octoroom.Agent.Backend.Cascaded{} = backend, opts \\ []) do
-    alias Octoroom.Agent.Processors
-
-    cond do
-      Octoroom.Agent.Backend.Cascaded.audio_input?(backend) ->
-        raise ArgumentError, "audio input to the LLM (speech_to_text: false) isn't copied yet"
-
-      Map.get(backend.turn_detection, :provider) != :stt ->
-        raise ArgumentError, "only turn_detection: :stt is copied so far"
-
-      true ->
-        :ok
-    end
-
-    vad = backend.vad
-    vad? = Map.get(vad, :enabled, true)
-
-    vad_opts =
-      vad
-      |> Map.take([
-        :start_threshold,
-        :stop_threshold,
-        :min_speech_ms,
-        :min_silence_ms,
-        :model_path
-      ])
-      |> Map.to_list()
-
-    spec = if vad?, do: processor(:vad, Processors.VAD, vad_opts), else: new()
-
-    spec
-    |> processor(:stt, Processors.STT, Map.to_list(backend.speech_to_text))
-    |> processor(:turns, Processors.STTTurns, vad: vad?)
-    |> processor(:context, Processors.Context, Keyword.get(opts, :context, []))
-    |> processor(:llm, Processors.LLM, Map.to_list(backend.llm))
-    |> processor(:tools, Processors.Tools)
-    |> processor(:chunker, Processors.TextChunker)
-    |> processor(:tts, Processors.TTS, Map.to_list(backend.text_to_speech))
-    |> processor(:collector, Processors.AssistantCollector)
-  end
-
-  @doc """
-  The pipeline of an agent that hears several people, in two parts:
-  `{front_end, back_end}`. Each input runs its own front end, and their
-  turns go into one back end.
-
-  With speech-to-text (cascaded):
-
-      front: vad -> stt -> turns [-> decisions]
+      front: vad -> stt -> turns
       back:  context -> llm -> tools -> chunker -> tts -> collector
 
-  With `speech_to_text: false` (half-cascaded: the LLM hears each turn):
+  It picks no provider and no model: `:stt`, `:llm` and `:tts` are needed,
+  each naming both. Options are their stage's, passed on as they are:
 
-      front: vad -> turns (AudioTurns, Smart Turn) [-> decisions]
+    * `:stt` - `Octoroom.Agent.Processors.STT`'s
+    * `:llm` - `Octoroom.Agent.Processors.LLM`'s
+    * `:tts` - `Octoroom.Agent.Processors.TTS`'s
+    * `:vad` - `Octoroom.Agent.Processors.VAD`'s (the local Silero model).
+      `false` leaves the VAD out: turn taking and barge-in fall back to the
+      STT provider.
+
+  `:stt` and `:tts` also take just a `"provider:model"` string.
+
+      Spec.default(
+        stt: "soniox:stt-rt-v6",
+        llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+        tts: [provider: :assembly_ai, model: "assemblyai-tts-1", voice: "aai-titus"]
+      )
+
+  With `stt: false` (half-cascaded) the LLM hears each turn as audio, so it
+  must be a Gemini model, the VAD can't be left out, and `:transcriber`
+  (`Octoroom.Agent.Processors.Transcriber`'s options) names the model that
+  writes each turn down afterwards:
+
+      front: vad -> turns (AudioTurns, Smart Turn)
       back:  transcriber -> context -> llm -> tools -> chunker -> tts -> collector
 
-  The front ends' turn stages don't interrupt; the agent decides who may.
-
-  Options: `:decisions` (options for `Processors.Decisions`; leave it out
-  for no decision stage), `:context`.
+  The front end's turn stage doesn't interrupt; the agent decides who may.
+  Change either part with the editing helpers.
   """
-  def cascaded_split(%Octoroom.Agent.Backend.Cascaded{} = backend, opts \\ []) do
+  def default(opts) do
     alias Octoroom.Agent.Processors
+    alias Octoroom.Agent.{STT, TTS}
 
-    audio? = Octoroom.Agent.Backend.Cascaded.audio_input?(backend)
-    vad = backend.vad
-    vad? = audio? or Map.get(vad, :enabled, true)
+    opts = Keyword.validate!(opts, [:stt, :llm, :tts, :transcriber, vad: []])
+    vad = opts[:vad]
+    stt = named!(opts, :stt, &STT.resolve/1)
+    tts = named!(opts, :tts, &TTS.resolve/1)
+    llm = Keyword.fetch!(opts, :llm)
 
-    if not audio? and Map.get(backend.turn_detection, :provider) != :stt,
-      do: raise(ArgumentError, "with speech-to-text, only turn_detection: :stt is copied so far")
+    named? = llm[:provider] != nil and is_atom(llm[:provider]) and is_binary(llm[:model])
 
-    vad_opts =
-      vad
-      |> Map.take([
-        :start_threshold,
-        :stop_threshold,
-        :min_speech_ms,
-        :min_silence_ms,
-        :model_path
-      ])
-      |> Map.to_list()
+    if not named? and llm[:request] == nil,
+      do: raise(ArgumentError, "llm: needs a :provider and a :model, got: #{inspect(llm)}")
 
-    front = if vad?, do: processor(:vad, Processors.VAD, vad_opts), else: new()
+    front = if vad, do: processor(:vad, Processors.VAD, vad), else: new()
 
-    front =
-      if audio? do
-        smart = backend.turn_detection |> Map.drop([:provider]) |> Map.to_list()
+    {front, back} =
+      if stt do
+        front =
+          front
+          |> processor(:stt, Processors.STT, stt)
+          |> processor(:turns, Processors.STTTurns, vad: vad != false, interrupt: false)
 
-        processor(
-          front,
-          :turns,
-          Processors.AudioTurns,
-          [interrupt: false, smart_turn: Map.get(backend.turn_detection, :smart_turn, true)] ++
-            Keyword.take(smart, [:threshold, :max_silence_ms, :model_path, :features_model_path]) ++
-            [min_speech_ms: Map.get(vad, :min_speech_ms, 200)]
-        )
+        {front, new()}
       else
-        front
-        |> processor(:stt, Processors.STT, Map.to_list(backend.speech_to_text))
-        |> processor(:turns, Processors.STTTurns, vad: vad?, interrupt: false)
+        if vad == false,
+          do: raise(ArgumentError, "stt: false needs the VAD: nothing else hears the user")
+
+        transcriber = opts[:transcriber] || []
+
+        if not is_binary(transcriber[:model]) and transcriber[:transcribe] == nil,
+          do: raise(ArgumentError, "stt: false needs transcriber: [model: ...]")
+
+        turns = [interrupt: false] ++ Keyword.take(vad, [:min_speech_ms])
+
+        {processor(front, :turns, Processors.AudioTurns, turns),
+         processor(:transcriber, Processors.Transcriber, transcriber)}
       end
-
-    front =
-      case Keyword.fetch(opts, :decisions) do
-        {:ok, decision_opts} -> processor(front, :decisions, Processors.Decisions, decision_opts)
-        :error -> front
-      end
-
-    transcription_model = Map.get(backend.speech_to_text, :transcription_model)
-
-    back =
-      if audio? and is_binary(transcription_model) and transcription_model != "",
-        do: processor(:transcriber, Processors.Transcriber, model: transcription_model),
-        else: new()
 
     back =
       back
-      |> processor(:context, Processors.Context, Keyword.get(opts, :context, []))
-      |> processor(:llm, Processors.LLM, Map.to_list(backend.llm))
+      |> processor(:context, Processors.Context)
+      |> processor(:llm, Processors.LLM, llm)
       |> processor(:tools, Processors.Tools)
       |> processor(:chunker, Processors.TextChunker)
-      |> processor(:tts, Processors.TTS, Map.to_list(backend.text_to_speech))
+      |> processor(:tts, Processors.TTS, tts)
       |> processor(:collector, Processors.AssistantCollector)
 
     {front, back}
   end
 
-  @doc """
-  The back end of a Gemini Live agent, one `:gemini` stage
-  (`Octoroom.Agent.Processors.GeminiLive`). It has no front end: the agent
-  mixes its inputs into it. Add stages around it with the editing helpers.
-  """
-  def gemini_live(%Octoroom.Agent.Backend.GeminiLive{} = backend) do
-    opts =
-      [model: backend.model, voice: backend.voice, api_key: backend.api_key]
-      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  # A speech stage's options, checked now: a missing provider or model
+  # would otherwise only show when someone joins.
+  defp named!(opts, key, resolve) do
+    case Keyword.fetch(opts, key) do
+      {:ok, false} when key == :stt ->
+        false
 
-    processor(:gemini, Octoroom.Agent.Processors.GeminiLive, opts)
+      {:ok, value} ->
+        stage_opts =
+          if is_list(value),
+            do: value,
+            else: Octoroom.Agent.SpeechProvider.with_provider(value, [])
+
+        case resolve.(stage_opts) do
+          {:ok, _module, _opts} ->
+            stage_opts
+
+          {:error, reason} ->
+            raise ArgumentError,
+                  "#{key}: needs a provider and a model, such as \"provider:model\" " <>
+                    "(#{inspect(reason)}), got: #{inspect(value)}"
+        end
+
+      :error ->
+        raise ArgumentError, "#{key}: is needed: Spec.default/1 picks no provider"
+    end
+  end
+
+  @doc """
+  The pipeline of a Gemini Live agent: no front end (the agent mixes its
+  inputs) and one `:gemini` stage, `Octoroom.Agent.Processors.GeminiLive`,
+  which takes `opts`: `:model` (needed), `:voice`, `:api_key`.
+
+      Spec.gemini_live(model: "gemini-3.1-flash-live-preview", voice: "Puck")
+  """
+  def gemini_live(opts) do
+    if not is_binary(opts[:model]), do: raise(ArgumentError, "gemini_live needs a :model")
+    {nil, processor(:gemini, Octoroom.Agent.Processors.GeminiLive, opts)}
+  end
+
+  @doc "The options of the stage named `name`, or nil when there's none."
+  def opts(%__MODULE__{stages: stages}, name) do
+    Enum.find_value(stages, fn stage -> if stage.name == name, do: stage.opts end)
   end
 
   @doc "Names of the stages, in order."

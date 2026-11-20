@@ -5,6 +5,7 @@ defmodule Meet.Assistant do
   """
   use Octoroom.Agent
 
+  alias Octoroom.Agent.Pipeline.Spec
   alias Octoroom.Agent.Tool
 
   @impl true
@@ -21,8 +22,19 @@ defmodule Meet.Assistant do
   # Reson8's rumble-2 hears the call. Nemotron through OpenRouter: quicker
   # to first text than Gemini. It speaks with AssemblyAI's Kyla voice.
   @impl true
-  def backend(_ctx),
-    do: %{stt: "reson8:rumble-2", llm: %{provider: :openrouter}, tts: "assembly_ai"}
+  def pipeline(_ctx) do
+    Spec.default(
+      stt: "reson8:rumble-2",
+      # Reasoning is off for voice, and OpenRouter picks its quickest host.
+      llm: [
+        provider: :openrouter,
+        model: "nvidia/nemotron-3.5-lightning",
+        reasoning_effort: :none,
+        provider_options: [openrouter_provider: %{sort: "latency"}]
+      ],
+      tts: "assembly_ai:assemblyai-tts-1"
+    )
+  end
 
   @impl true
   def tools(_ctx) do

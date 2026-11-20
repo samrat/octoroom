@@ -83,25 +83,28 @@ architecture.md in the same change.
 | [D43](#d43-inlets-decode-to-the-workers-format)                                               | Inlets decode to the worker's format                                               | Current                 |
 | [D44](#d44-workers-reach-clients-through-their-outputs)                                       | Workers reach clients through their outputs                                        | Current                 |
 | [D45](#d45-a-frame-changes-a-stages-options-by-name)                                          | A frame changes a stage's options, by name                                         | Current                 |
+| [D46](#d46-an-agent-says-what-it-runs-as-a-pipeline)                                          | An agent says what it runs as a pipeline                                           | Current                 |
 
 ## Removed code
 
 Names that appear in old commits and in superseded entries below, and no
 longer exist:
 
-| Name                                            | Was                                                                     | Removed by |
-| ----------------------------------------------- | ----------------------------------------------------------------------- | ---------- |
-| `Octoroom.Plug`                                 | The WebSocket endpoint Cloudflare dialed for each adapter.              | D24        |
-| `Octoroom.Adapter`, `Octoroom.Adapter.Socket`   | Adapter bookkeeping and the socket handler for one adapter.             | D24        |
-| `Octoroom.Cloudflare.Packet`                    | Hand-rolled protobuf codec for the adapters' PCM `Packet`.              | D24        |
-| Adapter calls in `Octoroom.Cloudflare`          | `adapters/websocket/new` and `close`.                                   | D24        |
-| `config :octoroom, public_ws_url:`              | The public `wss://` URL Cloudflare dialed.                              | D24        |
-| The store's `:adapters` table                   | Adapter ids recorded so a later run could close them.                   | D24        |
-| The janitor's adapter sweep                     | Closed adapters whose room wasn't running.                              | D24        |
-| `plug`, `websock_adapter` dependencies          | For `Octoroom.Plug`.                                                    | D24        |
-| Telemetry `[:octoroom, :adapter, :create]`      | Became `[:octoroom, :peer, :connect]`.                                  | D24        |
-| A participant's `mic` field in the room server  | `:none \| :publishing \| :pending \| :live`, one track per participant. | D31        |
-| The room server as the supervisor's first child | The process order of milestone 3.                                       | D20        |
+| Name                                             | Was                                                                     | Removed by |
+| ------------------------------------------------ | ----------------------------------------------------------------------- | ---------- |
+| `Octoroom.Plug`                                  | The WebSocket endpoint Cloudflare dialed for each adapter.              | D24        |
+| `Octoroom.Adapter`, `Octoroom.Adapter.Socket`    | Adapter bookkeeping and the socket handler for one adapter.             | D24        |
+| `Octoroom.Cloudflare.Packet`                     | Hand-rolled protobuf codec for the adapters' PCM `Packet`.              | D24        |
+| Adapter calls in `Octoroom.Cloudflare`           | `adapters/websocket/new` and `close`.                                   | D24        |
+| `config :octoroom, public_ws_url:`               | The public `wss://` URL Cloudflare dialed.                              | D24        |
+| The store's `:adapters` table                    | Adapter ids recorded so a later run could close them.                   | D24        |
+| The janitor's adapter sweep                      | Closed adapters whose room wasn't running.                              | D24        |
+| `plug`, `websock_adapter` dependencies           | For `Octoroom.Plug`.                                                    | D24        |
+| Telemetry `[:octoroom, :adapter, :create]`       | Became `[:octoroom, :peer, :connect]`.                                  | D24        |
+| A participant's `mic` field in the room server   | `:none \| :publishing \| :pending \| :live`, one track per participant. | D31        |
+| The room server as the supervisor's first child  | The process order of milestone 3.                                       | D20        |
+| `Octoroom.Agent.Backend.Cascaded`, `.GeminiLive` | Config structs an agent's `backend/1` returned, turned into pipelines.  | D46        |
+| `Spec.cascaded/2`, `Spec.cascaded_split/2`       | Built pipelines from a `Backend.Cascaded`.                              | D46        |
 
 ## Decisions
 
@@ -881,7 +884,7 @@ call assistant.
 
 **Decision.** `Octoroom.Agent.Worker` holds one pipeline core per input
 (`vad -> stt -> turns`) and one back end (`context` onwards), from
-`Spec.cascaded_split/2`. Inputs come and go without a restart. Finished
+`Spec.default/1` (`Spec.cascaded_split/2` until [D46](#d46-an-agent-says-what-it-runs-as-a-pipeline)). Inputs come and go without a restart. Finished
 turns go to the back end as `Transcription`s with `speaker` (from `join/2`
 metadata) and `respond`. `Context` labels them `[speaker]` and keeps
 `respond: false` turns in the history without replying. `respond:` is
@@ -928,7 +931,7 @@ assistant just answered turning to the team) gets no reply. Waiting counts
 as replying there, since the speaker was just talking to the assistant,
 and a follow-up with no decision still replies.
 
-Half-cascaded (`backend: %{stt: false}`) runs `vad -> AudioTurns` (Smart
+Half-cascaded (`Spec.default(stt: false)`) runs `vad -> AudioTurns` (Smart
 Turn) per speaker and puts a `Transcriber` in front of the back end's
 context. Audio turns reach the LLM after a `[speaker]` text part; the
 transcript replaces the audio in the history when it arrives.
@@ -1165,6 +1168,48 @@ and OpenAI send it with each request, but AssemblyAI fixes it for a session,
 so it would reconnect. Neither STT provider here takes anything that could
 change mid-stream. Stages don't declare which options they take, so a
 script naming one that can't change only fails when it gets there.
+
+#### D46. An agent says what it runs as a pipeline
+
+**Status:** Current.
+
+**Context.** An agent's providers went through three layers: `backend/1`
+returned a map, `Backend.Cascaded.new/1` normalized it into a struct
+(string keys from Subvocal's JSON config, aliases, per-provider defaults),
+and `Spec.cascaded_split/2` turned the struct into two pipeline specs.
+`pipeline/1` already let an agent return the specs itself, and the worker
+then skipped the first two layers, along with what they derived: the
+booking agent's VAD silence was taken as 0.
+
+**Decision.** `pipeline/1` is the one way, and the one callback an agent
+must have: it returns `{front_end | nil, back_end}`. `Spec.default/1`
+builds the usual pair and passes `:vad`, `:stt`, `:llm` and `:tts` to their
+stages as they are (`stt: false` for half-cascaded); `Spec.gemini_live/1`
+returns a mixed pipeline. `backend/1` and both `Backend` structs are gone.
+
+Nothing picks a provider or a model. `Spec.default/1` raises without
+`:stt`, `:llm` and `:tts`, each naming both, and the stages themselves
+(`STT`, `TTS`, `LLM`, `Decisions`, `Transcriber`, `GeminiLive`) fail to
+start with `{:no_provider, _}` or `{:no_model, _}`. The built-in speech
+providers still fill in a voice and a sample rate. An agent with no
+pipeline stops with `:no_pipeline`.
+
+**Why no defaults.** A default provider is a key the app needs without
+having asked for it, and a default model is a choice that changes cost,
+latency and behavior and shows nowhere in the app's code:
+`llm: [provider: :openrouter]` used to mean one particular NVIDIA model.
+
+The worker reads what it needs from the specs, whoever built them: the
+VAD stage's `min_silence_ms`, and that a `:tts` stage speaks 24 kHz and an
+`:stt` stage hears 16 kHz. It still edits them for two of its own args:
+`voice: false` drops the `:tts` stage, and `gate: :decision` adds a
+`:decisions` stage to a front end that has none, with the questions it
+worked out; `decisions:` must name the model.
+
+**Why keep a builder at all.** The stages have rules a first agent
+shouldn't need to know: a front end's turn stage mustn't interrupt (the
+agent decides who may), and it needs to know whether a VAD is in front of
+it.
 
 ## Evidence
 

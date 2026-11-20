@@ -8,7 +8,7 @@ defmodule Octoroom.Agent.TTS do
           sample_rate: 24_000
         )
 
-      {:ok, pcm} = Octoroom.Agent.TTS.synthesize(:inworld, "Hello!")
+      {:ok, pcm} = Octoroom.Agent.TTS.synthesize(:inworld, "Hello!", model: "inworld-tts-2")
 
   Audio is 16-bit little-endian mono PCM at `:sample_rate`, with no
   container header.
@@ -20,7 +20,7 @@ defmodule Octoroom.Agent.TTS do
   provider takes:
 
     * `:api_key` - defaults to the provider's environment variable
-    * `:model`
+    * `:model` - needed: no provider picks one for you
     * `:voice`
     * `:sample_rate` - of the audio returned
 
@@ -51,7 +51,7 @@ defmodule Octoroom.Agent.TTS do
   @callback synthesize(text :: String.t(), opts :: keyword()) ::
               {:ok, binary()} | {:error, term()}
 
-  @doc "Options used when the caller doesn't give them, such as `:model` and `:voice`."
+  @doc "Options used when the caller doesn't give them, such as `:voice`."
   @callback default_options() :: keyword()
 
   @doc """
@@ -77,14 +77,6 @@ defmodule Octoroom.Agent.TTS do
   the provider's defaults filled in.
   """
   def resolve(opts), do: SpeechProvider.resolve(opts, __MODULE__, providers())
-
-  @doc "The defaults of the provider that `opts` names, or `[]`."
-  def default_options(opts) do
-    case resolve(opts) do
-      {:ok, _module, opts} -> opts
-      {:error, _reason} -> []
-    end
-  end
 
   @doc "`connect/1` of `module`, or `opts` unchanged when it has none."
   def connect(module, opts) do
