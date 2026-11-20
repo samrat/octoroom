@@ -128,7 +128,10 @@ defmodule Octoroom.Agent.TTS.AssemblyAI.SocketTest do
   end
 
   test "the connect query" do
-    assert {:ok, query} = AssemblyAI.query(AssemblyAI.default_options() ++ [language: "english"])
+    assert {:ok, query} =
+             AssemblyAI.query(
+               AssemblyAI.default_options() ++ [model: "assemblyai-tts-1", language: "english"]
+             )
 
     assert query == %{
              voice_id: "aai-kyla",

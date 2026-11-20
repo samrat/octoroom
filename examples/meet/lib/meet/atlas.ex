@@ -23,8 +23,18 @@ defmodule Meet.Atlas do
   # Gemini. It speaks with AssemblyAI's Titus voice, so it doesn't sound like
   # Assistant.
   @impl true
-  def backend(_ctx),
-    do: %{llm: %{provider: :openrouter}, tts: %{provider: :assembly_ai, voice: "aai-titus"}}
+  def pipeline(_ctx) do
+    Octoroom.Agent.Pipeline.Spec.default(
+      stt: "soniox:stt-rt-v6",
+      llm: [
+        provider: :openrouter,
+        model: "nvidia/nemotron-3.5-lightning",
+        reasoning_effort: :none,
+        provider_options: [openrouter_provider: %{sort: "latency"}]
+      ],
+      tts: [provider: :assembly_ai, model: "assemblyai-tts-1", voice: "aai-titus"]
+    )
+  end
 
   @impl true
   def questions(ctx) do

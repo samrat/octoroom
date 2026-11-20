@@ -8,9 +8,8 @@ defmodule Octoroom.Agent.Processors.STT do
   finalize what it has heard now. A failed session is replaced after a
   backoff.
 
-  Options are `Octoroom.Agent.STT`'s: `:provider` (default `:soniox`),
-  `:model`, `:api_key`, `:sample_rate` and the provider's own, as in
-  `Octoroom.Agent.Backend.Cascaded`'s `speech_to_text`. The session starts
+  Options are `Octoroom.Agent.STT`'s: `:provider` and `:model` (both needed),
+  `:model`, `:api_key`, `:sample_rate` and the provider's own. The session starts
   only under a host (`ctx.runner`); in `Octoroom.Agent.Pipeline.Test`, feed
   provider events with `Test.info/3` (for example `{:stt, {:final, "Hi"}}`).
   """
@@ -29,7 +28,7 @@ defmodule Octoroom.Agent.Processors.STT do
 
   @impl true
   def init(opts, ctx) do
-    with {:ok, module, provider_opts} <- STT.resolve(Keyword.put_new(opts, :provider, :soniox)) do
+    with {:ok, module, provider_opts} <- STT.resolve(opts) do
       sample_rate = Keyword.fetch!(provider_opts, :sample_rate)
 
       state = %{

@@ -24,6 +24,6 @@ defmodule Meet.Gemini do
   end
 
   @impl true
-  def backend(_ctx),
-    do: %Octoroom.Agent.Backend.GeminiLive{model: "gemini-3.8-live", voice: "Puck"}
+  def pipeline(_ctx),
+    do: Octoroom.Agent.Pipeline.Spec.gemini_live(model: "gemini-3.8-live", voice: "Puck")
 end

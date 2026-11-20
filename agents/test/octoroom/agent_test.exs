@@ -81,5 +81,8 @@ defmodule Octoroom.AgentTest do
 
   defmodule Bare do
     use Octoroom.Agent
+
+    @impl true
+    def pipeline(_ctx), do: Octoroom.Agent.Pipeline.Spec.gemini_live(model: "gemini-live-x")
   end
 end

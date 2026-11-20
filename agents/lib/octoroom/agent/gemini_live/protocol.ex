@@ -6,24 +6,22 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
   Copied from Subvocal, with session resumption and `audioStreamEnd` added.
   """
 
-  @default_model "models/gemini-3.1-flash-live-preview"
   @default_voice "Zephyr"
   @send_sample_rate 16_000
 
-  def default_model, do: @default_model
   def default_voice, do: @default_voice
   def send_sample_rate, do: @send_sample_rate
 
   @doc """
-  The setup frame, the first thing sent on a connection. Options: `:model`,
-  `:voice`, `:response_modalities`, `:system_instruction`, `:tools` (Gemini
+  The setup frame, the first thing sent on a connection. Options: `:model`
+  (needed), `:voice`, `:response_modalities`, `:system_instruction`, `:tools` (Gemini
   declarations) and `:resumption_handle` (from a `{:resumption, handle}`
   event, to carry on the same session on a new connection).
   """
-  def setup_frame(opts \\ []) do
+  def setup_frame(opts) do
     setup =
       %{
-        model: model_name(Keyword.get(opts, :model)),
+        model: model_name(Keyword.fetch!(opts, :model)),
         inputAudioTranscription: %{},
         outputAudioTranscription: %{},
         generationConfig: %{
@@ -75,7 +73,6 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
   The model as the API names it, `"models/..."`. Takes a bare name or a
   `gemini:` or `google:` prefix; nil is the default.
   """
-  def model_name(nil), do: @default_model
   def model_name("models/" <> _ = model), do: model
   def model_name("gemini:" <> model), do: model_name(model)
   def model_name("google:" <> model), do: model_name(model)

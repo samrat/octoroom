@@ -5,7 +5,7 @@ defmodule Octoroom.Agent.WorkerTest do
 
   import Octoroom.Agent.Pipeline.Spec
 
-  alias Octoroom.Agent.{Backend, Frames, Processors}
+  alias Octoroom.Agent.{Frames, Processors}
   alias Octoroom.Room.Server
   alias Octoroom.Test.{Client, FakeCloudflare, FakePeerMedia}
 
@@ -15,6 +15,12 @@ defmodule Octoroom.Agent.WorkerTest do
   # Stands in for `Processors.STT`: remembers the source of the audio it
   # hears, and turns `{:fake_stt, source, ...}` messages for that source into
   # what the real stage pushes.
+  # Stands where the decision stage would: the fake STT's turns already
+  # carry their decisions, so no model is asked.
+  defmodule NoDecisions do
+    use Octoroom.Agent.Processor
+  end
+
   defmodule FakeSTT do
     use Octoroom.Agent.Processor
 
@@ -132,6 +138,13 @@ defmodule Octoroom.Agent.WorkerTest do
     def subscriptions(_listener, _room), do: [track("assistant")]
   end
 
+  # Named, as `default/1` wants, and then replaced by fakes.
+  @providers [
+    stt: "soniox:stt-rt-v6",
+    llm: [provider: :google, model: "gemini-3.5-flash"],
+    tts: "inworld:inworld-tts-2"
+  ]
+
   setup do
     {:ok, fake} = FakeCloudflare.start_link(self())
 
@@ -164,8 +177,7 @@ defmodule Octoroom.Agent.WorkerTest do
       :ok
     end
 
-    {front, back} =
-      cascaded_split(Backend.Cascaded.new(%{vad: false}))
+    {front, back} = default([vad: false] ++ @providers)
 
     # Half-cascaded back ends transcribe each audio turn in the background.
     {transcribe, extra} = Map.pop(extra, :transcribe)
@@ -184,7 +196,10 @@ defmodule Octoroom.Agent.WorkerTest do
       %{
         name: "Assistant",
         instructions: "Be brief.",
-        front_end: replace(front, :stt, processor(:stt, FakeSTT, test: test)),
+        front_end:
+          front
+          |> replace(:stt, processor(:stt, FakeSTT, test: test))
+          |> processor(:decisions, NoDecisions),
         back_end:
           back
           |> replace(:llm, processor(:llm, Processors.LLM, request: llm))
@@ -274,7 +289,8 @@ defmodule Octoroom.Agent.WorkerTest do
 
   test "a restarted agent carries on the conversation, and apps can read it", ctx do
     %{alice: alice} = start(ctx, 50, %{initial_text: "Greet everyone."})
-    assert_receive {:llm, ["Be brief.", "Greet everyone."]}
+    # The greeting starts 100 ms after the agent does.
+    assert_receive {:llm, ["Be brief.", "Greet everyone."]}, 1_000
 
     assert_receive {:octoroom, _,
                     {:worker_event, "assistant",
@@ -926,7 +942,12 @@ defmodule Octoroom.Agent.WorkerTest do
     # would send comes here as `{:to_gemini, message}`, and `live/2` plays
     # the model's events.
     defp live_args(test) do
-      back = processor(:gemini, Processors.GeminiLive, send: &send(test, {:to_gemini, &1}))
+      back =
+        processor(:gemini, Processors.GeminiLive,
+          model: "gemini-live-x",
+          send: &send(test, {:to_gemini, &1})
+        )
+
       %{name: "Assistant", front_end: nil, back_end: back}
     end
 
@@ -1077,18 +1098,16 @@ defmodule Octoroom.Agent.WorkerTest do
       assert connect[:fallback_setup][:system_instruction] =~ "[someone] I'm Alice."
     end
 
-    test "a module picks it as its backend" do
+    test "a module picks it as its pipeline, and it can't be silent" do
       defmodule LiveAgent do
         use Octoroom.Agent
 
         @impl true
-        def backend(_ctx), do: %{gemini_live: %{voice: "Puck", model: "gemini-live-x"}}
+        def pipeline(_ctx),
+          do: Octoroom.Agent.Pipeline.Spec.gemini_live(voice: "Puck", model: "gemini-live-x")
       end
 
-      assert %Backend.GeminiLive{voice: "Puck", model: "models/gemini-live-x"} =
-               Backend.GeminiLive.from(LiveAgent.backend(%{}))
-
-      assert {:stop, :voice_false_needs_a_cascaded_backend} =
+      assert {:stop, :voice_false_needs_text_to_speech} =
                Octoroom.Agent.Worker.init(
                  %{agent: LiveAgent, args: %{}, voice: false},
                  %Octoroom.Worker.Context{room_id: "r", id: "a", inputs: [], outputs: []}
@@ -1096,12 +1115,70 @@ defmodule Octoroom.Agent.WorkerTest do
     end
   end
 
-  test "a backend that can't speak at 24 kHz doesn't start", ctx do
+  test "a pipeline that can't speak at 24 kHz or hear 16 kHz doesn't start", ctx do
+    worker_ctx = %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
+    tts = [provider: :inworld, model: "inworld-tts-2", output_sample_rate: 16_000]
+    {front, back} = default(Keyword.put(@providers, :tts, tts))
+
     assert {:stop, {:unsupported_output_sample_rate, 16_000}} =
+             Octoroom.Agent.Worker.init(%{front_end: front, back_end: back}, worker_ctx)
+
+    stt = [provider: :soniox, model: "stt-rt-v6", sample_rate: 8_000]
+    {front, back} = default(Keyword.put(@providers, :stt, stt))
+
+    assert {:stop, {:unsupported_input_sample_rate, 8_000}} =
+             Octoroom.Agent.Worker.init(%{front_end: front, back_end: back}, worker_ctx)
+  end
+
+  test "the decision gate adds a decision stage to a front end without one", ctx do
+    worker_ctx = %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
+    args = args(self(), 200)
+    bare = remove(args.front_end, :decisions)
+
+    front_spec = fn args ->
+      assert {:ok, state, _actions} = Octoroom.Agent.Worker.init(args, worker_ctx)
+      state.front_spec
+    end
+
+    assert names(front_spec.(%{args | front_end: bare})) == [:stt, :turns]
+
+    gate = %{front_end: bare, gate: :decision}
+    gated = front_spec.(Map.merge(args, Map.put(gate, :decisions, model: "google:some-model")))
+    assert names(gated) == [:stt, :turns, :decisions]
+    assert List.last(gated.stages).module == Processors.Decisions
+    assert Keyword.fetch!(opts(gated, :decisions), :model) == "google:some-model"
+
+    # It picks no model.
+    assert {:stop, :decisions_need_a_model} =
+             Octoroom.Agent.Worker.init(Map.merge(args, gate), worker_ctx)
+
+    # One of its own is left alone.
+    kept = front_spec.(Map.put(args, :gate, :decision))
+    assert List.last(kept.stages).module == NoDecisions
+  end
+
+  test "an agent with no pipeline doesn't start", ctx do
+    assert {:stop, :no_pipeline} =
              Octoroom.Agent.Worker.init(
-               %{backend: %{tts: %{output_sample_rate: 16_000}}},
+               %{instructions: "Be brief."},
                %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
              )
+  end
+
+  test "a module's pipeline/1 must return both parts" do
+    defmodule NoPipeline do
+      use Octoroom.Agent
+
+      @impl true
+      def pipeline(_ctx), do: nil
+    end
+
+    assert_raise ArgumentError, ~r/pipeline\/1 must return/, fn ->
+      Octoroom.Agent.Worker.init(
+        %{agent: NoPipeline, args: %{}},
+        %Octoroom.Worker.Context{room_id: "r", id: "a", inputs: [], outputs: []}
+      )
+    end
   end
 
   defp wait_until(fun, tries \\ 100) do

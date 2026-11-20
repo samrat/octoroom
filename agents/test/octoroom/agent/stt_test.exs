@@ -1,7 +1,6 @@
 defmodule Octoroom.Agent.STTTest do
   use ExUnit.Case, async: true
 
-  alias Octoroom.Agent.Backend.Cascaded
   alias Octoroom.Agent.STT
 
   # An unregistered provider that echoes audio back as finals, without
@@ -64,11 +63,12 @@ defmodule Octoroom.Agent.STTTest do
 
     assert {:error, {:unknown_provider, STT, "deepgram"}} = STT.start_link("deepgram")
     assert {:error, {:no_provider, STT}} = STT.resolve(model: "stt-rt-v4")
+    assert {:error, {:no_model, STT.Soniox}} = STT.start_link(:soniox)
   end
 
   test "a missing API key fails before connecting" do
     if System.get_env("SONIOX_API_KEY") == nil do
-      assert {:error, {:missing_env, "SONIOX_API_KEY"}} = STT.start_link(:soniox)
+      assert {:error, {:missing_env, "SONIOX_API_KEY"}} = STT.start_link("soniox:stt-rt-v6")
     end
   end
 
@@ -76,21 +76,5 @@ defmodule Octoroom.Agent.STTTest do
     assert STT.error_message(%{code: 408, message: "Request timeout."}) == "Request timeout."
     assert STT.error_message(%{code: 408, message: nil}) == "STT error 408"
     assert STT.error_message(:closed) == "STT error"
-  end
-
-  test "the cascaded backend takes provider:model strings and the providers' defaults" do
-    backend = Cascaded.new(%{stt: "soniox:stt-rt-v4", tts: "inworld:inworld-tts-1.5-max"})
-
-    assert %{provider: :soniox, model: "stt-rt-v4", sample_rate: 16_000} = backend.speech_to_text
-
-    assert %{provider: :inworld, model: "inworld-tts-1.5-max", voice: "Ashley"} =
-             backend.text_to_speech
-
-    # The provider's sample rate is the agent's output rate.
-    assert backend.text_to_speech.output_sample_rate == 24_000
-    refute Map.has_key?(backend.text_to_speech, :sample_rate)
-
-    backend = Cascaded.new(%{"tts" => %{"provider" => "inworld", "voice" => "Dennis"}})
-    assert %{provider: :inworld, voice: "Dennis"} = backend.text_to_speech
   end
 end

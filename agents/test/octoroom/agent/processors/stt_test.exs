@@ -5,7 +5,7 @@ defmodule Octoroom.Agent.Processors.STTTest do
 
   # A stage that had a socket, with this test process as its host.
   defp stage(socket) do
-    {:ok, state} = STT.init([provider: :soniox], %{})
+    {:ok, state} = STT.init([provider: :soniox, model: "stt-rt-v6"], %{})
     %{state | socket: socket, connected?: true, runner: self()}
   end
 

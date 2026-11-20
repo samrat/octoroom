@@ -17,17 +17,16 @@ defmodule Octoroom.Agent.STT.Reson8Test do
 
   defp confirmation(id), do: {:text, Jason.encode!(%{"type" => "flush_confirmation", "id" => id})}
 
-  test "is registered, with rumble-2 by default" do
-    assert {:ok, Reson8, opts} = STT.resolve(provider: :reson8)
-    assert opts[:model] == "rumble-2" and opts[:sample_rate] == 16_000
+  test "is registered, and picks no model" do
+    assert {:error, {:no_model, Reson8}} = STT.resolve(provider: :reson8)
 
     assert {:ok, Reson8, opts} = STT.resolve(model: "reson8:resonant-1")
-    assert opts[:model] == "resonant-1"
+    assert opts[:model] == "resonant-1" and opts[:sample_rate] == 16_000
   end
 
   test "needs RESON8_API_KEY" do
     if System.get_env("RESON8_API_KEY") == nil do
-      assert {:error, {:missing_env, "RESON8_API_KEY"}} = STT.start_link(:reson8)
+      assert {:error, {:missing_env, "RESON8_API_KEY"}} = STT.start_link("reson8:rumble-2")
     end
   end
 

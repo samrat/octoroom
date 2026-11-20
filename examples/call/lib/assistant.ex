@@ -7,6 +7,7 @@ defmodule Call.Assistant do
 
   use Octoroom.Agent
 
+  alias Octoroom.Agent.Pipeline.Spec
   alias Octoroom.Agent.Tool
 
   @impl true
@@ -19,10 +20,19 @@ defmodule Call.Assistant do
     """
   end
 
+  @llm_and_tts [
+    llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+    tts: "inworld:inworld-tts-2"
+  ]
+
   @impl true
-  def backend(%{args: %{pipeline: :half}}), do: %{stt: false}
-  def backend(%{args: %{pipeline: :live}}), do: %Octoroom.Agent.Backend.GeminiLive{}
-  def backend(_ctx), do: %{}
+  def pipeline(%{args: %{pipeline: :live}}),
+    do: Spec.gemini_live(model: "gemini-3.1-flash-live-preview")
+
+  def pipeline(%{args: %{pipeline: :half}}),
+    do: Spec.default([stt: false, transcriber: [model: "gemini-3.1-flash-lite"]] ++ @llm_and_tts)
+
+  def pipeline(_ctx), do: Spec.default([stt: "soniox:stt-rt-v6"] ++ @llm_and_tts)
 
   @impl true
   def tools(_ctx) do

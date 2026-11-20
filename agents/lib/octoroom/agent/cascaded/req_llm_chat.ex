@@ -28,7 +28,7 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
 
     with {:ok, response} <-
            ReqLLM.generate_text(
-             %{provider: Keyword.get(opts, :provider, :google), id: model},
+             %{provider: Keyword.fetch!(opts, :provider), id: model},
              input,
              request_opts
            ) do
@@ -67,7 +67,7 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
 
     with {:ok, stream_response} <-
            stream_fun.(
-             %{provider: Keyword.get(opts, :provider, :google), id: model},
+             %{provider: Keyword.fetch!(opts, :provider), id: model},
              input,
              request_opts
            ),

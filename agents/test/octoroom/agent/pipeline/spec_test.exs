@@ -53,30 +53,73 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
              Spec.validate(processor(:a, A) |> processor(:x, String))
   end
 
-  test "cascaded builds the default chain" do
-    spec = cascaded(Octoroom.Agent.Backend.Cascaded.new())
+  @stt "soniox:stt-rt-v6"
+  @llm [provider: :google, model: "gemini-3.5-flash"]
+  @tts [provider: :assembly_ai, model: "assemblyai-tts-1", voice: "aai-titus"]
 
-    assert names(spec) == [:vad, :stt, :turns, :context, :llm, :tools, :chunker, :tts, :collector]
-    assert {:ok, _spec} = Spec.validate(spec)
+  test "default builds a front end and a back end, each stage with its options" do
+    {front, back} = default(stt: @stt, llm: @llm, tts: @tts)
+    assert names(front) == [:vad, :stt, :turns]
+    assert names(back) == [:context, :llm, :tools, :chunker, :tts, :collector]
+    assert {:ok, _} = Spec.validate(front)
+    assert {:ok, _} = Spec.validate(back)
+
+    assert opts(front, :stt) == [model: "soniox:stt-rt-v6"]
+    assert opts(front, :turns) == [vad: true, interrupt: false]
+    assert opts(back, :llm) == @llm
+    assert opts(back, :tts) == @tts
+    assert opts(front, :nope) == nil
+
+    {front, _back} = default(vad: false, stt: @stt, llm: @llm, tts: "inworld:inworld-tts-2")
+    assert names(front) == [:stt, :turns]
+    assert opts(front, :turns) == [vad: false, interrupt: false]
   end
 
-  test "cascaded refuses stages that aren't copied yet" do
-    assert_raise ArgumentError, fn ->
-      cascaded(Octoroom.Agent.Backend.Cascaded.new(%{turn_detection: :smart_turn}))
+  test "default picks no provider and no model" do
+    assert_raise ArgumentError, ~r/stt: is needed/, fn -> default(llm: @llm, tts: @tts) end
+    assert_raise ArgumentError, ~r/tts: is needed/, fn -> default(stt: @stt, llm: @llm) end
+    assert_raise KeyError, fn -> default(stt: @stt, tts: @tts) end
+
+    for stt <- ["soniox", :soniox, [provider: :soniox], "nobody:x"] do
+      assert_raise ArgumentError, ~r/stt: needs a provider and a model/, fn ->
+        default(stt: stt, llm: @llm, tts: @tts)
+      end
+    end
+
+    assert_raise ArgumentError, ~r/tts: needs a provider and a model/, fn ->
+      default(stt: @stt, llm: @llm, tts: [provider: :inworld, voice: "Ashley"])
+    end
+
+    for llm <- [[], [provider: :google], [model: "gemini-3.5-flash"]] do
+      assert_raise ArgumentError, ~r/llm: needs a :provider and a :model/, fn ->
+        default(stt: @stt, llm: llm, tts: @tts)
+      end
+    end
+
+    assert_raise ArgumentError, fn -> default(stt: @stt, llm: @llm, tts: @tts, backend: %{}) end
+  end
+
+  test "default without speech-to-text records turns and transcribes them later" do
+    half = [stt: false, llm: @llm, tts: @tts, transcriber: [model: "gemini-3.1-flash-lite"]]
+    {front, back} = default(half ++ [vad: [min_speech_ms: 150]])
+
+    assert names(front) == [:vad, :turns]
+    assert List.last(front.stages).module == Octoroom.Agent.Processors.AudioTurns
+    assert opts(front, :turns) == [interrupt: false, min_speech_ms: 150]
+    assert names(back) == [:transcriber, :context, :llm, :tools, :chunker, :tts, :collector]
+    assert opts(back, :transcriber) == [model: "gemini-3.1-flash-lite"]
+
+    assert_raise ArgumentError, ~r/needs the VAD/, fn -> default(half ++ [vad: false]) end
+
+    assert_raise ArgumentError, ~r/transcriber/, fn ->
+      default(stt: false, llm: @llm, tts: @tts)
     end
   end
 
-  test "cascaded_split builds both pipelines, with an optional decision stage" do
-    {front, back} = cascaded_split(Octoroom.Agent.Backend.Cascaded.new())
-    assert names(front) == [:vad, :stt, :turns]
-    assert names(back) == [:context, :llm, :tools, :chunker, :tts, :collector]
-
-    {front, back} =
-      cascaded_split(Octoroom.Agent.Backend.Cascaded.new(%{stt: false}), decisions: [])
-
-    assert names(front) == [:vad, :turns, :decisions]
-    assert hd(front.stages |> tl()).module == Octoroom.Agent.Processors.AudioTurns
-    assert names(back) == [:transcriber, :context, :llm, :tools, :chunker, :tts, :collector]
-    assert {:ok, _} = Spec.validate(front)
+  test "gemini_live has no front end, and needs a model" do
+    assert {nil, back} = gemini_live(model: "gemini-live-x", voice: "Puck")
+    assert names(back) == [:gemini]
+    assert opts(back, :gemini) == [model: "gemini-live-x", voice: "Puck"]
+    assert_raise ArgumentError, fn -> gemini_live(voice: "Puck") end
   end
 end

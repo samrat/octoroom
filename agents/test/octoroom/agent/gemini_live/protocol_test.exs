@@ -6,14 +6,15 @@ defmodule Octoroom.Agent.GeminiLive.ProtocolTest do
   test "the setup frame carries the voice, instructions, tools and a resumption handle" do
     %{setup: setup} =
       Protocol.setup_frame(
+        model: "gemini-3.8-live",
         voice: "Puck",
         system_instruction: "Be brief.",
         tools: [%{functionDeclarations: []}],
         resumption_handle: "h1"
       )
 
-    assert setup.model == Protocol.default_model()
-    assert Protocol.setup_frame(model: "gemini-3.8-live").setup.model == "models/gemini-3.8-live"
+    assert setup.model == "models/gemini-3.8-live"
+    assert_raise KeyError, fn -> Protocol.setup_frame(voice: "Puck") end
 
     assert setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName ==
              "Puck"
@@ -23,8 +24,8 @@ defmodule Octoroom.Agent.GeminiLive.ProtocolTest do
     assert setup.sessionResumption == %{handle: "h1"}
 
     # A first connection asks for handles without one.
-    assert Protocol.setup_frame().setup.sessionResumption == %{}
-    refute Map.has_key?(Protocol.setup_frame().setup, :systemInstruction)
+    assert Protocol.setup_frame(model: "gemini-3.8-live").setup.sessionResumption == %{}
+    refute Map.has_key?(Protocol.setup_frame(model: "gemini-3.8-live").setup, :systemInstruction)
   end
 
   test "audio goes up base64 at 16 kHz" do

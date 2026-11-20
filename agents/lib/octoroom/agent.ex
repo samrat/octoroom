@@ -14,6 +14,15 @@ defmodule Octoroom.Agent do
 
         @impl true
         def tools(_ctx), do: [MyApp.Sheets.add_row(), MyApp.Sheets.update_cell()]
+
+        @impl true
+        def pipeline(_ctx) do
+          Octoroom.Agent.Pipeline.Spec.default(
+            stt: "soniox:stt-rt-v6",
+            llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+            tts: "inworld:inworld-tts-2"
+          )
+        end
       end
 
       defmodule MyApp.TeamRoom do
@@ -35,11 +44,13 @@ defmodule Octoroom.Agent do
   Every callback gets `ctx`: `room_id`, `agent_id`, `name`, `participants`
   (when the agent started), `resumed` (see `Octoroom.Worker.Context`),
   `args` (from `agent/3`) and `roster` (the agents in the room, see
-  `agents/2`). All callbacks are optional.
+  `agents/2`). Only `pipeline/1` is needed: it names the providers and
+  models, and nothing picks them for you.
 
   ## Deciding to answer
 
-  With `gate: :decision`, each turn's audio goes to a decision model with
+  With `gate: :decision` and `decisions: [model: "google:gemini-decision-1"]`,
+  each turn's audio goes to that decision model with
   `questions/1`, and `decide/2` reads the answers. The defaults ask who the
   speaker is talking to (each agent by name, a person, the group, nobody)
   and whether the agent could answer, and reply, wait or listen by the
@@ -101,19 +112,6 @@ defmodule Octoroom.Agent do
   @callback tools(ctx) :: [%Octoroom.Agent.Tool{}]
 
   @doc """
-  The providers: an `Octoroom.Agent.Backend.Cascaded` struct, or a map for
-  `Octoroom.Agent.Backend.Cascaded.new/1`. Default `%{}`: Soniox, Gemini
-  through ReqLLM, Inworld.
-
-  Or an `Octoroom.Agent.Backend.GeminiLive` struct (or
-  `%{gemini_live: opts}`): one speech-to-speech model that hears everyone
-  mixed and takes its own turns, so `respond:` and `gate:` don't apply (see
-  "Gemini Live" in `Octoroom.Agent.Worker`).
-  """
-  @callback backend(ctx) ::
-              %Octoroom.Agent.Backend.Cascaded{} | %Octoroom.Agent.Backend.GeminiLive{} | map
-
-  @doc """
   Something to answer as soon as the agent starts, as if a person had said
   it ("Greet the visitor"). Not used when the agent restarts during a room's
   recovery (`ctx.resumed`) or carries on a saved conversation, so it
@@ -122,12 +120,18 @@ defmodule Octoroom.Agent do
   @callback initial_text(ctx) :: String.t() | nil
 
   @doc """
-  `{front_end, back_end}` pipeline specs to run instead of the backend's
-  (see `Octoroom.Agent.Pipeline.Spec.cascaded_split/2`), for custom stages
-  or fake providers in tests. A `nil` front end makes the back end hear
-  the inputs mixed, as with `Spec.gemini_live/1`. `nil` uses the backend's.
+  What the agent runs: `{front_end, back_end}` pipeline specs. The one
+  callback every agent needs: nothing picks providers or models for it.
+  `Octoroom.Agent.Pipeline.Spec.default/1` builds the usual stages from the
+  ones you name; edit what it returns, or build both from stages of your own.
+
+  Each input runs its own front end, and their turns go into the one back
+  end. A `nil` front end makes the back end hear the inputs mixed, as
+  `Spec.gemini_live/1` does: one speech-to-speech model that takes its own
+  turns, so `respond:` and `gate:` don't apply (see "Gemini Live" in
+  `Octoroom.Agent.Worker`).
   """
-  @callback pipeline(ctx) :: {Spec.t() | nil, Spec.t()} | nil
+  @callback pipeline(ctx) :: {Spec.t() | nil, Spec.t()}
 
   @doc """
   The questions for the decision model, as for `ReqLLM.evaluate/4` (with
@@ -159,13 +163,7 @@ defmodule Octoroom.Agent do
       def tools(_ctx), do: []
 
       @impl Octoroom.Agent
-      def backend(_ctx), do: %{}
-
-      @impl Octoroom.Agent
       def initial_text(_ctx), do: nil
-
-      @impl Octoroom.Agent
-      def pipeline(_ctx), do: nil
 
       @impl Octoroom.Agent
       def questions(ctx), do: Octoroom.Agent.default_questions(ctx)
@@ -175,9 +173,7 @@ defmodule Octoroom.Agent do
 
       defoverridable instructions: 1,
                      tools: 1,
-                     backend: 1,
                      initial_text: 1,
-                     pipeline: 1,
                      questions: 1,
                      decide: 2
     end

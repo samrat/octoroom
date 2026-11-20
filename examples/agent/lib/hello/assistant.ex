@@ -6,6 +6,8 @@ defmodule Hello.Assistant do
   """
   use Octoroom.Agent
 
+  alias Octoroom.Agent.Pipeline.Spec
+
   @impl true
   def instructions(_ctx) do
     """
@@ -18,5 +20,17 @@ defmodule Hello.Assistant do
   def initial_text(_ctx), do: "Greet me in one short sentence."
 
   @impl true
-  def backend(_ctx), do: %{stt: "soniox", llm: %{provider: :openrouter}, tts: "assembly_ai"}
+  def pipeline(_ctx) do
+    Spec.default(
+      stt: "soniox:stt-rt-v6",
+      # Reasoning is off for voice, and OpenRouter picks its quickest host.
+      llm: [
+        provider: :openrouter,
+        model: "nvidia/nemotron-3.5-lightning",
+        reasoning_effort: :none,
+        provider_options: [openrouter_provider: %{sort: "latency"}]
+      ],
+      tts: "assembly_ai:assemblyai-tts-1"
+    )
+  end
 end

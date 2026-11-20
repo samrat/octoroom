@@ -8,8 +8,8 @@ defmodule Hello.Booking do
   editor where someone who doesn't write Elixir builds their own: the
   processor runs any script of this shape. This one is `script/0`.
 
-  `pipeline/1` builds the agent's pipeline from scratch instead of from a
-  backend:
+  `pipeline/1` builds the agent's pipeline from stages instead of with
+  `Spec.default/1`:
 
       front (one per speaker): vad -> stt -> turns -> decisions
       back:                    script -> context -> chunker -> tts -> collector
@@ -33,7 +33,7 @@ defmodule Hello.Booking do
 
     front =
       processor(:vad, Processors.VAD)
-      |> processor(:stt, Processors.STT, provider: :soniox)
+      |> processor(:stt, Processors.STT, provider: :soniox, model: "stt-rt-v6")
       |> processor(:turns, Processors.STTTurns, interrupt: false)
       |> processor(:decisions, Processors.Decisions,
         model: "openrouter:cloudflare/clef-flash",
@@ -45,7 +45,7 @@ defmodule Hello.Booking do
       processor(:script, Script, script: script, start: @start)
       |> processor(:context, Processors.Context)
       |> processor(:chunker, Processors.TextChunker)
-      |> processor(:tts, Processors.TTS, provider: :assembly_ai)
+      |> processor(:tts, Processors.TTS, provider: :assembly_ai, model: "assemblyai-tts-1")
       |> processor(:collector, Processors.AssistantCollector)
 
     {front, back}

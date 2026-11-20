@@ -17,7 +17,7 @@ defmodule Octoroom.Agent.STT do
 
     * `:owner` - the process that gets the events (default: the caller)
     * `:api_key` - defaults to the provider's environment variable
-    * `:model`
+    * `:model` - needed: no provider picks one for you
     * `:sample_rate` - of the audio sent: 16-bit little-endian mono PCM
     * `:language_hints`
 
@@ -75,7 +75,7 @@ defmodule Octoroom.Agent.STT do
   @doc "Flushes the audio sent, then ends the session."
   @callback close(pid()) :: :ok
 
-  @doc "Options used when the caller doesn't give them, such as `:model`."
+  @doc "Options used when the caller doesn't give them, such as `:sample_rate`."
   @callback default_options() :: keyword()
 
   @optional_callbacks finalize: 1, default_options: 0

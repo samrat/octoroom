@@ -8,8 +8,8 @@ defmodule Octoroom.Agent.Processors.TTS do
   and sent as one request, so the voice keeps its prosody across sentences.
   `LLMResponseEnd` and `End` wait until the queued audio is out.
 
-  Options are `Octoroom.Agent.TTS`'s: `:provider` (default `:inworld`),
-  `:model`, `:voice`, `:api_key` and the provider's own, with
+  Options are `Octoroom.Agent.TTS`'s: `:provider` and `:model` (both needed),
+  `:voice`, `:api_key` and the provider's own, with
   `:output_sample_rate` as the provider's `:sample_rate`. It connects the
   provider once (`Octoroom.Agent.TTS.connect/2`), for those that keep a
   connection. Also
@@ -48,7 +48,7 @@ defmodule Octoroom.Agent.Processors.TTS do
 
   defp synthesizer(nil, opts) do
     {rate, opts} = Keyword.pop(opts, :output_sample_rate)
-    opts = opts |> Keyword.put_new(:provider, :inworld) |> put_present(:sample_rate, rate)
+    opts = put_present(opts, :sample_rate, rate)
 
     with {:ok, module, opts} <- TTS.resolve(opts),
          {:ok, opts} <- TTS.connect(module, opts) do

@@ -22,7 +22,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
   `:input` picks what the model judges:
 
     * `:audio` - the turn's audio, which carries tone and pauses. Only
-      Gemini Decisions (`google:gemini-decision-1`, the default) takes
+      Gemini Decisions (`google:gemini-decision-1`) takes
       audio.
     * `:transcript` - the turn's final transcript, for text-only decision
       models such as `"openrouter:cloudflare/clef-flash"` (Cloudflare's
@@ -42,7 +42,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
   call, and the turn is evaluated again when it ends. Behind `AudioTurns`
   (half-cascaded), the turn's own `UserAudio` is evaluated when it arrives.
 
-  Options: `:model` (default `"google:gemini-decision-1"`), `:input` (see
+  Options: `:model` (needed, such as `"google:gemini-decision-1"`), `:input` (see
   above), `:api_key` (default ReqLLM's key for the model's provider, such
   as `GOOGLE_API_KEY` or `OPENROUTER_API_KEY`), `:request_options`,
   `:questions` (see `default_questions/0`), `:max_wait_ms` (1500),
@@ -123,6 +123,12 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   @impl true
   def init(opts, ctx) do
+    if is_binary(opts[:model]) or is_function(opts[:evaluate]),
+      do: start(opts, ctx),
+      else: {:error, {:no_model, __MODULE__}}
+  end
+
+  defp start(opts, ctx) do
     questions = Keyword.get(opts, :questions, @default_questions)
     input = Keyword.get_lazy(opts, :input, fn -> default_input(opts) end)
 
@@ -410,11 +416,11 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   # -- the API call
 
-  @default_model "google:gemini-decision-1"
-
+  # No model: an `:evaluate` function stands in for it, and hears audio.
   defp default_input(opts) do
-    case Keyword.get(opts, :model, @default_model) do
+    case Keyword.get(opts, :model) do
       "google:" <> _ -> :audio
+      nil -> :audio
       _other -> :transcript
     end
   end
@@ -423,7 +429,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
   defp warm_up(:transcript), do: "Hello."
 
   defp api_evaluate(input, questions, opts) do
-    model = Keyword.get(opts, :model, @default_model)
+    model = Keyword.get(opts, :model)
     model = Map.get(@inline_models, model, model)
     req_opts = Keyword.get(opts, :request_options, [])
     req_opts = if key = opts[:api_key], do: [{:api_key, key} | req_opts], else: req_opts

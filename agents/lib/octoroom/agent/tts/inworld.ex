@@ -21,7 +21,6 @@ defmodule Octoroom.Agent.TTS.Inworld do
   @impl true
   def default_options do
     [
-      model: "inworld-tts-2",
       voice: "Ashley",
       audio_encoding: "LINEAR16",
       sample_rate: 24_000
@@ -81,7 +80,7 @@ defmodule Octoroom.Agent.TTS.Inworld do
   defp config(opts) do
     %{
       voiceId: value(opts, :voice, "Ashley"),
-      modelId: value(opts, :model, "inworld-tts-2"),
+      modelId: Keyword.fetch!(opts, :model),
       audioConfig: %{
         audioEncoding: value(opts, :audio_encoding, "LINEAR16"),
         sampleRateHertz: value(opts, :sample_rate, 24_000)

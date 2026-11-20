@@ -26,7 +26,7 @@ defmodule Octoroom.Agent.TTS.OpenAITest do
     end
 
     assert {:ok, <<1, 0, 2, 0>>} =
-             TTS.synthesize(:openai, "Hello",
+             TTS.synthesize("openai:gpt-4o-mini-tts", "Hello",
                api_key: "key",
                voice: "coral",
                instructions: "Cheerful.",
@@ -46,7 +46,7 @@ defmodule Octoroom.Agent.TTS.OpenAITest do
     end
 
     assert :ok =
-             TTS.stream(:openai, "Hello", &send(parent, {:audio, &1}),
+             TTS.stream("openai:gpt-4o-mini-tts", "Hello", &send(parent, {:audio, &1}),
                api_key: "key",
                request_fun: request_fun
              )
@@ -67,7 +67,7 @@ defmodule Octoroom.Agent.TTS.OpenAITest do
     end
 
     assert {:error, {:openai_speech_failed, 401, %{"error" => %{"message" => "bad key"}}}} =
-             TTS.stream(:openai, "Hello", &send(parent, {:audio, &1}),
+             TTS.stream("openai:gpt-4o-mini-tts", "Hello", &send(parent, {:audio, &1}),
                api_key: "bad",
                request_fun: request_fun
              )
@@ -77,6 +77,9 @@ defmodule Octoroom.Agent.TTS.OpenAITest do
 
   test "only speaks at 24 kHz" do
     assert {:error, {:unsupported_sample_rate, 16_000, only: 24_000}} =
-             TTS.synthesize(:openai, "Hello", api_key: "key", sample_rate: 16_000)
+             TTS.synthesize("openai:gpt-4o-mini-tts", "Hello",
+               api_key: "key",
+               sample_rate: 16_000
+             )
   end
 end

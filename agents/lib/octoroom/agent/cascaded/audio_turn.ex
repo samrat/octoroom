@@ -1,8 +1,8 @@
 defmodule Octoroom.Agent.Cascaded.AudioTurn do
   @moduledoc false
 
-  # Helpers for the audio-input mode of the cascaded backend
-  # (`speech_to_text: false`), where the LLM hears each user turn as audio
+  # Helpers for the half-cascaded pipeline
+  # (`Spec.default(stt: false)`), where the LLM hears each user turn as audio
   # instead of an STT transcript.
 
   alias ReqLLM.Context

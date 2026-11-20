@@ -8,7 +8,7 @@ defmodule Octoroom.Agent.TTSTest do
     @behaviour Octoroom.Agent.TTS
 
     @impl true
-    def default_options, do: [voice: "plain"]
+    def default_options, do: [model: "one", voice: "plain"]
 
     @impl true
     def synthesize(text, opts), do: {:ok, "#{opts[:voice]}:#{text}"}
@@ -17,6 +17,9 @@ defmodule Octoroom.Agent.TTSTest do
   # A provider with only `stream/3`.
   defmodule Chunks do
     @behaviour Octoroom.Agent.TTS
+
+    @impl true
+    def default_options, do: [model: "one"]
 
     @impl true
     def stream(text, on_audio, _opts) do
@@ -32,15 +35,25 @@ defmodule Octoroom.Agent.TTSTest do
   end
 
   test "resolves names, strings and provider:model specs, with the provider's defaults" do
-    assert {:ok, TTS.Inworld, opts} = TTS.resolve(provider: "inworld")
+    assert {:ok, TTS.Inworld, opts} = TTS.resolve(provider: "inworld", model: "inworld-tts-2")
     assert opts[:model] == "inworld-tts-2" and opts[:voice] == "Ashley"
 
     assert {:ok, TTS.Inworld, opts} = TTS.resolve(%{model: "inworld:inworld-tts-1.5-max"})
     assert opts[:model] == "inworld-tts-1.5-max"
 
     # Given options win over defaults; nil ones don't count.
-    assert {:ok, TTS.Inworld, opts} = TTS.resolve(provider: :inworld, voice: "Dennis", model: nil)
-    assert opts[:voice] == "Dennis" and opts[:model] == "inworld-tts-2"
+    assert {:ok, TTS.Inworld, opts} =
+             TTS.resolve(provider: :inworld, model: "inworld-tts-2", voice: "Dennis", url: nil)
+
+    assert opts[:voice] == "Dennis" and not Keyword.has_key?(opts, :url)
+  end
+
+  test "no provider picks a model" do
+    for provider <- [:inworld, :assembly_ai, :openai] do
+      assert {:error, {:no_model, _module}} = TTS.resolve(provider: provider)
+    end
+
+    assert {:error, {:no_model, TTS.Inworld}} = TTS.synthesize(:inworld, "Hi")
   end
 
   test "a module provider works unregistered, either callback standing in for the other" do
@@ -67,6 +80,6 @@ defmodule Octoroom.Agent.TTSTest do
       end)
 
     assert {:ok, <<1, 2, 3>>} =
-             TTS.synthesize(:inworld, "Hello.", api_key: "key", connection: socket)
+             TTS.synthesize("inworld:inworld-tts-2", "Hello.", api_key: "key", connection: socket)
   end
 end
