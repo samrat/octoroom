@@ -58,6 +58,8 @@ defmodule MeetWeb.TraceStore do
     do: true
 
   defp relevant?([:octoroom_agent, :turn, _]), do: true
+  defp relevant?([:octoroom_agent, :live, :session]), do: true
+  defp relevant?([:octoroom_agent, :live, :response, :stop]), do: true
   defp relevant?([:octoroom_agent, :pipeline, :interruption]), do: true
 
   defp relevant?([:octoroom, :room, ev]) when ev in [:start, :stop], do: true
@@ -328,6 +330,152 @@ defmodule MeetWeb.TraceStore do
   end
 
   defp record(
+         [:octoroom_agent, :live, :session],
+         m,
+         meta,
+         now_ms,
+         wall_at,
+         state
+       ) do
+    dur = (m[:duration_ms] || 0) * 1.0
+    {span_id, state} = next_id(state)
+    event = meta[:event] || :event
+
+    span = %{
+      id: span_id,
+      kind: :live_session,
+      label: "live #{event} (#{meta[:agent_id] || meta[:provider]})",
+      start_ms: now_ms - dur,
+      end_ms: max(now_ms, now_ms - dur + 5.0),
+      duration_ms: dur,
+      status: if(event in [:error, :disconnected], do: :error, else: :ok),
+      meta:
+        compact_map(%{
+          agent_id: meta[:agent_id],
+          provider: meta[:provider],
+          model: meta[:model],
+          transport: meta[:transport],
+          event: event,
+          duration_ms: m[:duration_ms],
+          reason: if(meta[:reason], do: inspect(meta[:reason]))
+        })
+    }
+
+    append_join_spans(meta[:room_id], [span], now_ms, wall_at, state, false)
+  end
+
+  defp record(
+         [:octoroom_agent, :live, :response, :stop],
+         m,
+         meta,
+         now_ms,
+         wall_at,
+         state
+       ) do
+    room_id = meta[:room_id]
+    agent_id = meta[:agent_id] || to_string(meta[:provider] || "live")
+    ended_ms = (m[:ended_at_ms] || now_ms) * 1.0
+    dur = (m[:duration_ms] || 0) * 1.0
+    start_ms = ended_ms - dur
+    latency_ms = m[:response_latency_ms]
+    speech_ref_ms = if is_number(latency_ms), do: start_ms - latency_ms, else: start_ms
+
+    {call_id, state} = ensure_call(room_id, speech_ref_ms, wall_at, state)
+
+    {utterance_id, state} =
+      find_or_create_live_utterance(
+        call_id,
+        room_id,
+        meta[:speaker],
+        meta[:user_text],
+        speech_ref_ms,
+        ended_ms,
+        wall_at,
+        meta[:typed] == true,
+        state
+      )
+
+    {span_id, state} = next_id(state)
+    status = meta[:status] || :ok
+
+    live_span = %{
+      id: span_id,
+      kind: :live,
+      label: "live (#{short_model(meta[:model] || "s2s")})",
+      start_ms: start_ms,
+      end_ms: max(ended_ms, start_ms + 5.0),
+      duration_ms: dur,
+      first_output_ms: nil,
+      status: status,
+      meta:
+        compact_map(%{
+          provider: meta[:provider],
+          model: meta[:model],
+          voice: meta[:voice],
+          transport: meta[:transport],
+          status: status,
+          duration_ms: round(dur),
+          audio_ms: m[:audio_ms],
+          outputs: m[:outputs],
+          response_latency_ms: latency_ms,
+          user_text: meta[:user_text],
+          assistant_text: meta[:assistant_text],
+          reason: if(meta[:reason], do: inspect(meta[:reason]))
+        })
+    }
+
+    {spans, state} =
+      if is_number(latency_ms) and latency_ms > 0 do
+        {wait_id, state} = next_id(state)
+
+        think_span = %{
+          id: wait_id,
+          kind: :stt,
+          label: "live think",
+          start_ms: speech_ref_ms,
+          end_ms: start_ms,
+          duration_ms: latency_ms * 1.0,
+          first_output_ms: nil,
+          status: :ok,
+          meta: %{response_latency_ms: latency_ms, transport: meta[:transport]}
+        }
+
+        {[think_span, live_span], state}
+      else
+        {[live_span], state}
+      end
+
+    marker = %{kind: :first_audio, at_ms: start_ms, label: "first audio"}
+
+    latency =
+      if is_number(latency_ms),
+        do: %{processing_ms: latency_ms, wait_ms: 0, audio_ms: latency_ms},
+        else: %{processing_ms: round(dur), wait_ms: 0, audio_ms: round(dur)}
+
+    state =
+      update_utterance(state, utterance_id, fn u ->
+        lane =
+          u.lanes
+          |> Map.get(agent_id, new_lane(agent_id))
+          |> Map.merge(%{
+            outcome: :reply,
+            why: if(meta[:typed], do: :typed, else: meta[:transport] || :live),
+            latency: latency
+          })
+          |> append_spans(spans)
+          |> Map.update(:markers, [marker], &(&1 ++ [marker]))
+
+        u
+        |> put_in([:lanes, agent_id], lane)
+        |> maybe_fill_text(meta[:user_text])
+        |> maybe_fill_speaker(meta[:speaker])
+        |> recompute_bounds()
+      end)
+
+    put_in(state.active_utterance[{room_id, agent_id}], utterance_id)
+  end
+
+  defp record(
          [:octoroom_agent, :pipeline, :interruption],
          m,
          meta,
@@ -529,6 +677,7 @@ defmodule MeetWeb.TraceStore do
         {:tts, model, _} when is_binary(model) -> "tts (#{short_model(model)})"
         {:decisions, model, _} when is_binary(model) -> "decisions (#{short_model(model)})"
         {:tools, _, _} -> "tools"
+        {:transcriber, model, _} when is_binary(model) -> "transcriber (#{short_model(model)})"
         {:transcriber, _, _} -> "transcriber"
         _ -> "#{meta[:processor]}:#{meta[:task]}"
       end
@@ -578,17 +727,20 @@ defmodule MeetWeb.TraceStore do
           stt_span = %{
             id: stt_id,
             kind: :stt,
-            label: "stt",
+            label: stt_label(meta),
             start_ms: speech_end_ms,
             end_ms: stt_end,
             duration_ms: stt_dur,
             first_output_ms: nil,
             status: :ok,
-            meta: %{
-              derived: "speech_end to decisions start",
-              duration_ms: Float.round(stt_dur, 1),
-              text: meta[:text]
-            }
+            meta:
+              compact_map(%{
+                provider: meta[:stt_provider],
+                model: meta[:stt_model],
+                derived: "speech_end to decisions start",
+                duration_ms: Float.round(stt_dur, 1),
+                text: meta[:text]
+              })
           }
 
           {[stt_span, decision_span], state}
@@ -602,19 +754,40 @@ defmodule MeetWeb.TraceStore do
         stt_span = %{
           id: stt_id,
           kind: :stt,
-          label: "stt",
+          label: stt_label(meta),
           start_ms: speech_end_ms,
           end_ms: decided_ms,
           duration_ms: speech_to_decided,
           first_output_ms: nil,
           status: :ok,
-          meta: %{duration_ms: Float.round(speech_to_decided, 1), text: meta[:text]}
+          meta:
+            compact_map(%{
+              provider: meta[:stt_provider],
+              model: meta[:stt_model],
+              duration_ms: Float.round(speech_to_decided, 1),
+              text: meta[:text]
+            })
         }
 
         {[stt_span], state}
 
       true ->
         {[], state}
+    end
+  end
+
+  defp stt_label(meta) do
+    model =
+      case meta[:stt_model] do
+        m when is_binary(m) and m != "" -> short_model(m)
+        _ -> nil
+      end
+
+    case {meta[:stt_provider], model} do
+      {p, m} when not is_nil(p) and is_binary(m) -> "stt (#{p}/#{m})"
+      {nil, m} when is_binary(m) -> "stt (#{m})"
+      {p, nil} when not is_nil(p) -> "stt (#{p})"
+      _ -> "stt"
     end
   end
 
@@ -707,6 +880,51 @@ defmodule MeetWeb.TraceStore do
           wall_at: wall_at,
           t0_ms: speech_end_ms,
           t_end_ms: now_ms,
+          lanes: %{}
+        }
+
+        utterances = Enum.take([utterance | state.utterances], @max_utterances)
+        {id, %{state | utterances: utterances}}
+    end
+  end
+
+  defp find_or_create_live_utterance(
+         call_id,
+         room_id,
+         speaker,
+         text,
+         t0_ms,
+         t_end_ms,
+         wall_at,
+         typed?,
+         state
+       ) do
+    match =
+      if typed? do
+        nil
+      else
+        Enum.find(state.utterances, fn u ->
+          u.call_id == call_id and abs(u.t0_ms - t0_ms) <= 3_000.0
+        end)
+      end
+
+    case match do
+      %{id: id} ->
+        {id, state}
+
+      nil ->
+        {id, state} = next_seq(state)
+
+        utterance = %{
+          id: id,
+          call_id: call_id,
+          room_id: room_id || "unknown",
+          input: nil,
+          speaker: speaker,
+          text: text,
+          wall_at: wall_at,
+          t0_ms: t0_ms,
+          t_end_ms: t_end_ms,
           lanes: %{}
         }
 

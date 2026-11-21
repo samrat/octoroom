@@ -59,13 +59,30 @@ defmodule Octoroom.Agent.Telemetry do
       and `OutputAudio` are excluded). Measurements `duration` (on `:stop` and
       `:exception`); metadata `processor`, `frame`, `generation`.
 
+  ## Live speech-to-speech (`OpenAILive`, `GeminiLive`)
+
+    * `[:octoroom_agent, :live, :session]`: session lifecycle events (`event`:
+      `:started`, `:paused`, `:resumed`, `:disconnected`, `:closed`, `:error`).
+      Includes `duration_ms` on `:started` (connect time). Metadata: `room_id`,
+      `agent_id`, `provider` (`:openai` | `:gemini`), `model`, `voice`,
+      `transport` (`:webrtc` | `:websocket`), `event`, optional `reason`.
+    * `[:octoroom_agent, :live, :response, :start | :first_audio | :stop]`:
+      per spoken reply from a speech-to-speech model. `:stop` includes
+      `duration` (native), `duration_ms`, `audio_ms` (length of spoken audio),
+      `outputs` (audio chunk count), and optional `response_latency_ms`
+      (user turn/transcript end to first audio). Metadata: `room_id`,
+      `agent_id`, `provider`, `model`, `voice`, `transport`, `status`
+      (`:ok` | `:interrupted` | `:error`), `speaker`, `typed`, `user_text`,
+      `assistant_text`.
+
   ## Turns (`Octoroom.Agent.Worker`)
 
     * `[:octoroom_agent, :turn, :decided]`: emitted when a front end finishes a
       turn (or a user types one) and the gate decides `:reply`, `:wait`, or
       `:listen`. Measurements `speech_to_decided_ms`, `system_time`,
       `monotonic_time`, and optional `decision_ms`. Metadata: `room_id`,
-      `agent_id`, `input`, `speaker`, `text`, `outcome`, `why`, `decision`.
+      `agent_id`, `input`, `speaker`, `text`, `outcome`, `why`, `decision`,
+      `stt_provider`, `stt_model`.
     * `[:octoroom_agent, :turn, :floor_wait]`: emitted when a `:wait` turn
       either starts replying (`outcome: :replied`) or yields because someone
       else spoke (`outcome: :yielded`). Measurements `duration_ms`,
@@ -75,7 +92,8 @@ defmodule Octoroom.Agent.Telemetry do
       reaches the outlet. Measurements `transcript_ms`, `audio_ms`, `wait_ms`,
       `processing_ms` (`audio_ms - wait_ms`), `stt_and_decision_ms`, and
       optional `llm_ms` (ms since the speaker's VAD speech end). Metadata:
-      `room_id`, `agent_id`, `turn_id`, `input`, `speaker`.
+      `room_id`, `agent_id`, `turn_id`, `input`, `speaker`, `stt_provider`,
+      `stt_model`.
   """
 
   require Logger
@@ -95,6 +113,10 @@ defmodule Octoroom.Agent.Telemetry do
       [:octoroom_agent, :tool, :call, :start],
       [:octoroom_agent, :tool, :call, :stop],
       [:octoroom_agent, :tool, :call, :exception],
+      [:octoroom_agent, :live, :session],
+      [:octoroom_agent, :live, :response, :start],
+      [:octoroom_agent, :live, :response, :first_audio],
+      [:octoroom_agent, :live, :response, :stop],
       [:octoroom_agent, :turn, :decided],
       [:octoroom_agent, :turn, :floor_wait],
       [:octoroom_agent, :turn, :latency]
@@ -106,6 +128,8 @@ defmodule Octoroom.Agent.Telemetry do
     [:octoroom_agent, :processor, :async, :exception],
     [:octoroom_agent, :tool, :call, :stop],
     [:octoroom_agent, :tool, :call, :exception],
+    [:octoroom_agent, :live, :session],
+    [:octoroom_agent, :live, :response, :stop],
     [:octoroom_agent, :turn, :latency]
   ]
 
@@ -171,6 +195,35 @@ defmodule Octoroom.Agent.Telemetry do
   def format([:octoroom_agent, :tool, :call, :exception], m, meta) do
     "Octoroom.Agent #{scope(meta)} tool #{meta.tool} exception in #{to_ms(m.duration)} ms " <>
       "(#{meta.kind}: #{inspect(meta.reason)})"
+  end
+
+  def format([:octoroom_agent, :live, :session], m, meta) do
+    extra =
+      [
+        if(m[:duration_ms], do: "in #{m.duration_ms} ms"),
+        target(meta),
+        if(meta[:transport], do: to_string(meta.transport)),
+        if(meta[:reason], do: "reason=#{inspect(meta.reason)}")
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    suffix = if extra == [], do: "", else: " (#{Enum.join(extra, ", ")})"
+    "Octoroom.Agent #{scope(meta)} live session #{meta.event}#{suffix}"
+  end
+
+  def format([:octoroom_agent, :live, :response, :stop], m, meta) do
+    details =
+      [
+        if(m[:response_latency_ms], do: "latency #{m.response_latency_ms} ms"),
+        if(m[:audio_ms] && m.audio_ms > 0, do: "#{m.audio_ms} ms audio"),
+        target(meta),
+        if(meta[:transport], do: to_string(meta.transport))
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    suffix = if details == [], do: "", else: " (#{Enum.join(details, ", ")})"
+
+    "Octoroom.Agent #{scope(meta)} live response #{meta.status} in #{m.duration_ms} ms#{suffix}"
   end
 
   def format([:octoroom_agent, :turn, :latency], m, meta) do

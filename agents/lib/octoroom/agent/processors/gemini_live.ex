@@ -72,10 +72,12 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
       Protocol.context_window_compression(opts[:context_window_compression])
     end
 
+    voice = Keyword.get(opts, :voice, Protocol.default_voice())
+
     setup =
       [
         model: model,
-        voice: Keyword.get(opts, :voice, Protocol.default_voice()),
+        voice: voice,
         system_instruction: instructions,
         tools: GeminiTools.to_declarations(tools)
       ] ++
@@ -92,6 +94,12 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
     state = %{
       send: Keyword.get(opts, :send),
+      model: model,
+      voice: voice,
+      telemetry: Map.get(ctx, :telemetry, %{}),
+      connect_started_at: now(),
+      user_turn: nil,
+      response: nil,
       socket: nil,
       # Where tool tasks send their results: the runner, or a test.
       reply_to: Map.get(ctx, :runner) || self(),
@@ -169,7 +177,11 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     do: {[{:push, frame, :downstream}], %{state | interrupting?: false}}
 
   def handle_frame(%Frames.Interruption{} = frame, :downstream, state) do
-    state = if state.generating?, do: commit_assistant(state, :interrupted), else: state
+    state =
+      if state.generating?,
+        do: state |> emit_response_stop(:interrupted) |> commit_assistant(:interrupted),
+        else: state
+
     {[{:push, frame, :downstream}], %{state | discard?: state.generating?}}
   end
 
@@ -182,8 +194,20 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     extra =
       Map.reject(%{speaker: frame.speaker, source: frame.source}, fn {_k, v} -> is_nil(v) end)
 
+    ts = now()
+
+    user_turn = %{
+      started_at: ts,
+      last_at: ts,
+      text: text,
+      speaker: frame.speaker,
+      source: frame.source,
+      typed?: true
+    }
+
     state =
       state
+      |> Map.put(:user_turn, user_turn)
       |> ConversationEvents.commit(:user, :completed)
       |> ConversationEvents.replace(:user, text)
       |> ConversationEvents.commit(:user, :completed, extra)
@@ -272,26 +296,37 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   defp event(:connected, state), do: {[], %{state | setup_complete?: false}}
 
   defp event(:setup_complete, state) do
-    state = %{state | setup_complete?: true}
+    dur = if state.connect_started_at, do: max(now() - state.connect_started_at, 0)
+    emit_session(state, :started, if(dur, do: %{duration_ms: dur}, else: %{}))
+    state = %{state | setup_complete?: true, connect_started_at: nil}
     {initial_text_timer(state), state}
   end
 
   defp event({:audio, _pcm, _rate}, %{discard?: true} = state), do: {[], state}
 
   defp event({:audio, pcm, sample_rate: rate}, state) do
-    state = %{state | generating?: true, hearing?: false}
+    ts = now()
+
+    state =
+      state
+      |> ensure_response_started(ts)
+      |> record_response_audio(pcm, rate, ts)
+      |> Map.merge(%{generating?: true, hearing?: false})
+
     frame = %Frames.OutputAudio{audio: pcm, sample_rate: rate}
     {[{:push, frame, :downstream}], state}
   end
 
   defp event({:text, _text}, %{discard?: true} = state), do: {[], state}
 
-  defp event({:text, text}, state),
-    do: {[], %{state | generating?: true, model_text: state.model_text <> text}}
+  defp event({:text, text}, state) do
+    state = state |> ensure_response_started(now())
+    {[], %{state | generating?: true, model_text: state.model_text <> text}}
+  end
 
   # Someone started a turn: the agent stops if its reply is still playing.
   defp event({:transcription, :user, text, finished?}, state) do
-    state = ConversationEvents.append(state, :user, text)
+    state = state |> ConversationEvents.append(:user, text) |> track_user_turn(text, now())
 
     {notify, state} =
       if String.trim(text) != "" and not state.hearing? and not state.generating?,
@@ -322,21 +357,22 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
   # The model heard someone talk over it and stopped generating.
   defp event(:interrupted, %{discard?: true} = state),
-    do: {[], %{state | discard?: false, generating?: false}}
+    do: {[], %{state | discard?: false, generating?: false, response: nil}}
 
   defp event(:interrupted, state) do
-    state = commit_assistant(state, :interrupted)
+    state = state |> emit_response_stop(:interrupted) |> commit_assistant(:interrupted)
 
     {[{:push, %Frames.Interruption{}, :downstream}],
      %{state | generating?: false, interrupting?: true}}
   end
 
   defp event(:turn_complete, %{discard?: true} = state),
-    do: {[], %{state | discard?: false, generating?: false}}
+    do: {[], %{state | discard?: false, generating?: false, response: nil}}
 
   defp event(:turn_complete, state) do
     text = assistant_text(state)
-    state = %{commit_assistant(state, :completed) | generating?: false}
+    state = state |> emit_response_stop(:ok) |> commit_assistant(:completed)
+    state = %{state | generating?: false}
     state = ConversationEvents.commit(state, :user)
 
     if text == "",
@@ -351,11 +387,23 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
   defp event({:disconnected, reason}, state) do
     Logger.warning("Gemini Live disconnected: #{inspect(reason)}; reconnecting")
+    emit_session(state, :disconnected, %{}, %{reason: reason})
     state = ConversationEvents.commit(state, :user, :failed)
-    state = if state.generating?, do: commit_assistant(state, :failed), else: state
+
+    state =
+      if state.generating?,
+        do: state |> emit_response_stop(:error, reason) |> commit_assistant(:failed),
+        else: state
 
     {[{:notify, {:status, "Reconnecting"}}],
-     %{state | setup_complete?: false, generating?: false, discard?: false, hearing?: false}}
+     %{
+       state
+       | setup_complete?: false,
+         connect_started_at: now(),
+         generating?: false,
+         discard?: false,
+         hearing?: false
+     }}
   end
 
   defp event({:go_away, time_left}, state) do
@@ -412,6 +460,154 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   defp initial_text_timer(_state), do: []
 
   defp now, do: System.monotonic_time(:millisecond)
+
+  # -- Telemetry --
+
+  defp track_user_turn(state, text, ts) do
+    if String.trim(text || "") == "" do
+      state
+    else
+      user_turn =
+        case state.user_turn do
+          %{typed?: false} = ut ->
+            %{ut | last_at: ts, text: ut.text <> text}
+
+          _ ->
+            %{started_at: ts, last_at: ts, text: text, speaker: nil, source: nil, typed?: false}
+        end
+
+      %{state | user_turn: user_turn}
+    end
+  end
+
+  defp ensure_response_started(%{response: %{} = _} = state, _ts), do: state
+
+  defp ensure_response_started(state, ts) do
+    user = state.user_turn
+
+    response = %{
+      started_at: ts,
+      first_audio_at: nil,
+      audio_ms: 0,
+      audio_chunks: 0,
+      user_last_at: user && user.last_at,
+      user_text: user && String.trim(user.text || ""),
+      speaker: user && user.speaker,
+      source: user && user.source,
+      typed?: (user && user.typed?) || false
+    }
+
+    :telemetry.execute(
+      [:octoroom_agent, :live, :response, :start],
+      %{system_time: System.system_time(), monotonic_time: System.monotonic_time()},
+      live_meta(state, %{speaker: response.speaker, typed: response.typed?})
+    )
+
+    %{state | response: response, user_turn: nil}
+  end
+
+  defp record_response_audio(state, <<>>, _rate, _ts), do: state
+
+  defp record_response_audio(%{response: r} = state, pcm, rate, ts) do
+    first_audio_at =
+      if r.first_audio_at == nil do
+        latency_ms = if r.user_last_at, do: max(ts - r.user_last_at, 0)
+
+        measurements =
+          %{system_time: System.system_time(), monotonic_time: System.monotonic_time()}
+          |> then(fn m ->
+            if latency_ms, do: Map.put(m, :response_latency_ms, latency_ms), else: m
+          end)
+
+        :telemetry.execute(
+          [:octoroom_agent, :live, :response, :first_audio],
+          measurements,
+          live_meta(state, %{speaker: r.speaker, typed: r.typed?})
+        )
+
+        ts
+      else
+        r.first_audio_at
+      end
+
+    chunk_ms =
+      if is_integer(rate) and rate > 0, do: div(byte_size(pcm) * 1_000, rate * 2), else: 0
+
+    %{
+      state
+      | response: %{
+          r
+          | first_audio_at: first_audio_at,
+            audio_ms: r.audio_ms + chunk_ms,
+            audio_chunks: r.audio_chunks + 1
+        }
+    }
+  end
+
+  defp emit_response_stop(state, status, reason \\ nil)
+  defp emit_response_stop(%{response: nil} = state, _status, _reason), do: state
+
+  defp emit_response_stop(%{response: r} = state, status, reason) do
+    ended_at = now()
+    duration_ms = max(ended_at - r.started_at, 0)
+    duration = System.convert_time_unit(duration_ms, :millisecond, :native)
+
+    latency_ms =
+      if r.user_last_at && r.first_audio_at, do: max(r.first_audio_at - r.user_last_at, 0)
+
+    measurements =
+      %{
+        duration: duration,
+        duration_ms: duration_ms,
+        audio_ms: r.audio_ms,
+        outputs: r.audio_chunks,
+        ended_at_ms: ended_at
+      }
+      |> then(fn m ->
+        if latency_ms, do: Map.put(m, :response_latency_ms, latency_ms), else: m
+      end)
+
+    extra =
+      %{
+        status: status,
+        speaker: r.speaker,
+        input: r.source,
+        typed: r.typed?,
+        user_text: if(r.user_text not in [nil, ""], do: r.user_text),
+        assistant_text: assistant_text(state)
+      }
+      |> then(fn m -> if reason, do: Map.put(m, :reason, reason), else: m end)
+
+    :telemetry.execute(
+      [:octoroom_agent, :live, :response, :stop],
+      measurements,
+      live_meta(state, extra)
+    )
+
+    %{state | response: nil}
+  end
+
+  defp emit_session(state, event, measurements, extra \\ %{}) do
+    :telemetry.execute(
+      [:octoroom_agent, :live, :session],
+      Map.merge(
+        %{system_time: System.system_time(), monotonic_time: System.monotonic_time()},
+        measurements
+      ),
+      live_meta(state, Map.put(extra, :event, event))
+    )
+  end
+
+  defp live_meta(state, extra) do
+    state.telemetry
+    |> Map.merge(%{
+      provider: :gemini,
+      model: state.model,
+      voice: state.voice,
+      transport: :websocket
+    })
+    |> Map.merge(extra)
+  end
 
   defp send_gemini(%{send: send}, message) when is_function(send, 1), do: send.(message)
   defp send_gemini(%{socket: nil}, _message), do: :ok

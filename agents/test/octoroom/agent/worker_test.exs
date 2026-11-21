@@ -1389,6 +1389,83 @@ defmodule Octoroom.Agent.WorkerTest do
     end
   end
 
+  test "resolves STT provider and model into worker state and turn telemetry", ctx do
+    worker_ctx = %Octoroom.Worker.Context{room_id: ctx.room_id, id: "a", inputs: [], outputs: []}
+
+    # Real "provider:model" string via Spec.default/1
+    {front, back} =
+      default(
+        stt: "reson8:rumble-2",
+        llm: [provider: :google, model: "gemini-test", request: fn _, _ -> {:ok, %{}} end],
+        tts: [provider: :inworld, model: "inworld-tts-2", synthesize: fn _, _ -> :ok end]
+      )
+
+    assert {:ok, state, _} =
+             Octoroom.Agent.Worker.init(%{front_end: front, back_end: back}, worker_ctx)
+
+    assert state.stt == %{provider: :reson8, model: "rumble-2"}
+
+    # Half-cascaded (stt: false) has nil STT provider/model
+    {half_front, half_back} =
+      default(
+        stt: false,
+        transcriber: [model: "gemini-lite", transcribe: fn _, _ -> {:ok, "hi"} end],
+        llm: [provider: :google, model: "gemini-test", request: fn _, _ -> {:ok, %{}} end],
+        tts: [provider: :inworld, model: "inworld-tts-2", synthesize: fn _, _ -> :ok end]
+      )
+
+    assert {:ok, half_state, _} =
+             Octoroom.Agent.Worker.init(
+               %{front_end: half_front, back_end: half_back},
+               worker_ctx
+             )
+
+    assert half_state.stt == %{provider: nil, model: nil}
+
+    # Emitted on [:octoroom_agent, :turn, :decided] and [:octoroom_agent, :turn, :latency]
+    test_pid = self()
+    handler = {__MODULE__, :stt_telemetry, make_ref()}
+
+    :telemetry.attach_many(
+      handler,
+      [[:octoroom_agent, :turn, :decided], [:octoroom_agent, :turn, :latency]],
+      fn event, measurements, meta, _ ->
+        if meta[:room_id] == ctx.room_id,
+          do: send(test_pid, {:telemetry, event, measurements, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    base = args(self(), 200)
+
+    stt_front =
+      replace(
+        base.front_end,
+        :stt,
+        processor(:stt, FakeSTT, test: self(), provider: :soniox, model: "stt-rt-v6")
+      )
+
+    %{alice: alice} = start(ctx, 200, %{front_end: stt_front})
+    say(ctx, alice, {:final, "Hello!"})
+
+    assert_receive {:telemetry, [:octoroom_agent, :turn, :decided], _,
+                    %{stt_provider: :soniox, stt_model: "stt-rt-v6", text: "Hello!"}},
+                   1_000
+
+    assert_receive {:telemetry, [:octoroom_agent, :turn, :latency], _,
+                    %{stt_provider: :soniox, stt_model: "stt-rt-v6"}},
+                   1_000
+
+    # Typed turns omit STT provider/model on :decided.
+    Server.worker_message(alice.server, alice.id, "assistant", %{"text" => "Typed"}, :typed_msg)
+
+    assert_receive {:telemetry, [:octoroom_agent, :turn, :decided], _,
+                    %{stt_provider: nil, stt_model: nil, why: :typed, text: "Typed"}},
+                   1_000
+  end
+
   defp wait_until(fun, tries \\ 100) do
     cond do
       fun.() -> :ok

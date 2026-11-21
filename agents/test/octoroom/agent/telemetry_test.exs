@@ -439,4 +439,99 @@ defmodule Octoroom.Agent.TelemetryTest do
       assert :ok = Telemetry.detach_default_logger()
     end
   end
+
+  describe "live speech-to-speech telemetry (OpenAI Live & Gemini Live)" do
+    test "OpenAILive emits session and response start/first_audio/stop events" do
+      room = tag()
+      attach(Telemetry.events(), room)
+
+      harness =
+        processor(:openai, Processors.OpenAILive,
+          model: "gpt-live-1.1",
+          voice: "marin",
+          send: fn _ -> :ok end
+        )
+        |> Harness.start!(ctx: %{telemetry: %{room_id: room, agent_id: "openai"}})
+        |> Harness.info(:openai, {:openai_live_socket, {:session_started, %{}}})
+        |> Harness.info(:openai, {:openai_live_socket, {:transcription, :user, "OpenAI hi"}})
+        |> Harness.info(
+          :openai,
+          {:openai_live_socket, {:audio, :binary.copy(<<1, 0>>, 480), sample_rate: 24_000}}
+        )
+        |> Harness.info(:openai, {:openai_live_socket, {:transcription, :assistant, "Hey!"}})
+        |> Harness.info(:openai, {:openai_live_socket, {:session_paused, %{}}})
+
+      assert harness != nil
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :session], %{duration_ms: d},
+                       %{
+                         room_id: ^room,
+                         agent_id: "openai",
+                         provider: :openai,
+                         model: "gpt-live-1.1",
+                         transport: :webrtc,
+                         event: :started
+                       }}
+
+      assert d >= 0
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :response, :start], _,
+                       %{room_id: ^room, agent_id: "openai", provider: :openai}}
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :response, :first_audio],
+                       %{response_latency_ms: lat},
+                       %{room_id: ^room, agent_id: "openai", provider: :openai}}
+
+      assert lat >= 0
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :response, :stop],
+                       %{duration_ms: _, audio_ms: 20, outputs: 1, response_latency_ms: ^lat},
+                       %{
+                         room_id: ^room,
+                         agent_id: "openai",
+                         provider: :openai,
+                         model: "gpt-live-1.1",
+                         status: :ok,
+                         user_text: "OpenAI hi",
+                         assistant_text: "Hey!"
+                       }}
+    end
+
+    test "GeminiLive emits session and response stop events" do
+      room = tag()
+      attach(Telemetry.events(), room)
+
+      processor(:gemini, Processors.GeminiLive,
+        model: "gemini-3.8-live",
+        voice: "Puck",
+        send: fn _ -> :ok end
+      )
+      |> Harness.start!(ctx: %{telemetry: %{room_id: room, agent_id: "gemini"}})
+      |> Harness.info(:gemini, {:gemini_live_socket, :setup_complete})
+      |> Harness.info(:gemini, {:gemini_live_socket, {:transcription, :user, "Hi Gemini", true}})
+      |> Harness.info(
+        :gemini,
+        {:gemini_live_socket, {:audio, :binary.copy(<<1, 0>>, 480), sample_rate: 24_000}}
+      )
+      |> Harness.info(
+        :gemini,
+        {:gemini_live_socket, {:transcription, :assistant, "Hello!", true}}
+      )
+      |> Harness.info(:gemini, {:gemini_live_socket, :turn_complete})
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :session], %{duration_ms: _},
+                       %{room_id: ^room, agent_id: "gemini", provider: :gemini, event: :started}}
+
+      assert_received {:telemetry, [:octoroom_agent, :live, :response, :stop],
+                       %{audio_ms: 20, outputs: 1, response_latency_ms: _},
+                       %{
+                         room_id: ^room,
+                         agent_id: "gemini",
+                         provider: :gemini,
+                         status: :ok,
+                         user_text: "Hi Gemini",
+                         assistant_text: "Hello!"
+                       }}
+    end
+  end
 end

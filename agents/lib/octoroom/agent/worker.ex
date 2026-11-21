@@ -245,6 +245,7 @@ defmodule Octoroom.Agent.Worker do
         },
         fronts: %{},
         front_spec: front_spec,
+        stt: stt_info(front_spec),
         # Options the back end set on front-end stages with `UpdateStage`,
         # by stage name, for front ends started later.
         front_updates: %{},
@@ -729,6 +730,29 @@ defmodule Octoroom.Agent.Worker do
     case Spec.opts(front, :vad) do
       nil -> 0
       opts -> Keyword.get(opts, :min_silence_ms, Octoroom.Agent.VAD.defaults().min_silence_ms)
+    end
+  end
+
+  defp stt_info(nil), do: %{provider: nil, model: nil}
+
+  defp stt_info(front) do
+    case Spec.opts(front, :stt) do
+      nil ->
+        %{provider: nil, model: nil}
+
+      opts ->
+        case Octoroom.Agent.STT.resolve(opts) do
+          {:ok, module, resolved} ->
+            provider =
+              Enum.find_value(Octoroom.Agent.STT.providers(), module, fn {name, mod} ->
+                if mod == module, do: name
+              end)
+
+            %{provider: provider, model: Keyword.get(resolved, :model)}
+
+          {:error, _reason} ->
+            %{provider: Keyword.get(opts, :provider), model: Keyword.get(opts, :model)}
+        end
     end
   end
 
@@ -1443,6 +1467,11 @@ defmodule Octoroom.Agent.Worker do
         end
       end)
 
+    {stt_provider, stt_model} =
+      if event.why == :typed,
+        do: {nil, nil},
+        else: {state.stt.provider, state.stt.model}
+
     :telemetry.execute(
       [:octoroom_agent, :turn, :decided],
       measurements,
@@ -1454,7 +1483,9 @@ defmodule Octoroom.Agent.Worker do
         text: event.text,
         outcome: event.outcome,
         why: event.why,
-        decision: event.decision
+        decision: event.decision,
+        stt_provider: stt_provider,
+        stt_model: stt_model
       }
     )
   end
@@ -1508,7 +1539,9 @@ defmodule Octoroom.Agent.Worker do
         agent_id: state.id,
         turn_id: turn[:id],
         input: state.addressee,
-        speaker: state.addressee_name
+        speaker: state.addressee_name,
+        stt_provider: state.stt.provider,
+        stt_model: state.stt.model
       }
     )
 

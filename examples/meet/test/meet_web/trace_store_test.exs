@@ -39,7 +39,9 @@ defmodule MeetWeb.TraceStoreTest do
         text: "Hey assistant, what time is it?",
         outcome: :listen,
         why: :not_addressed,
-        decision: nil
+        decision: nil,
+        stt_provider: :soniox,
+        stt_model: "stt-rt-v6"
       }
     )
 
@@ -70,7 +72,9 @@ defmodule MeetWeb.TraceStoreTest do
         text: "Hey assistant, what time is it?",
         outcome: :wait,
         why: :open_question,
-        decision: nil
+        decision: nil,
+        stt_provider: :reson8,
+        stt_model: "rumble-2"
       }
     )
 
@@ -146,6 +150,16 @@ defmodule MeetWeb.TraceStoreTest do
     assert :llm in assistant_kinds
     assert :tts in assistant_kinds
 
+    atlas_stt = Enum.find(u.lanes["atlas"].spans, &(&1.kind == :stt))
+    assert atlas_stt.label == "stt (soniox/stt-rt-v6)"
+    assert atlas_stt.meta.provider == :soniox
+    assert atlas_stt.meta.model == "stt-rt-v6"
+
+    assistant_stt = Enum.find(u.lanes["assistant"].spans, &(&1.kind == :stt))
+    assert assistant_stt.label == "stt (reson8/rumble-2)"
+    assert assistant_stt.meta.provider == :reson8
+    assert assistant_stt.meta.model == "rumble-2"
+
     llm_span = Enum.find(u.lanes["assistant"].spans, &(&1.kind == :llm))
     assert_in_delta llm_span.first_output_ms, 310.0, 2.0
     assert u.lanes["assistant"].latency.processing_ms == 1_580
@@ -162,6 +176,8 @@ defmodule MeetWeb.TraceStoreTest do
       )
 
     assert html =~ "Hey assistant, what time is it?"
+    assert html =~ "stt (soniox/stt-rt-v6)"
+    assert html =~ "stt (reson8/rumble-2)"
     assert html =~ "floor wait"
     assert html =~ "310 ms TTFT"
     assert html =~ "nemotron-3.5-lightning"
@@ -235,6 +251,74 @@ defmodule MeetWeb.TraceStoreTest do
     assert latest_html =~ "Second call question"
     refute latest_html =~ "First call question"
     assert latest_html =~ "All calls (2)"
+  end
+
+  test "records OpenAI Live session and response events in the waterfall" do
+    :telemetry.execute([:octoroom, :room, :start], %{}, %{
+      room_id: "live-room",
+      run: "r1",
+      recovered: false
+    })
+
+    :telemetry.execute(
+      [:octoroom_agent, :live, :session],
+      %{duration_ms: 420},
+      %{
+        room_id: "live-room",
+        agent_id: "openai",
+        provider: :openai,
+        model: "gpt-live-1.1",
+        transport: :webrtc,
+        event: :started
+      }
+    )
+
+    now_ms = System.monotonic_time(:millisecond)
+
+    :telemetry.execute(
+      [:octoroom_agent, :live, :response, :stop],
+      %{
+        duration: System.convert_time_unit(850, :millisecond, :native),
+        duration_ms: 850,
+        audio_ms: 1_200,
+        outputs: 40,
+        ended_at_ms: now_ms,
+        response_latency_ms: 310
+      },
+      %{
+        room_id: "live-room",
+        agent_id: "openai",
+        provider: :openai,
+        model: "gpt-live-1.1",
+        voice: "marin",
+        transport: :webrtc,
+        status: :ok,
+        typed: false,
+        user_text: "OpenAI, say hello",
+        assistant_text: "Hello there!"
+      }
+    )
+
+    %{calls: [call], utterances: [u], joins: [join]} = TraceStore.snapshot()
+    assert call.room_id == "live-room"
+    assert Enum.any?(join.spans, &(&1.kind == :live_session))
+    assert u.text == "OpenAI, say hello"
+    assert Map.has_key?(u.lanes, "openai")
+    assert Enum.any?(u.lanes["openai"].spans, &(&1.kind == :live))
+
+    html =
+      Phoenix.LiveViewTest.render_component(&MeetWeb.OctoroomDashboardPage.render/1,
+        tab: :turns,
+        selected: nil,
+        selected_call: :latest,
+        calls: [call],
+        utterances: [u],
+        joins: [join]
+      )
+
+    assert html =~ "OpenAI, say hello"
+    assert html =~ "gpt-live-1.1"
+    assert html =~ "1200 ms audio"
   end
 
   test "groups room join, cloudflare, peer connect, and first pull events" do

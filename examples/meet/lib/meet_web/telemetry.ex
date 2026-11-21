@@ -74,6 +74,18 @@ defmodule MeetWeb.Telemetry do
         reporter_options: [nav: :octoroom],
         description: "Tool handler duration"
       ),
+      summary("octoroom_agent.live.response.stop.response_latency_ms",
+        tags: [:agent_id, :provider],
+        unit: :millisecond,
+        reporter_options: [nav: :octoroom],
+        description: "Live S2S response latency (user end to first audio)"
+      ),
+      summary("octoroom_agent.live.response.stop.duration",
+        tags: [:agent_id, :provider, :status],
+        unit: {:native, :millisecond},
+        reporter_options: [nav: :octoroom],
+        description: "Live S2S response streaming duration"
+      ),
       counter("octoroom_agent.pipeline.interruption.count",
         event_name: [:octoroom_agent, :pipeline, :interruption],
         measurement: :killed_tasks,

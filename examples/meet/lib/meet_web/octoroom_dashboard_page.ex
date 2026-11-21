@@ -165,6 +165,8 @@ defmodule MeetWeb.OctoroomDashboardPage do
         .octo-wf .kind-llm { background: #4f46e5; }
         .octo-wf .kind-tools, .octo-wf .kind-tool { background: #9333ea; }
         .octo-wf .kind-tts { background: #10b981; }
+        .octo-wf .kind-live { background: #0284c7; }
+        .octo-wf .kind-live_session { background: #14b8a6; }
         .octo-wf .kind-transcriber { background: #0ea5e9; }
         .octo-wf .kind-client { background: #3b82f6; }
         .octo-wf .kind-join { background: #6366f1; }
@@ -285,6 +287,7 @@ defmodule MeetWeb.OctoroomDashboardPage do
           </span>
           <span class="wf-swatch"><span class="wf-box kind-tool"></span>Tool</span>
           <span class="wf-swatch"><span class="wf-box kind-tts"></span>TTS (│ = TTFB)</span>
+          <span class="wf-swatch"><span class="wf-box kind-live"></span>Live S2S</span>
           <span class="wf-swatch"><span class="wf-box status-error"></span>Error / Interrupted</span>
           <span style="margin-left: auto; color: #9ca3af;">Click any bar for details</span>
         </div>
@@ -535,6 +538,11 @@ defmodule MeetWeb.OctoroomDashboardPage do
 
   defp span_caption(%{kind: :tts, first_output_ms: ttfb} = span) when is_number(ttfb) do
     "#{span.label} · #{round(ttfb)} ms TTFB / #{round(span.duration_ms)} ms"
+  end
+
+  defp span_caption(%{kind: :live, meta: %{audio_ms: audio_ms}} = span)
+       when is_number(audio_ms) and audio_ms > 0 do
+    "#{span.label} · #{round(span.duration_ms)} ms (#{round(audio_ms)} ms audio)"
   end
 
   defp span_caption(%{status: status} = span) when status not in [:ok, nil] do
