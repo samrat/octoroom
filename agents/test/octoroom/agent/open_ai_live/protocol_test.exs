@@ -34,7 +34,61 @@ defmodule Octoroom.Agent.OpenAILive.ProtocolTest do
     assert minimal.session.audio.output.voice == "marin"
     refute Map.has_key?(minimal.session, :instructions)
     refute Map.has_key?(minimal.session, :delegation)
+    refute Map.has_key?(minimal.session, :idle_timeout_s)
+    refute Map.has_key?(minimal.session, :wake_policy)
     refute Map.has_key?(minimal.session, :initial_items)
+  end
+
+  test "idle_timeout_s and wake_policy can be configured and validated" do
+    %{session: session} =
+      Protocol.session_start_frame(
+        model: "gpt-live-1.1",
+        idle_timeout_s: 15,
+        wake_policy: [type: :speech, vad_threshold: 0.6]
+      )
+
+    assert session.idle_timeout_s == 15
+    assert session.wake_policy == %{type: "speech", vad_threshold: 0.6}
+
+    assert %{session: %{idle_timeout_s: 5, wake_policy: %{type: "speech"}}} =
+             Protocol.session_start_frame(
+               model: "gpt-live-1.1",
+               idle_timeout_s: 5,
+               wake_policy: :speech
+             )
+
+    assert %{session: %{idle_timeout_s: 60}} =
+             Protocol.session_start_frame(model: "gpt-live-1.1", idle_timeout_s: 60)
+
+    %{session: omitted} =
+      Protocol.session_start_frame(
+        model: "gpt-live-1.1",
+        idle_timeout_s: nil,
+        wake_policy: false
+      )
+
+    refute Map.has_key?(omitted, :idle_timeout_s)
+    refute Map.has_key?(omitted, :wake_policy)
+
+    for bad <- [0, 4, 61, 15.0, "15", :never] do
+      assert_raise ArgumentError, fn ->
+        Protocol.session_start_frame(model: "gpt-live-1.1", idle_timeout_s: bad)
+      end
+    end
+
+    for bad <- [
+          :always,
+          [type: :immediate],
+          [vad_threshold: -0.1],
+          [vad_threshold: 1.5],
+          [vad_threshold: "0.5"],
+          [unknown: 1],
+          %{type: "speech", vad_threshold: 2.0}
+        ] do
+      assert_raise ArgumentError, fn ->
+        Protocol.session_start_frame(model: "gpt-live-1.1", wake_policy: bad)
+      end
+    end
   end
 
   test "delegation supports :client, Responses delegation with merged tools, and validates options" do
@@ -199,5 +253,11 @@ defmodule Octoroom.Agent.OpenAILive.ProtocolTest do
 
     assert {:ok, [{:ack, "session.commentary.appended", _}]} =
              Protocol.decode_frame(~s({"type":"session.commentary.appended"}))
+
+    assert {:ok, [{:session_paused, %{"type" => "session.paused"}}]} =
+             Protocol.decode_frame(~s({"type":"session.paused"}))
+
+    assert {:ok, [{:session_resumed, %{"type" => "session.resumed"}}]} =
+             Protocol.decode_frame(~s({"type":"session.resumed"}))
   end
 end

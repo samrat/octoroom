@@ -11,6 +11,7 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
   @default_voice "marin"
   @default_sample_rate 24_000
   @supported_sample_rates [16_000, 24_000]
+  @idle_timeout_range 5..60
 
   def default_voice, do: @default_voice
   def default_sample_rate, do: @default_sample_rate
@@ -28,6 +29,10 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
       Responses delegation, or a raw delegation map)
     * `:tools` (`%Octoroom.Agent.Tool{}` structs or OpenAI tool maps, merged
       into Responses delegation when configured)
+    * `:idle_timeout_s` (integer in `5..60`, seconds of inactivity before
+      standby; omit or `nil` to keep inference active)
+    * `:wake_policy` (`:speech`, `[type: :speech, vad_threshold: 0.5]`, or a
+      raw wake policy map)
     * `:initial_items` (list of initial conversation item maps)
     * `:event_id` (optional client event id)
   """
@@ -45,10 +50,67 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
       }
       |> put_instructions(Keyword.get(opts, :instructions))
       |> put_delegation(Keyword.get(opts, :delegation), tools)
+      |> put_idle_timeout_s(Keyword.get(opts, :idle_timeout_s))
+      |> put_wake_policy(Keyword.get(opts, :wake_policy))
       |> put_initial_items(Keyword.get(opts, :initial_items))
 
     %{type: "session.start", session: session}
     |> maybe_put(:event_id, Keyword.get(opts, :event_id))
+  end
+
+  @doc "Validates `idle_timeout_s` (`nil` or an integer in `5..60`)."
+  def idle_timeout_s(nil), do: nil
+
+  def idle_timeout_s(seconds) when is_integer(seconds) and seconds in @idle_timeout_range,
+    do: seconds
+
+  def idle_timeout_s(other) do
+    raise ArgumentError,
+          "idle_timeout_s must be an integer between #{@idle_timeout_range.first} and #{@idle_timeout_range.last}, got: #{inspect(other)}"
+  end
+
+  @doc """
+  Builds and validates `session.wake_policy` (`nil`/`false`, `:speech`,
+  `[type: :speech, vad_threshold: 0.5]`, or a raw map).
+  """
+  def wake_policy(nil), do: nil
+  def wake_policy(false), do: nil
+  def wake_policy(type) when type in [:speech, "speech"], do: %{type: "speech"}
+
+  def wake_policy(%{type: "speech"} = map) do
+    if Map.has_key?(map, :vad_threshold), do: validate_vad_threshold!(map.vad_threshold)
+    map
+  end
+
+  def wake_policy(%{"type" => "speech"} = map) do
+    if Map.has_key?(map, "vad_threshold"), do: validate_vad_threshold!(map["vad_threshold"])
+    map
+  end
+
+  def wake_policy(opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:type, :vad_threshold])
+
+    case Keyword.get(opts, :type, :speech) do
+      type when type in [:speech, "speech"] ->
+        threshold = opts[:vad_threshold]
+        if threshold != nil, do: validate_vad_threshold!(threshold)
+        maybe_put(%{type: "speech"}, :vad_threshold, threshold)
+
+      other ->
+        raise ArgumentError, "wake_policy :type must be :speech, got: #{inspect(other)}"
+    end
+  end
+
+  def wake_policy(other) do
+    raise ArgumentError,
+          "wake_policy expects :speech, [type: :speech, vad_threshold: ...], or a map, got: #{inspect(other)}"
+  end
+
+  defp validate_vad_threshold!(value) when is_number(value) and value >= 0 and value <= 1, do: :ok
+
+  defp validate_vad_threshold!(other) do
+    raise ArgumentError,
+          "wake_policy :vad_threshold must be a number between 0 and 1, got: #{inspect(other)}"
   end
 
   @doc "Validates a PCM sample rate supported by OpenAI Live (`16_000` or `24_000`)."
@@ -234,6 +296,9 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
 
   defp events(%{"type" => "error", "error" => error}, _opts), do: [{:error, error}]
 
+  defp events(%{"type" => "session.paused"} = frame, _opts), do: [{:session_paused, frame}]
+  defp events(%{"type" => "session.resumed"} = frame, _opts), do: [{:session_resumed, frame}]
+
   defp events(%{"type" => type} = frame, _opts)
        when type in [
               "session.instructions.appended",
@@ -241,9 +306,7 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
               "session.commentary.appended",
               "session.input_audio.muted",
               "session.input_audio.unmuted",
-              "session.usage.updated",
-              "session.paused",
-              "session.resumed"
+              "session.usage.updated"
             ],
        do: [{:ack, type, frame}]
 
@@ -290,6 +353,20 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
     case delegation(config, tools) do
       nil -> session
       built -> Map.put(session, :delegation, built)
+    end
+  end
+
+  defp put_idle_timeout_s(session, value) do
+    case idle_timeout_s(value) do
+      nil -> session
+      seconds -> Map.put(session, :idle_timeout_s, seconds)
+    end
+  end
+
+  defp put_wake_policy(session, value) do
+    case wake_policy(value) do
+      nil -> session
+      policy -> Map.put(session, :wake_policy, policy)
     end
   end
 

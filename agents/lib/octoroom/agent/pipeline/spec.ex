@@ -217,12 +217,16 @@ defmodule Octoroom.Agent.Pipeline.Spec do
   which takes `opts`: `:model` (needed, such as `"gpt-live-1.1"`), `:voice`
   (default `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:sample_rate`
   (`24_000` default, or `16_000`), `:delegation` (`:client`,
-  `[model: "...", ...]`, or a delegation map), and `:initial_items`.
+  `[model: "...", ...]`, or a delegation map), `:idle_timeout_s` (`5..60`
+  seconds before standby, or `nil`), `:wake_policy` (`:speech` or
+  `[type: :speech, vad_threshold: 0.5]`), and `:initial_items`.
 
       Spec.openai_live(
         model: "gpt-live-1.1",
         voice: "marin",
-        delegation: [model: "gpt-5.4-mini"]
+        delegation: [model: "gpt-5.4-mini"],
+        idle_timeout_s: 15,
+        wake_policy: [type: :speech, vad_threshold: 0.5]
       )
   """
   def openai_live(opts) do
@@ -236,6 +240,14 @@ defmodule Octoroom.Agent.Pipeline.Spec do
 
     if Keyword.has_key?(opts, :delegation) do
       Protocol.delegation(opts[:delegation])
+    end
+
+    if Keyword.has_key?(opts, :idle_timeout_s) do
+      Protocol.idle_timeout_s(opts[:idle_timeout_s])
+    end
+
+    if Keyword.has_key?(opts, :wake_policy) do
+      Protocol.wake_policy(opts[:wake_policy])
     end
 
     {nil, processor(:openai, Octoroom.Agent.Processors.OpenAILive, opts)}

@@ -215,7 +215,30 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
     assert_received {:to_openai, {:commentary, "Greet them."}}
   end
 
+  test "forwards idle_timeout_s and wake_policy to setup and notifies pause/resume" do
+    harness =
+      processor(:openai, OpenAILive,
+        model: "gpt-live-1.1",
+        idle_timeout_s: 15,
+        wake_policy: [type: :speech, vad_threshold: 0.6],
+        send: &send(self(), {:sent, &1})
+      )
+      |> Test.start!()
+      |> live({:session_paused, %{"type" => "session.paused"}})
+      |> live({:session_resumed, %{"type" => "session.resumed"}})
+
+    assert_received {:sent, {:connect, connect}}
+    assert connect[:setup][:idle_timeout_s] == 15
+    assert connect[:setup][:wake_policy] == [type: :speech, vad_threshold: 0.6]
+    assert :session_paused in Test.notifications(harness)
+    assert :session_resumed in Test.notifications(harness)
+  end
+
   test "requires a model and validates options" do
     assert {:error, {:no_model, OpenAILive}} = OpenAILive.init([], %{})
+
+    assert_raise ArgumentError, fn ->
+      OpenAILive.init([model: "gpt-live-1.1", idle_timeout_s: 4], %{})
+    end
   end
 end

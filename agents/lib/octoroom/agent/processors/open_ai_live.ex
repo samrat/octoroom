@@ -33,10 +33,14 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   Options: `:model` (needed, such as `"gpt-live-1.1"`), `:voice` (default
   `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:sample_rate` (`24_000`
   default, or `16_000`), `:delegation` (`:client`, `[model: "...", ...]`, or a
-  delegation map), `:initial_items`, and, defaulting to the runner context's,
-  `:instructions`, `:initial_text`, `:tools` and `:context`. The socket starts
-  only under a runner; for tests, pass `send: fn message -> ... end` to capture
-  what would go to OpenAI, and feed its events with `{:openai_live_socket, event}`.
+  delegation map), `:idle_timeout_s` (`5..60` seconds before standby, or `nil`
+  to omit), `:wake_policy` (`:speech`, `[type: :speech, vad_threshold: 0.5]`,
+  or a map), `:initial_items`, and, defaulting to the runner context's,
+  `:instructions`, `:initial_text`, `:tools` and `:context`. OpenAI documents
+  `idle_timeout_s` and `wake_policy` for standby mode on WebRTC sessions.
+  The socket starts only under a runner; for tests, pass
+  `send: fn message -> ... end` to capture what would go to OpenAI, and feed
+  its events with `{:openai_live_socket, event}`.
   """
 
   use Octoroom.Agent.Processor
@@ -79,6 +83,14 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
       Protocol.delegation(delegation, tools)
     end
 
+    if Keyword.has_key?(opts, :idle_timeout_s) do
+      Protocol.idle_timeout_s(opts[:idle_timeout_s])
+    end
+
+    if Keyword.has_key?(opts, :wake_policy) do
+      Protocol.wake_policy(opts[:wake_policy])
+    end
+
     if tools != [] and delegation in [nil, false] do
       Logger.warning(
         "OpenAI Live has #{length(tools)} tool(s) but no :delegation configured; " <>
@@ -94,7 +106,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
         instructions: with_transcript(instructions, resume[:items]),
         delegation: delegation,
         tools: tools
-      ] ++ Keyword.take(opts, [:initial_items])
+      ] ++ Keyword.take(opts, [:initial_items, :idle_timeout_s, :wake_policy])
 
     state = %{
       send: Keyword.get(opts, :send),
@@ -403,6 +415,18 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
   defp event({:delegation_created, delegation}, state),
     do: {[{:notify, {:delegation, delegation}}], state}
+
+  defp event({:session_paused, _frame}, state) do
+    Logger.debug("OpenAI Live session paused (standby)")
+    state = ConversationEvents.commit(state, :user, :completed)
+    state = if state.generating?, do: commit_assistant(state, :completed), else: state
+    {[{:notify, :session_paused}], %{state | generating?: false, hearing?: false}}
+  end
+
+  defp event({:session_resumed, _frame}, state) do
+    Logger.debug("OpenAI Live session resumed")
+    {[{:notify, :session_resumed}], state}
+  end
 
   defp event({:error, error}, state) do
     Logger.warning("OpenAI Live error: #{inspect(error)}")
