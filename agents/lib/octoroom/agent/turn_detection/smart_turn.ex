@@ -11,11 +11,15 @@ defmodule Octoroom.Agent.TurnDetection.SmartTurn do
   the work and are loaded once per path, then shared between streams:
 
     * `smart_turn_features.onnx` turns the 8 s window into the Whisper log-mel
-      spectrogram the classifier expects (built by
+      spectrogram the classifier expects (bundled in `priv/models/`, built by
       `priv/models/build_smart_turn_features.py`)
     * `smart-turn-v3.2-cpu.onnx` is the int8 classifier from
-      <https://huggingface.co/pipecat-ai/smart-turn-v3>
+      <https://huggingface.co/pipecat-ai/smart-turn-v3>, downloaded and cached
+      on demand via `Octoroom.Agent.Models` (or pre-fetched with
+      `mix octoroom.models.download`)
   """
+
+  alias Octoroom.Agent.Models
 
   @sample_rate 16_000
   @window_samples 8 * @sample_rate
@@ -29,23 +33,32 @@ defmodule Octoroom.Agent.TurnDetection.SmartTurn do
   def sample_rate, do: @sample_rate
   def window_ms, do: div(@window_samples * 1_000, @sample_rate)
 
-  def default_model_path,
-    do: Application.app_dir(:octoroom_agents, "priv/models/smart-turn-v3.2-cpu.onnx")
+  def default_model_path, do: Models.path(:smart_turn)
 
   def default_features_model_path,
     do: Application.app_dir(:octoroom_agents, "priv/models/smart_turn_features.onnx")
 
   @doc """
   Loads (or reuses) the ONNX models and returns an analyzer with no audio.
+
+  When `:model_path` is not given, `Octoroom.Agent.Models.ensure(:smart_turn, opts)`
+  resolves (and downloads if missing) `smart-turn-v3.2-cpu.onnx`.
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, term()}
   def new(opts \\ []) do
-    model_path = Keyword.get(opts, :model_path) || default_model_path()
     features_path = Keyword.get(opts, :features_model_path) || default_features_model_path()
 
-    with {:ok, model} <- load_model(model_path),
+    with {:ok, model_path} <- resolve_model_path(opts),
+         {:ok, model} <- load_model(model_path),
          {:ok, features} <- load_model(features_path) do
       {:ok, %__MODULE__{model: model, features: features}}
+    end
+  end
+
+  defp resolve_model_path(opts) do
+    case Keyword.get(opts, :model_path) do
+      nil -> Models.ensure(:smart_turn, opts)
+      path -> {:ok, path}
     end
   end
 

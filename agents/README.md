@@ -167,8 +167,12 @@ config :octoroom_agents, stt_providers: [acme: MyApp.AcmeSTT], tts_providers: [a
 ## Building
 
 Silero VAD and Smart Turn run on ONNX Runtime through `onnxruntime` (which
-downloads precompiled NIFs on macOS arm64 and Linux x86_64/arm64). Octoroom's
-own WebRTC stack needs the system's libsrtp (`brew install srtp`).
+downloads precompiled NIFs on macOS arm64 and Linux x86_64/arm64). Silero VAD
+is bundled; Smart Turn's classifier (`smart-turn-v3.2-cpu.onnx`, used only when
+`stt: false`) is downloaded and SHA-256 verified on demand into the OS cache
+directory (or pre-fetched with `mix octoroom.models.download` /
+`OCTOROOM_MODELS_DIR`). Octoroom's own WebRTC stack needs the system's libsrtp
+(`brew install srtp`).
 
 ```sh
 mix deps.get
