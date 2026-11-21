@@ -1138,13 +1138,13 @@ defmodule Octoroom.Agent.WorkerTest do
     defp openai_live(ctx, event),
       do: :ok = Octoroom.Worker.send(ctx.room_id, "assistant", {:openai_live_socket, event})
 
-    test "mixes inputs and resamples 16 kHz to 24 kHz for OpenAI Live", ctx do
+    test "mixes inputs and forwards 16 kHz audio to OpenAI Live (WebRTC default)", ctx do
       %{alice: alice} = start_openai_live(ctx)
       speak(ctx, alice, 4)
 
-      assert_receive {:to_openai, {:audio, pcm}}, 1_000
-      # 20 ms at 24 kHz mono s16le = 480 samples = 960 bytes.
-      assert byte_size(pcm) == 960
+      assert_receive {:to_openai, {:audio, pcm, sample_rate: 16_000}}, 1_000
+      # 20 ms at 16 kHz mono s16le = 320 samples = 640 bytes.
+      assert byte_size(pcm) == 640
     end
 
     test "speaks what the model says, with its state and transcript", ctx do
@@ -1172,7 +1172,7 @@ defmodule Octoroom.Agent.WorkerTest do
 
     test "typed messages, prompts and restart transcript carry over", ctx do
       %{alice: alice} = start_openai_live(ctx)
-      assert_receive {:to_openai, {:connect, [setup: _]}}
+      assert_receive {:to_openai, {:connect, [transport: :webrtc, setup: _]}}
 
       Server.worker_message(alice.server, alice.id, "assistant", %{"text" => "What's up?"}, :msg)
       assert_receive {:to_openai, {:commentary, "[Alice] What's up?"}}

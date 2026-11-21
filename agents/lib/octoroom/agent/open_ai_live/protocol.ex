@@ -11,11 +11,22 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
   @default_voice "marin"
   @default_sample_rate 24_000
   @supported_sample_rates [16_000, 24_000]
+  @default_transport :webrtc
+  @supported_transports [:webrtc, :websocket]
   @idle_timeout_range 5..60
 
   def default_voice, do: @default_voice
   def default_sample_rate, do: @default_sample_rate
   def supported_sample_rates, do: @supported_sample_rates
+  def default_transport, do: @default_transport
+
+  @doc "Validates `:transport` (`:webrtc` or `:websocket`)."
+  def transport(value) when value in @supported_transports, do: value
+
+  def transport(other) do
+    raise ArgumentError,
+          "OpenAI Live :transport must be one of #{inspect(@supported_transports)}, got: #{inspect(other)}"
+  end
 
   @doc """
   The `session.start` frame, the first event sent on a primary WebSocket.
@@ -30,32 +41,52 @@ defmodule Octoroom.Agent.OpenAILive.Protocol do
     * `:tools` (`%Octoroom.Agent.Tool{}` structs or OpenAI tool maps, merged
       into Responses delegation when configured)
     * `:idle_timeout_s` (integer in `5..60`, seconds of inactivity before
-      standby; omit or `nil` to keep inference active)
+      standby; WebRTC only)
     * `:wake_policy` (`:speech`, `[type: :speech, vad_threshold: 0.5]`, or a
-      raw wake policy map)
+      raw wake policy map; WebRTC only)
     * `:initial_items` (list of initial conversation item maps)
     * `:event_id` (optional client event id)
   """
   def session_start_frame(opts) do
-    rate = sample_rate(Keyword.get(opts, :sample_rate, @default_sample_rate))
-    tools = Keyword.get(opts, :tools, [])
-
-    session =
-      %{
-        model: model_name(Keyword.fetch!(opts, :model)),
-        audio: %{
-          format: %{type: "audio/pcm", rate: rate},
-          output: %{voice: Keyword.get(opts, :voice, @default_voice)}
-        }
-      }
-      |> put_instructions(Keyword.get(opts, :instructions))
-      |> put_delegation(Keyword.get(opts, :delegation), tools)
-      |> put_idle_timeout_s(Keyword.get(opts, :idle_timeout_s))
-      |> put_wake_policy(Keyword.get(opts, :wake_policy))
-      |> put_initial_items(Keyword.get(opts, :initial_items))
+    session = session_config(opts, include_audio_format: true)
 
     %{type: "session.start", session: session}
     |> maybe_put(:event_id, Keyword.get(opts, :event_id))
+  end
+
+  @doc """
+  The JSON request body for `POST /v1/live/sessions` over WebRTC.
+
+  Omits `audio.format` because WebRTC negotiates media format in SDP.
+  """
+  def webrtc_session_request(opts, sdp) when is_binary(sdp) do
+    %{
+      session: session_config(opts, include_audio_format: false),
+      transport: %{type: "webrtc", sdp: sdp}
+    }
+  end
+
+  defp session_config(opts, include_audio_format: include_format?) do
+    tools = Keyword.get(opts, :tools, [])
+    voice = Keyword.get(opts, :voice, @default_voice)
+
+    audio =
+      if include_format? do
+        rate = sample_rate(Keyword.get(opts, :sample_rate, @default_sample_rate))
+        %{format: %{type: "audio/pcm", rate: rate}, output: %{voice: voice}}
+      else
+        %{output: %{voice: voice}}
+      end
+
+    %{
+      model: model_name(Keyword.fetch!(opts, :model)),
+      audio: audio
+    }
+    |> put_instructions(Keyword.get(opts, :instructions))
+    |> put_delegation(Keyword.get(opts, :delegation), tools)
+    |> put_idle_timeout_s(Keyword.get(opts, :idle_timeout_s))
+    |> put_wake_policy(Keyword.get(opts, :wake_policy))
+    |> put_initial_items(Keyword.get(opts, :initial_items))
   end
 
   @doc "Validates `idle_timeout_s` (`nil` or an integer in `5..60`)."

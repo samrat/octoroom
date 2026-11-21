@@ -139,6 +139,16 @@ defmodule Octoroom.Agent.Audio.PCM16 do
 
   defp emit_linear(_prev, _curr, frac, _step, acc), do: {acc, frac}
 
+  @doc "Peak absolute sample amplitude (`0..32_768`) in a mono/stereo s16le PCM binary."
+  def peak_abs(audio) when is_binary(audio), do: peak_abs(audio, 0)
+
+  defp peak_abs(<<sample::little-signed-16, rest::binary>>, peak) do
+    amp = abs(sample)
+    peak_abs(rest, if(amp > peak, do: amp, else: peak))
+  end
+
+  defp peak_abs(_trailing, peak), do: peak
+
   defp clamp_sample(sample) when sample > 32_767, do: 32_767
   defp clamp_sample(sample) when sample < -32_768, do: -32_768
   defp clamp_sample(sample), do: sample

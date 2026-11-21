@@ -24,6 +24,12 @@ defmodule Meet.OpenAI do
   end
 
   @impl true
-  def pipeline(_ctx),
-    do: Octoroom.Agent.Pipeline.Spec.openai_live(model: "gpt-live-1.1", voice: "marin")
+  def pipeline(_ctx) do
+    Octoroom.Agent.Pipeline.Spec.openai_live(
+      model: "gpt-live-1.1",
+      voice: "marin",
+      idle_timeout_s: 15,
+      wake_policy: :speech
+    )
+  end
 end

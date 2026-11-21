@@ -21,17 +21,17 @@ defmodule Meet.Room do
     {"assistant", Meet.Assistant,
      name: "Assistant", description: "A general assistant for the team."},
     {"atlas", Meet.Atlas,
-     name: "Atlas", description: "Answers questions about geography, and nothing else."}
+     name: "Atlas", description: "Answers questions about geography, and nothing else."},
     # {"gemini", Meet.Gemini,
     #  name: "Gemini",
     #  description: "A Gemini Live assistant; answers when someone says its name.",
     #  gate: nil,
     #  respond: nil},
-    # {"openai", Meet.OpenAI,
-    #  name: "OpenAI",
-    #  description: "An OpenAI Live assistant; answers when someone says its name.",
-    #  gate: nil,
-    #  respond: nil}
+    {"openai", Meet.OpenAI,
+     name: "OpenAI",
+     description: "An OpenAI Live assistant; answers when someone says its name.",
+     gate: nil,
+     respond: nil}
   ]
 
   @doc "The assistants in every call: `%{id, name}`."

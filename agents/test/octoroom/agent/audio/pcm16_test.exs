@@ -44,6 +44,13 @@ defmodule Octoroom.Agent.Audio.PCM16Test do
     assert {^raw, :st} = PCM16.resample_stream(raw, 24_000, 24_000, :st)
   end
 
+  test "peak_abs finds maximum absolute amplitude" do
+    assert PCM16.peak_abs(<<>>) == 0
+    assert PCM16.peak_abs(pcm16([0, 0, 0])) == 0
+    assert PCM16.peak_abs(pcm16([10, -500, 250])) == 500
+    assert PCM16.peak_abs(pcm16([-32_768])) == 32_768
+  end
+
   defp pcm16(samples) do
     for sample <- samples, into: <<>>, do: <<sample::little-signed-16>>
   end

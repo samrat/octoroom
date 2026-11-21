@@ -39,10 +39,11 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
 
   defp live(harness, event), do: Test.info(harness, :openai, {:openai_live_socket, event})
 
-  test "resamples input audio from 16 kHz to 24 kHz once started, mutes on pause and unmutes" do
+  test "websocket transport resamples 16 kHz to 24 kHz once started, mutes on pause and unmutes" do
     harness =
-      processor(:openai, Octoroom.Agent.Processors.OpenAILive,
+      processor(:openai, OpenAILive,
         model: "gpt-live-1.1",
+        transport: :websocket,
         send: &send(self(), {:sent, &1})
       )
       |> Test.start!()
@@ -71,6 +72,23 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
     Test.push(harness, %Frames.InputAudio{audio: frame_16k, sample_rate: 16_000})
     assert_received {:sent, :unmute}
     assert_received {:sent, {:audio, _}}
+  end
+
+  test "webrtc transport (default) forwards raw input audio with sample rate without mute timers" do
+    frame_16k = :binary.copy(<<100::little-signed-16>>, 320)
+
+    harness =
+      processor(:openai, OpenAILive,
+        model: "gpt-live-1.1",
+        send: &send(self(), {:sent, &1})
+      )
+      |> Test.start!()
+      |> live({:session_started, %{"id" => "live_1"}})
+      |> Test.push(%Frames.InputAudio{audio: frame_16k, sample_rate: 16_000})
+
+    assert_received {:sent, {:connect, [transport: :webrtc, setup: _]}}
+    assert_received {:sent, {:audio, ^frame_16k, sample_rate: 16_000}}
+    refute Test.timer_pending?(harness, :openai, :audio_end)
   end
 
   test "commits transcripts and pushes AssistantMessage when the reply settles" do

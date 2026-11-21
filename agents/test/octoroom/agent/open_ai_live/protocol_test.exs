@@ -39,6 +39,35 @@ defmodule Octoroom.Agent.OpenAILive.ProtocolTest do
     refute Map.has_key?(minimal.session, :initial_items)
   end
 
+  test "webrtc_session_request omits audio.format and wraps SDP offer" do
+    body =
+      Protocol.webrtc_session_request(
+        [
+          model: "gpt-live-1.1",
+          voice: "marin",
+          instructions: "Be brief.",
+          idle_timeout_s: 15,
+          wake_policy: :speech
+        ],
+        "v=0\r\n"
+      )
+
+    assert body == %{
+             session: %{
+               model: "gpt-live-1.1",
+               instructions: "Be brief.",
+               audio: %{output: %{voice: "marin"}},
+               idle_timeout_s: 15,
+               wake_policy: %{type: "speech"}
+             },
+             transport: %{type: "webrtc", sdp: "v=0\r\n"}
+           }
+
+    assert Protocol.transport(:webrtc) == :webrtc
+    assert Protocol.transport(:websocket) == :websocket
+    assert_raise ArgumentError, fn -> Protocol.transport(:sip) end
+  end
+
   test "idle_timeout_s and wake_policy can be configured and validated" do
     %{session: session} =
       Protocol.session_start_frame(

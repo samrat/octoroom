@@ -159,7 +159,9 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
            ]
 
     assert {nil, _} = openai_live(model: "gpt-live-1.1", delegation: :client)
-    assert {nil, _} = openai_live(model: "gpt-live-1.1", sample_rate: 16_000)
+
+    assert {nil, _} =
+             openai_live(model: "gpt-live-1.1", transport: :websocket, sample_rate: 16_000)
 
     assert {nil, back} =
              openai_live(
@@ -175,6 +177,18 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
            ]
 
     assert_raise ArgumentError, fn -> openai_live(voice: "marin") end
+
+    assert_raise ArgumentError, fn ->
+      openai_live(model: "gpt-live-1.1", transport: :sip)
+    end
+
+    assert_raise ArgumentError, fn ->
+      openai_live(model: "gpt-live-1.1", transport: :websocket, idle_timeout_s: 15)
+    end
+
+    assert_raise ArgumentError, fn ->
+      openai_live(model: "gpt-live-1.1", transport: :websocket, wake_policy: :speech)
+    end
 
     assert_raise ArgumentError, fn ->
       openai_live(model: "gpt-live-1.1", sample_rate: 8_000)

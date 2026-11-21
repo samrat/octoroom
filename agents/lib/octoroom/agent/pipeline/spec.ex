@@ -215,11 +215,12 @@ defmodule Octoroom.Agent.Pipeline.Spec do
   The pipeline of an OpenAI Live agent: no front end (the agent mixes its
   inputs) and one `:openai` stage, `Octoroom.Agent.Processors.OpenAILive`,
   which takes `opts`: `:model` (needed, such as `"gpt-live-1.1"`), `:voice`
-  (default `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:sample_rate`
-  (`24_000` default, or `16_000`), `:delegation` (`:client`,
+  (default `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:transport`
+  (`:webrtc`, the default, or `:websocket`), `:sample_rate` (`24_000` default,
+  or `16_000`; WebSocket only), `:delegation` (`:client`,
   `[model: "...", ...]`, or a delegation map), `:idle_timeout_s` (`5..60`
-  seconds before standby, or `nil`), `:wake_policy` (`:speech` or
-  `[type: :speech, vad_threshold: 0.5]`), and `:initial_items`.
+  seconds before standby, or `nil`; WebRTC only), `:wake_policy` (`:speech` or
+  `[type: :speech, vad_threshold: 0.5]`; WebRTC only), and `:initial_items`.
 
       Spec.openai_live(
         model: "gpt-live-1.1",
@@ -234,6 +235,8 @@ defmodule Octoroom.Agent.Pipeline.Spec do
 
     if not is_binary(opts[:model]), do: raise(ArgumentError, "openai_live needs a :model")
 
+    transport = Protocol.transport(Keyword.get(opts, :transport, Protocol.default_transport()))
+
     if Keyword.has_key?(opts, :sample_rate) do
       Protocol.sample_rate(opts[:sample_rate])
     end
@@ -242,12 +245,16 @@ defmodule Octoroom.Agent.Pipeline.Spec do
       Protocol.delegation(opts[:delegation])
     end
 
-    if Keyword.has_key?(opts, :idle_timeout_s) do
-      Protocol.idle_timeout_s(opts[:idle_timeout_s])
-    end
+    idle_timeout_s =
+      if Keyword.has_key?(opts, :idle_timeout_s),
+        do: Protocol.idle_timeout_s(opts[:idle_timeout_s])
 
-    if Keyword.has_key?(opts, :wake_policy) do
-      Protocol.wake_policy(opts[:wake_policy])
+    wake_policy =
+      if Keyword.has_key?(opts, :wake_policy),
+        do: Protocol.wake_policy(opts[:wake_policy])
+
+    if transport == :websocket and (idle_timeout_s != nil or wake_policy != nil) do
+      raise ArgumentError, "idle_timeout_s and wake_policy require transport: :webrtc"
     end
 
     {nil, processor(:openai, Octoroom.Agent.Processors.OpenAILive, opts)}

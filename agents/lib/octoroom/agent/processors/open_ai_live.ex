@@ -31,16 +31,16 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   unless typed.
 
   Options: `:model` (needed, such as `"gpt-live-1.1"`), `:voice` (default
-  `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:sample_rate` (`24_000`
-  default, or `16_000`), `:delegation` (`:client`, `[model: "...", ...]`, or a
+  `"marin"`), `:api_key` (default `OPENAI_API_KEY`), `:transport` (`:webrtc`,
+  the default, or `:websocket`), `:sample_rate` (`24_000` default, or `16_000`;
+  WebSocket only), `:delegation` (`:client`, `[model: "...", ...]`, or a
   delegation map), `:idle_timeout_s` (`5..60` seconds before standby, or `nil`
-  to omit), `:wake_policy` (`:speech`, `[type: :speech, vad_threshold: 0.5]`,
-  or a map), `:initial_items`, and, defaulting to the runner context's,
-  `:instructions`, `:initial_text`, `:tools` and `:context`. OpenAI documents
-  `idle_timeout_s` and `wake_policy` for standby mode on WebRTC sessions.
-  The socket starts only under a runner; for tests, pass
-  `send: fn message -> ... end` to capture what would go to OpenAI, and feed
-  its events with `{:openai_live_socket, event}`.
+  to omit; WebRTC only), `:wake_policy` (`:speech`, `[type: :speech,
+  vad_threshold: 0.5]`, or a map; WebRTC only), `:initial_items`, and,
+  defaulting to the runner context's, `:instructions`, `:initial_text`,
+  `:tools` and `:context`. The transport starts only under a runner; for tests,
+  pass `send: fn message -> ... end` to capture what would go to OpenAI, and
+  feed its events with `{:openai_live_socket, event}`.
   """
 
   use Octoroom.Agent.Processor
@@ -50,7 +50,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   alias Octoroom.Agent.Audio.PCM16
   alias Octoroom.Agent.ConversationEvents
   alias Octoroom.Agent.Frames
-  alias Octoroom.Agent.OpenAILive.{Protocol, WebSocket}
+  alias Octoroom.Agent.OpenAILive.{Protocol, WebRTC, WebSocket}
   alias Octoroom.Agent.ToolExecutor
 
   @output_sample_rate 24_000
@@ -73,6 +73,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
     tools = Keyword.get(opts, :tools, Map.get(ctx, :tools, []))
     instructions = Keyword.get(opts, :instructions, Map.get(ctx, :instructions))
     resume = Map.get(ctx, :resume) || %{}
+    transport = Protocol.transport(Keyword.get(opts, :transport, Protocol.default_transport()))
 
     sample_rate =
       Protocol.sample_rate(Keyword.get(opts, :sample_rate, Protocol.default_sample_rate()))
@@ -83,12 +84,16 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
       Protocol.delegation(delegation, tools)
     end
 
-    if Keyword.has_key?(opts, :idle_timeout_s) do
-      Protocol.idle_timeout_s(opts[:idle_timeout_s])
-    end
+    idle_timeout_s =
+      if Keyword.has_key?(opts, :idle_timeout_s),
+        do: Protocol.idle_timeout_s(opts[:idle_timeout_s])
 
-    if Keyword.has_key?(opts, :wake_policy) do
-      Protocol.wake_policy(opts[:wake_policy])
+    wake_policy =
+      if Keyword.has_key?(opts, :wake_policy),
+        do: Protocol.wake_policy(opts[:wake_policy])
+
+    if transport == :websocket and (idle_timeout_s != nil or wake_policy != nil) do
+      raise ArgumentError, "idle_timeout_s and wake_policy require transport: :webrtc"
     end
 
     if tools != [] and delegation in [nil, false] do
@@ -110,6 +115,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
     state = %{
       send: Keyword.get(opts, :send),
+      transport: transport,
       socket: nil,
       reply_to: Map.get(ctx, :runner) || self(),
       tools: tools,
@@ -138,9 +144,11 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
     case ctx do
       %{runner: runner} when is_pid(runner) and is_nil(state.send) ->
+        transport_mod = transport_module(transport)
+
         with {:ok, api_key} <- api_key(opts),
              {:ok, socket} <-
-               WebSocket.start_link(
+               transport_mod.start_link(
                  api_key: api_key,
                  parent: runner,
                  setup: setup
@@ -149,10 +157,13 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
         end
 
       _test ->
-        send_openai(state, {:connect, [setup: setup]})
+        send_openai(state, {:connect, [transport: transport, setup: setup]})
         {:ok, state}
     end
   end
+
+  defp transport_module(:webrtc), do: WebRTC
+  defp transport_module(:websocket), do: WebSocket
 
   defp api_key(opts) do
     key = Keyword.get(opts, :api_key) || System.get_env("OPENAI_API_KEY")
@@ -165,6 +176,20 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   # -- Frames from the agent --
 
   @impl true
+  def handle_frame(
+        %Frames.InputAudio{audio: audio, sample_rate: rate},
+        :downstream,
+        %{transport: :webrtc} = state
+      ) do
+    # WebRTC paces Opus RTP (with silence when idle) directly; audio can flow
+    # as soon as the peer is up, including to wake a speech-policy session.
+    if state.session_started? or state.socket != nil do
+      send_openai(state, {:audio, audio, sample_rate: rate})
+    end
+
+    {[], %{state | last_audio_at: now()}}
+  end
+
   def handle_frame(%Frames.InputAudio{audio: audio, sample_rate: rate}, :downstream, state) do
     state =
       if state.session_started? do
@@ -333,8 +358,8 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   def handle_info(_message, state), do: {[], state}
 
   @impl true
-  def terminate(_reason, %{socket: socket}) when is_pid(socket) do
-    WebSocket.close(socket)
+  def terminate(_reason, %{socket: socket, transport: transport}) when is_pid(socket) do
+    transport_module(transport).close(socket)
     :ok
   end
 
@@ -547,25 +572,34 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
   defp send_openai(%{send: send}, message) when is_function(send, 1), do: send.(message)
   defp send_openai(%{socket: nil}, _message), do: :ok
-  defp send_openai(%{socket: socket}, {:audio, audio}), do: WebSocket.send_audio(socket, audio)
-  defp send_openai(%{socket: socket}, :mute), do: WebSocket.send_mute(socket)
-  defp send_openai(%{socket: socket}, :unmute), do: WebSocket.send_unmute(socket)
 
-  defp send_openai(%{socket: socket}, {:commentary, text}),
-    do: WebSocket.send_commentary(socket, text)
+  defp send_openai(%{socket: socket, transport: :webrtc}, {:audio, audio, opts}),
+    do: WebRTC.send_audio(socket, audio, opts)
 
-  defp send_openai(%{socket: socket}, {:commentary, text, opts}),
-    do: WebSocket.send_commentary(socket, text, opts)
+  defp send_openai(%{socket: socket, transport: transport}, {:audio, audio}),
+    do: transport_module(transport).send_audio(socket, audio)
 
-  defp send_openai(%{socket: socket}, {:thinking, text, opts}),
-    do: WebSocket.send_thinking(socket, text, opts)
+  defp send_openai(%{socket: socket, transport: transport}, :mute),
+    do: transport_module(transport).send_mute(socket)
 
-  defp send_openai(%{socket: socket}, {:instructions, text, opts}),
-    do: WebSocket.send_instructions(socket, text, opts)
+  defp send_openai(%{socket: socket, transport: transport}, :unmute),
+    do: transport_module(transport).send_unmute(socket)
 
-  defp send_openai(%{socket: socket}, {:tool_output, call_id, output}),
-    do: WebSocket.send_tool_output(socket, call_id, output)
+  defp send_openai(%{socket: socket, transport: transport}, {:commentary, text}),
+    do: transport_module(transport).send_commentary(socket, text)
 
-  defp send_openai(%{socket: socket}, :response_create),
-    do: WebSocket.send_response_create(socket)
+  defp send_openai(%{socket: socket, transport: transport}, {:commentary, text, opts}),
+    do: transport_module(transport).send_commentary(socket, text, opts)
+
+  defp send_openai(%{socket: socket, transport: transport}, {:thinking, text, opts}),
+    do: transport_module(transport).send_thinking(socket, text, opts)
+
+  defp send_openai(%{socket: socket, transport: transport}, {:instructions, text, opts}),
+    do: transport_module(transport).send_instructions(socket, text, opts)
+
+  defp send_openai(%{socket: socket, transport: transport}, {:tool_output, call_id, output}),
+    do: transport_module(transport).send_tool_output(socket, call_id, output)
+
+  defp send_openai(%{socket: socket, transport: transport}, :response_create),
+    do: transport_module(transport).send_response_create(socket)
 end
