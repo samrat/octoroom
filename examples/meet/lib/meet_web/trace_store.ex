@@ -1169,6 +1169,8 @@ defmodule MeetWeb.TraceStore do
     model |> String.split("/") |> List.last() |> String.split(":") |> List.last()
   end
 
+  defp short_cf_path("/sessions/new"), do: "/sessions/new"
+
   defp short_cf_path(path) when is_binary(path) do
     path
     |> String.replace(~r|/sessions/[^/]+|, "/sessions/:id")

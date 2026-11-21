@@ -8,6 +8,205 @@ import {Socket} from "phoenix"
 let room = null
 const previews = new WeakMap() // local track => MediaStream, so previews don't flicker
 
+const AUDIO_CONSTRAINTS = {echoCancellation: true, noiseSuppression: true, autoGainControl: true}
+const VIDEO_CONSTRAINTS = {width: 1280, height: 720}
+
+// Pre-acquired lobby ("green room") media so joining skips cold getUserMedia.
+// Tracks handed to RoomClient are tracked in `handedOffTracks`, because
+// RoomClient doesn't stop tracks from a caller-provided stream.
+const lobby = {
+  stream: null,
+  promise: null,
+  generation: 0,
+  wantCamera: true,
+  mounted: false,
+  videoEl: null,
+  placeholderEl: null,
+  statusEl: null,
+}
+const handedOffTracks = new Set()
+
+const stopTracks = (tracks) => {
+  for (const t of tracks) {
+    try { t.stop() } catch {}
+  }
+}
+
+const stopHandedOff = () => {
+  stopTracks(handedOffTracks)
+  handedOffTracks.clear()
+}
+
+const liveTracks = (stream, kind) =>
+  stream ? stream.getTracks().filter((t) => t.kind === kind && t.readyState === "live") : []
+
+const renderLobbyPreview = (statusText = null) => {
+  const {videoEl, placeholderEl, statusEl, stream, wantCamera} = lobby
+  if (!videoEl || !placeholderEl) return
+  const [video] = liveTracks(stream, "video")
+  if (video && wantCamera) {
+    const media = new MediaStream([video])
+    videoEl.srcObject = media
+    videoEl.classList.remove("hidden")
+    placeholderEl.classList.add("hidden")
+    videoEl.play().catch(() => {})
+  } else {
+    videoEl.srcObject = null
+    videoEl.classList.add("hidden")
+    placeholderEl.classList.remove("hidden")
+    if (statusEl) {
+      if (statusText) statusEl.textContent = statusText
+      else if (!wantCamera) {
+        statusEl.textContent = liveTracks(stream, "audio").length > 0 ? "Camera off — mic ready" : "Camera off"
+      } else {
+        statusEl.textContent = "Preparing camera and mic…"
+      }
+    }
+  }
+}
+
+const discardLobbyStream = () => {
+  lobby.generation++
+  if (lobby.stream) {
+    stopTracks(lobby.stream.getTracks())
+    lobby.stream = null
+  }
+  lobby.promise = null
+}
+
+const warmLobbyMedia = (wantCamera) => {
+  lobby.wantCamera = wantCamera
+  if (!navigator.mediaDevices?.getUserMedia) {
+    renderLobbyPreview("Camera/mic will be requested on join")
+    return Promise.resolve(null)
+  }
+
+  // If audio is already warm, only toggle the video track.
+  if (lobby.stream && liveTracks(lobby.stream, "audio").length > 0) {
+    const videos = liveTracks(lobby.stream, "video")
+    if (!wantCamera) {
+      for (const v of videos) {
+        lobby.stream.removeTrack(v)
+        v.stop()
+      }
+      renderLobbyPreview()
+      return Promise.resolve(lobby.stream)
+    }
+    if (videos.length > 0) {
+      renderLobbyPreview()
+      return Promise.resolve(lobby.stream)
+    }
+    const gen = ++lobby.generation
+    renderLobbyPreview("Starting camera…")
+    const p = navigator.mediaDevices
+      .getUserMedia({video: VIDEO_CONSTRAINTS})
+      .then((camStream) => {
+        const [video] = camStream.getVideoTracks()
+        if (gen !== lobby.generation || !lobby.stream || !lobby.wantCamera) {
+          stopTracks(camStream.getTracks())
+          return lobby.stream
+        }
+        if (video) lobby.stream.addTrack(video)
+        renderLobbyPreview()
+        return lobby.stream
+      })
+      .catch(() => {
+        if (gen === lobby.generation) renderLobbyPreview("Camera unavailable — mic ready")
+        return lobby.stream
+      })
+      .finally(() => {
+        if (lobby.promise === p) lobby.promise = null
+      })
+    lobby.promise = p
+    return p
+  }
+
+  discardLobbyStream()
+  const gen = lobby.generation
+  renderLobbyPreview(wantCamera ? "Preparing camera and mic…" : "Preparing mic…")
+  const p = navigator.mediaDevices
+    .getUserMedia({audio: AUDIO_CONSTRAINTS, video: wantCamera ? VIDEO_CONSTRAINTS : false})
+    .then((stream) => {
+      if (gen !== lobby.generation) {
+        stopTracks(stream.getTracks())
+        return null
+      }
+      if (!lobby.wantCamera) {
+        for (const v of stream.getVideoTracks()) {
+          stream.removeTrack(v)
+          v.stop()
+        }
+      }
+      lobby.stream = stream
+      renderLobbyPreview()
+      return stream
+    })
+    .catch(() => {
+      if (gen === lobby.generation) renderLobbyPreview("Camera/mic will be requested on join")
+      return null
+    })
+    .finally(() => {
+      if (lobby.promise === p) lobby.promise = null
+    })
+  lobby.promise = p
+  return p
+}
+
+// Claims the pre-acquired lobby MediaStream if it matches the join's camera
+// choice, returning null to let RoomClient call getUserMedia itself otherwise.
+const takeLobbyStream = async (camera) => {
+  if (lobby.promise) await lobby.promise
+  let stream = lobby.stream
+  if (!stream || liveTracks(stream, "audio").length === 0) return null
+
+  if (!camera) {
+    for (const v of stream.getVideoTracks()) {
+      stream.removeTrack(v)
+      v.stop()
+    }
+  } else if (liveTracks(stream, "video").length === 0) {
+    // User asked for camera, but lobby only has audio: let RoomClient open both.
+    discardLobbyStream()
+    return null
+  }
+
+  // Hand off ownership of these tracks to the call lifecycle.
+  lobby.stream = null
+  lobby.generation++
+  if (lobby.videoEl) lobby.videoEl.srcObject = null
+  for (const t of stream.getTracks()) handedOffTracks.add(t)
+  return stream
+}
+
+export const LobbyPreview = {
+  mounted() {
+    lobby.mounted = true
+    lobby.videoEl = this.el.querySelector("[data-preview-video]")
+    lobby.placeholderEl = this.el.querySelector("[data-preview-placeholder]")
+    lobby.statusEl = this.el.querySelector("[data-preview-status]")
+
+    const form = this.el.closest(".card-body")?.querySelector("#join-form")
+    const checkbox = form?.querySelector('input[type="checkbox"][name="camera"]')
+    const wantCamera = checkbox ? checkbox.checked : true
+    this.onCameraToggle = (e) => warmLobbyMedia(e.target.checked)
+    checkbox?.addEventListener("change", this.onCameraToggle)
+    this.checkbox = checkbox
+
+    warmLobbyMedia(wantCamera)
+  },
+
+  destroyed() {
+    this.checkbox?.removeEventListener("change", this.onCameraToggle)
+    lobby.mounted = false
+    lobby.videoEl = null
+    lobby.placeholderEl = null
+    lobby.statusEl = null
+    // If we left the lobby without handing the stream to a room (e.g. navigated
+    // away), release the hardware devices.
+    if (lobby.stream) discardLobbyStream()
+  },
+}
+
 const mediaChanged = () => window.dispatchEvent(new Event("meet:media"))
 
 // The <video> for a participant's camera or screen.
@@ -81,14 +280,17 @@ export const Call = {
   async join(name, camera) {
     try { localStorage.setItem("meet:name", name) } catch {}
 
+    const stream = await takeLobbyStream(camera)
+
     // Handlers use this client, not `room`: "left" clears `room` before the
     // client's last "state" event (idle) arrives.
     const client = new RoomClient({
       socket: this.socket,
       topic: `room:${this.el.dataset.room}`,
       params: {name},
-      audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
-      video: camera ? {width: 1280, height: 720} : false,
+      stream,
+      audio: AUDIO_CONSTRAINTS,
+      video: camera ? VIDEO_CONSTRAINTS : false,
     })
     room = client
     client.on("state", (state) => this.pushEvent("client", {state, participant_id: client.participantId}))
@@ -97,6 +299,7 @@ export const Call = {
     client.on("error", (error) => console.error("octoroom:", error))
     client.on("left", () => {
       clearInterval(this.meters)
+      stopHandedOff()
       if (room === client) room = null
     })
 
@@ -106,13 +309,22 @@ export const Call = {
     } catch (error) {
       console.error("couldn't join:", error)
       this.pushEvent("client", {state: "idle"})
+      if (lobby.mounted) warmLobbyMedia(lobby.wantCamera)
     }
   },
 
   async toggleCamera() {
     if (!room) return
-    if (room.localTracks().camera) await room.stop("camera")
-    else await room.startCamera({width: 1280, height: 720}).catch((e) => console.error(e))
+    const existing = room.localTracks().camera?.track
+    if (existing) {
+      await room.stop("camera")
+      if (handedOffTracks.has(existing)) {
+        existing.stop()
+        handedOffTracks.delete(existing)
+      }
+    } else {
+      await room.startCamera(VIDEO_CONSTRAINTS).catch((e) => console.error(e))
+    }
   },
 
   async toggleScreen() {
@@ -150,6 +362,8 @@ export const Call = {
 
   destroyed() {
     room?.leave()
+    stopHandedOff()
+    discardLobbyStream()
     this.socket.disconnect()
   },
 }

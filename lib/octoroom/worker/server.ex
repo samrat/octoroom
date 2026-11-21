@@ -56,12 +56,18 @@ defmodule Octoroom.Worker.Server do
       outputs: spec.outputs,
       data: Map.get(spec, :data, []),
       prev: %{},
-      user: nil
+      user: nil,
+      initialized: false
     }
 
-    case module.init(spec.args, ctx) do
-      {:stop, reason} -> {:stop, reason}
-      result -> {:ok, handle_result(result, state)}
+    {:ok, state, {:continue, {:init, spec.args, ctx}}}
+  end
+
+  @impl true
+  def handle_continue({:init, args, ctx}, state) do
+    case state.module.init(args, ctx) do
+      {:stop, reason} -> {:stop, reason, state}
+      result -> {:noreply, handle_result(result, state)}
     end
   end
 
@@ -91,15 +97,16 @@ defmodule Octoroom.Worker.Server do
   def handle_info(message, state), do: {:noreply, user_info(message, state)}
 
   @impl true
+  def terminate(_reason, %{initialized: false}), do: :ok
   def terminate(reason, %{user: user, module: module}), do: module.terminate(reason, user)
 
   defp user_info(message, state),
     do: state.module.handle_info(message, state.user) |> handle_result(state)
 
-  defp handle_result({:ok, user}, state), do: %{state | user: user}
+  defp handle_result({:ok, user}, state), do: %{state | user: user, initialized: true}
 
   defp handle_result({:ok, user, actions}, state),
-    do: Enum.reduce(actions, %{state | user: user}, &action/2)
+    do: Enum.reduce(actions, %{state | user: user, initialized: true}, &action/2)
 
   defp handle_result(other, state) do
     raise ArgumentError,

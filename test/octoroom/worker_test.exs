@@ -512,4 +512,192 @@ defmodule Octoroom.WorkerTest do
     assert_receive {:octoroom, _, {:error, {:worker, "doomed"}, _reason}}, 1_000
     refute_receive {:octoroom, _, {:error, _, _}}, 100
   end
+
+  defmodule SlowWorker do
+    use Octoroom.Worker
+
+    @impl true
+    def init(%{test: test}, ctx) do
+      send(test, {:slow_init_started, ctx.id, self()})
+
+      receive do
+        :finish_init -> :ok
+      end
+
+      send(test, {:slow_init_done, ctx.id})
+      {:ok, test}
+    end
+
+    @impl true
+    def handle_audio(_input, _pcm, state), do: {:ok, state}
+
+    @impl true
+    def handle_info({:ping, from}, state) do
+      send(from, :pong)
+      {:ok, state}
+    end
+  end
+
+  defmodule SlowWorkerRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def workers(%{participants: []}), do: []
+
+    def workers(%{participants: [first | _]}) do
+      [
+        worker("slow-1", Octoroom.WorkerTest.SlowWorker,
+          outputs: ["slow-1"],
+          args: %{test: first.meta.test}
+        ),
+        worker("slow-2", Octoroom.WorkerTest.SlowWorker,
+          outputs: ["slow-2"],
+          args: %{test: first.meta.test}
+        )
+      ]
+    end
+  end
+
+  test "slow worker init runs asynchronously via handle_continue and does not block join", ctx do
+    alice = join(ctx, "alice", SlowWorkerRoom)
+    assert is_binary(alice.id)
+
+    # Both workers start initializing concurrently after join already returned.
+    assert_receive {:slow_init_started, "slow-1", pid1}
+    assert_receive {:slow_init_started, "slow-2", pid2}
+
+    # Messages sent before init completes are processed only after init finishes.
+    send(pid1, {:ping, self()})
+    refute_receive :pong, 30
+
+    send(pid1, :finish_init)
+    send(pid2, :finish_init)
+    assert_receive {:slow_init_done, "slow-1"}
+    assert_receive {:slow_init_done, "slow-2"}
+    assert_receive :pong
+  end
+
+  defmodule GatedPeerMedia do
+    @behaviour Octoroom.Peer.Media
+
+    alias Octoroom.Test.FakePeerMedia
+
+    @impl true
+    def init(%{cloudflare: %{gate: gate}} = opts) do
+      {:ok, inner} = FakePeerMedia.init(opts)
+      {:ok, %{inner: inner, gate: gate, signalled: false}}
+    end
+
+    @impl true
+    def session_created(s, id), do: %{s | inner: FakePeerMedia.session_created(s.inner, id)}
+
+    @impl true
+    def offer_sendonly(s, n) do
+      {:ok, sdp, slots, inner} = FakePeerMedia.offer_sendonly(s.inner, n)
+      {:ok, sdp, slots, %{s | inner: inner}}
+    end
+
+    @impl true
+    def apply_answer(s, _sdp) do
+      if not s.signalled, do: send(s.gate, {:peer_ready_to_connect, self()})
+      {:ok, %{s | signalled: true}}
+    end
+
+    @impl true
+    def answer_offer(s, sdp) do
+      {:ok, ans, refs, inner} = FakePeerMedia.answer_offer(s.inner, sdp)
+      {:ok, ans, refs, %{s | inner: inner}}
+    end
+
+    @impl true
+    def renegotiated(s), do: s
+
+    @impl true
+    def stop_and_offer(s, mids) do
+      {:ok, sdp, inner} = FakePeerMedia.stop_and_offer(s.inner, mids)
+      {:ok, sdp, %{s | inner: inner}}
+    end
+
+    @impl true
+    def handle_info(:connect_now, s), do: {:connected, s}
+
+    def handle_info(msg, s) do
+      case FakePeerMedia.handle_info(msg, s.inner) do
+        {:ignore, inner} -> {:ignore, %{s | inner: inner}}
+        other -> other
+      end
+    end
+
+    @impl true
+    def close(s), do: FakePeerMedia.close(s.inner)
+  end
+
+  defmodule MultiWorkerRoom do
+    use Octoroom.Room
+
+    @impl true
+    def join(_params, _socket), do: {:ok, %{}}
+
+    @impl true
+    def workers(%{participants: []}), do: []
+
+    def workers(%{participants: [first | _]}) do
+      for id <- ["w1", "w2"] do
+        worker(id, Octoroom.WorkerTest.Echo, outputs: [id], args: %{test: first.meta.test})
+      end
+    end
+  end
+
+  test "staggered worker outlets coalesce into a single batched pull", ctx do
+    cf = Map.put(FakeCloudflare.config(ctx.fake), :gate, self())
+
+    opts = [
+      cloudflare: cf,
+      signal_timeout: 1_000,
+      peer_media: GatedPeerMedia,
+      pull_coalesce_ms: 200
+    ]
+
+    alice =
+      Client.join("alice", MultiWorkerRoom, ctx.room_id, %{name: "alice", test: self()}, opts)
+      |> then(&publish(ctx, &1))
+
+    assert_receive {:peer_ready_to_connect, peer1}
+    assert_receive {:peer_ready_to_connect, peer2}
+
+    # First outlet goes live: server holds pull briefly since the second outlet is still pending.
+    send(peer1, :connect_now)
+    refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 30
+
+    # Second outlet goes live: server immediately fires ONE batched pull for both tracks.
+    send(peer2, :connect_now)
+    added = accept_pull(alice, 100)
+    assert Enum.map(added, & &1.track) |> Enum.sort() == ["w1", "w2"]
+    refute_receive {:client, "alice", {:octoroom_signal, :renegotiate, _}}, 50
+  end
+
+  test "coalesced pull still fires after pull_coalesce_ms when another outlet stalls", ctx do
+    cf = Map.put(FakeCloudflare.config(ctx.fake), :gate, self())
+
+    opts = [
+      cloudflare: cf,
+      signal_timeout: 1_000,
+      peer_media: GatedPeerMedia,
+      pull_coalesce_ms: 50
+    ]
+
+    alice =
+      Client.join("alice", MultiWorkerRoom, ctx.room_id, %{name: "alice", test: self()}, opts)
+      |> then(&publish(ctx, &1))
+
+    assert_receive {:peer_ready_to_connect, peer1}
+    assert_receive {:peer_ready_to_connect, _peer2}
+
+    # Only peer1 connects; peer2 stalls. Pull should fire once the 50 ms cap expires.
+    send(peer1, :connect_now)
+    assert [%{track: _}] = accept_pull(alice, 300)
+  end
 end

@@ -425,6 +425,28 @@ defmodule MeetWeb.RoomLive do
             Ready to join?
             <:subtitle>{who_is_here(@participants)}</:subtitle>
           </.header>
+          <div
+            id="lobby-preview"
+            phx-hook="LobbyPreview"
+            phx-update="ignore"
+            class="relative aspect-video overflow-hidden rounded-xl bg-base-200"
+          >
+            <video
+              data-preview-video
+              class="hidden size-full -scale-x-100 object-cover"
+              autoplay
+              playsinline
+              muted
+            >
+            </video>
+            <div
+              data-preview-placeholder
+              class="flex size-full flex-col items-center justify-center gap-2 text-sm opacity-60"
+            >
+              <.icon name="hero-video-camera" class="size-8" />
+              <span data-preview-status>Preparing camera and mic…</span>
+            </div>
+          </div>
           <.form for={@form} id="join-form" phx-submit="join">
             <.input field={@form[:name]} label="Your name" placeholder="Ada" autocomplete="off" />
             <.input field={@form[:camera]} type="checkbox" label="Join with camera" />

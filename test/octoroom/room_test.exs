@@ -423,10 +423,85 @@ defmodule Octoroom.RoomTest do
   end
 
   test "a failed publish is reported", ctx do
-    FakeCloudflare.fail_next(ctx.fake, :new_session, :boom)
     alice = join(ctx, "alice")
+    assert_receive {:cloudflare, :new_session, []}
+    FakeCloudflare.fail_next(ctx.fake, :push_tracks, :boom)
     Server.publish(alice.server, alice.id, "offer", %{"mic" => "0"}, :pub)
     assert_receive {:client, "alice", {:octoroom_signal, :reply, :pub, {:error, :boom}}}
+  end
+
+  test "joining pre-creates the participant's Cloudflare session before publish", ctx do
+    alice = join(ctx, "alice")
+    assert_receive {:cloudflare, :new_session, []}
+    # Synchronize so the server has processed the pre-created session result.
+    _ = Octoroom.Room.state(ctx.room_id)
+
+    alice = publish(ctx, alice)
+    assert_receive {:cloudflare, :push_tracks, [session, "offer:alice", _]}
+    assert session == alice.session
+    refute_received {:cloudflare, :new_session, []}
+  end
+
+  test "a transient session pre-creation failure falls back to creating on publish", ctx do
+    FakeCloudflare.fail_next(ctx.fake, :new_session, :transient)
+    alice = join(ctx, "alice")
+    assert_receive {:cloudflare, :new_session, []}
+    _ = Octoroom.Room.state(ctx.room_id)
+
+    alice = publish(ctx, alice)
+    assert_receive {:cloudflare, :new_session, []}
+    assert is_binary(alice.session)
+  end
+
+  test "a publish arriving while session pre-creation is in flight waits for it", ctx do
+    defmodule GatedSessionCF do
+      @behaviour Octoroom.Cloudflare
+      def new_session(%{gate: gate, inner: inner}) do
+        send(gate, {:new_session_started, self()})
+
+        receive do
+          {:release, :ok} -> FakeCloudflare.new_session(inner)
+          {:release, {:error, reason}} -> {:error, reason}
+        end
+      end
+
+      def push_tracks(%{inner: inner}, s, o, t), do: FakeCloudflare.push_tracks(inner, s, o, t)
+      def pull_tracks(%{inner: inner}, s, t), do: FakeCloudflare.pull_tracks(inner, s, t)
+      def renegotiate(%{inner: inner}, s, a), do: FakeCloudflare.renegotiate(inner, s, a)
+      def close_tracks(%{inner: inner}, s, m, o), do: FakeCloudflare.close_tracks(inner, s, m, o)
+      def session_state(%{inner: inner}, s), do: FakeCloudflare.session_state(inner, s)
+    end
+
+    gated_opts = [
+      cloudflare: %{client: GatedSessionCF, gate: self(), inner: FakeCloudflare.config(ctx.fake)},
+      signal_timeout: 500
+    ]
+
+    alice = Client.join("alice", GroupRoom, ctx.room_id, %{name: "alice"}, gated_opts)
+    assert_receive {:new_session_started, task_pid}
+
+    # Publish arrives before new_session finishes: should wait, not start a second new_session.
+    Server.publish(alice.server, alice.id, "offer:alice", %{"mic" => "0"}, :pub)
+    _ = Octoroom.Room.state(ctx.room_id)
+    refute_received {:new_session_started, _}
+
+    send(task_pid, {:release, :ok})
+
+    assert_receive {:client, "alice",
+                    {:octoroom_signal, :reply, :pub, {:ok, %{sdp: "answer:" <> _}}}}
+
+    # If the in-flight pre-creation fails while publish is waiting, publish gets the error.
+    bob = Client.join("bob", GroupRoom, ctx.room_id, %{name: "bob"}, gated_opts)
+    assert_receive {:new_session_started, bob_task}
+    Server.publish(bob.server, bob.id, "offer:bob", %{"mic" => "0"}, :pub_bob)
+    _ = Octoroom.Room.state(ctx.room_id)
+    send(bob_task, {:release, {:error, :boom}})
+    assert_receive {:client, "bob", {:octoroom_signal, :reply, :pub_bob, {:error, :boom}}}
+  end
+
+  test "listen-only participants don't pre-create a Cloudflare session", ctx do
+    _viewer = join(ctx, "viewer", GroupRoom, %{name: "viewer", publish: []})
+    refute_receive {:cloudflare, :new_session, []}, 50
   end
 
   test "the room stops when its last participant leaves", ctx do

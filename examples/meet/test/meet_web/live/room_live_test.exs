@@ -9,9 +9,11 @@ defmodule MeetWeb.RoomLiveTest do
   test "shows the lobby until the browser has joined", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/r/test")
     assert has_element?(view, "#join-form")
+    assert has_element?(view, "#lobby-preview")
 
     render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
     refute has_element?(view, "#join-form")
+    refute has_element?(view, "#lobby-preview")
     assert has_element?(view, "#transcript-panel")
   end
 

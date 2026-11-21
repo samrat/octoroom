@@ -65,6 +65,9 @@ defmodule Octoroom.Room.Server do
   @heartbeat_ms 5_000
   # A worker that ran this long before crashing starts its backoff afresh.
   @worker_stable_ms 30_000
+  # Max wait to batch a participant's pull when other desired worker outlets
+  # are still connecting (avoids splitting simultaneous outlets into serial pulls).
+  @pull_coalesce_ms 150
 
   ## API (called by a participant's process)
 
@@ -229,6 +232,7 @@ defmodule Octoroom.Room.Server do
        buckets: %{},
        # Failures back off retry_base_ms * 2^n: 0.5 s, 1 s, 2 s, ...
        retry_base_ms: Keyword.get(opts, :retry_base_ms, 250),
+       pull_coalesce_ms: Keyword.get(opts, :pull_coalesce_ms, @pull_coalesce_ms),
        # The peer connection under workers' peers (`Octoroom.Peer.Media`).
        peer_media: Keyword.get(opts, :peer_media, Octoroom.Peer.WebRTC),
        participants: %{},
@@ -262,7 +266,7 @@ defmodule Octoroom.Room.Server do
   def handle_call({:join, pid, meta}, _from, state) do
     if meta?(meta) do
       p = new_participant(new_id(), meta, pid)
-      state = add_participant(state, p)
+      state = state |> add_participant(p) |> prepare_session(p)
       :telemetry.execute([:octoroom, :participant, :join], %{}, %{room_id: state.id, id: p.id})
       # The participant can't hear or be heard yet, but workers may follow it.
       {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
@@ -302,7 +306,7 @@ defmodule Octoroom.Room.Server do
       # Never published: nothing to adopt, so it starts over.
       nil when session_id == nil ->
         p = new_participant(id, meta, pid)
-        state = add_participant(state, p)
+        state = state |> add_participant(p) |> prepare_session(p)
         :telemetry.execute([:octoroom, :participant, :join], %{}, meta_)
         {:reply, {:ok, join_reply(state, p, false)}, reconcile(state)}
 
@@ -474,14 +478,41 @@ defmodule Octoroom.Room.Server do
 
             p = %{p | timeline: %{joined: p.timeline.joined, publish: now_ms()}}
 
-            run(state, id, :publish, fn ->
-              with {:ok, session} <- Cloudflare.new_session(cf),
-                   {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
-                {:ok, session, answer}
-              end
-            end)
+            case p.prepared_session do
+              {:ready, session} ->
+                run(state, id, :publish, fn ->
+                  with {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
+                    {:ok, session, answer}
+                  end
+                end)
 
-            put_p(state, %{p | media: :publishing, publish_tag: tag, publishing: mids})
+                put_p(state, %{
+                  p
+                  | media: :publishing,
+                    publish_tag: tag,
+                    publishing: mids,
+                    prepared_session: nil
+                })
+
+              {:creating, _ref} ->
+                put_p(state, %{
+                  p
+                  | media: :publishing,
+                    publish_tag: tag,
+                    publishing: mids,
+                    pending_publish: %{sdp: sdp, tracks: tracks}
+                })
+
+              nil ->
+                run(state, id, :publish, fn ->
+                  with {:ok, session} <- Cloudflare.new_session(cf),
+                       {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
+                    {:ok, session, answer}
+                  end
+                end)
+
+                put_p(state, %{p | media: :publishing, publish_tag: tag, publishing: mids})
+            end
 
           {:error, reason} ->
             reply(p, tag, {:error, reason})
@@ -666,6 +697,16 @@ defmodule Octoroom.Room.Server do
 
   def handle_info(:retry, state), do: {:noreply, reconcile(%{state | retry: nil})}
 
+  def handle_info({:pull_ready, id, ref}, state) do
+    case state.participants[id] do
+      %{pull_defer: {:waiting, {^ref, _timer}}} = p ->
+        {:noreply, state |> put_p(%{p | pull_defer: :ready}) |> reconcile()}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:disconnect_expired, id, ref}, state) do
     case state.participants[id] do
       %{disconnected: ^ref} -> remove(state, id, :left)
@@ -801,6 +842,56 @@ defmodule Octoroom.Room.Server do
 
   ## Results of Cloudflare calls
 
+  defp handle_result(
+         state,
+         %{prepared_session: {:creating, ref}} = p,
+         {:prepare_session, ref},
+         {:ok, session}
+       ) do
+    case p do
+      %{media: :publishing, pending_publish: %{sdp: sdp, tracks: tracks}} ->
+        cf = state.cloudflare
+
+        run(state, p.id, :publish, fn ->
+          with {:ok, %{sdp: answer}} <- Cloudflare.push_tracks(cf, session, sdp, tracks) do
+            {:ok, session, answer}
+          end
+        end)
+
+        {:noreply, put_p(state, %{p | prepared_session: nil, pending_publish: nil})}
+
+      %{media: :none} ->
+        {:noreply, put_p(state, %{p | prepared_session: {:ready, session}})}
+
+      _ ->
+        {:noreply, put_p(state, %{p | prepared_session: nil})}
+    end
+  end
+
+  defp handle_result(
+         state,
+         %{prepared_session: {:creating, ref}, media: :publishing, pending_publish: %{}} = p,
+         {:prepare_session, ref},
+         {:error, reason}
+       ) do
+    handle_result(
+      state,
+      %{p | prepared_session: nil, pending_publish: nil},
+      :publish,
+      {:error, reason}
+    )
+  end
+
+  defp handle_result(
+         state,
+         %{prepared_session: {:creating, ref}} = p,
+         {:prepare_session, ref},
+         {:error, _reason}
+       ) do
+    # Pre-creation failed before publish arrived: fall back to creating on publish.
+    {:noreply, put_p(state, %{p | prepared_session: nil})}
+  end
+
   defp handle_result(state, p, :publish, {:ok, session, answer}) do
     reply(p, p.publish_tag, {:ok, %{sdp: answer}})
 
@@ -885,7 +976,16 @@ defmodule Octoroom.Room.Server do
   defp handle_result(state, p, :publish, {:error, reason}) do
     Logger.warning("Octoroom publish failed for #{p.id}: #{inspect(reason)}")
     reply(p, p.publish_tag, {:error, reason})
-    {:noreply, put_p(state, %{p | media: :none, publish_tag: nil, publishing: %{}})}
+
+    {:noreply,
+     put_p(state, %{
+       p
+       | media: :none,
+         publish_tag: nil,
+         publishing: %{},
+         pending_publish: nil,
+         prepared_session: nil
+     })}
   end
 
   defp handle_result(state, %{op: %{id: op_id} = op} = p, {:pushed, op_id}, result) do
@@ -1090,19 +1190,23 @@ defmodule Octoroom.Room.Server do
     }
 
     ops = Reconciler.diff(desired, actual) |> Enum.group_by(&elem(&1, 1))
-    requesting = for {id, %{requests: [_ | _]}} <- state.participants, do: id
+
+    pending =
+      for {id, p} <- state.participants,
+          p.requests != [] or p.pull_defer != nil,
+          do: id
 
     state =
-      (Map.keys(ops) ++ requesting)
+      (Map.keys(ops) ++ pending)
       |> Enum.uniq()
       |> Enum.reduce(state, fn id, state ->
-        apply_ops(state, state.participants[id], Map.get(ops, id, []))
+        apply_ops(state, state.participants[id], Map.get(ops, id, []), Map.get(desired, id, []))
       end)
 
     state |> sync_seen() |> schedule_retry()
   end
 
-  defp apply_ops(state, p, ops) do
+  defp apply_ops(state, p, ops, desired_tracks) do
     # Gain changes are client-side only, so they don't wait for the queue.
     p =
       Enum.reduce(ops, p, fn
@@ -1124,13 +1228,55 @@ defmodule Octoroom.Room.Server do
     request = ready_request(state, p)
 
     cond do
-      p.op != nil -> put_p(state, p)
-      request != nil -> start_request(state, p, request)
-      closes != [] -> start_close(state, p, closes)
-      opens != [] -> start_pull(state, p, opens)
-      true -> put_p(state, p)
+      p.op != nil -> put_p(state, cancel_pull_defer(p))
+      request != nil -> start_request(state, cancel_pull_defer(p), request)
+      closes != [] -> start_close(state, cancel_pull_defer(p), closes)
+      opens != [] -> maybe_start_pull(state, p, opens, desired_tracks)
+      true -> put_p(state, cancel_pull_defer(p))
     end
   end
+
+  # When multiple worker outlets start together on a fresh room join, they
+  # finish connecting milliseconds apart. Holding the pull briefly until
+  # the other desired outlets go live (capped at `pull_coalesce_ms`) lets
+  # them go in one batched Cloudflare pull instead of serial round-trips.
+  defp maybe_start_pull(state, p, opens, desired_tracks) do
+    cond do
+      state.pull_coalesce_ms <= 0 or p.pull_defer == :ready ->
+        start_pull(state, %{p | pull_defer: nil}, opens)
+
+      waiting_for_outlets?(state, p, desired_tracks) ->
+        case p.pull_defer do
+          {:waiting, _} ->
+            put_p(state, p)
+
+          nil ->
+            ref = make_ref()
+            timer = Process.send_after(self(), {:pull_ready, p.id, ref}, state.pull_coalesce_ms)
+            put_p(state, %{p | pull_defer: {:waiting, {ref, timer}}})
+        end
+
+      true ->
+        start_pull(state, cancel_pull_defer(p), opens)
+    end
+  end
+
+  defp waiting_for_outlets?(state, p, desired_tracks) do
+    Enum.any?(desired_tracks, fn track ->
+      name = track_name(track)
+
+      not Map.has_key?(p.subs, name) and
+        match?(%{status: status} when status in [:creating, :pending], state.outlets[name])
+    end)
+  end
+
+  defp cancel_pull_defer(%{pull_defer: {:waiting, {_ref, timer}}} = p) do
+    cancel(timer)
+    %{p | pull_defer: nil}
+  end
+
+  defp cancel_pull_defer(%{pull_defer: :ready} = p), do: %{p | pull_defer: nil}
+  defp cancel_pull_defer(p), do: p
 
   # The participant's oldest publish or unpublish, once it can start. An
   # unpublish waits for everyone's pulls of the track to close first.
@@ -1948,6 +2094,7 @@ defmodule Octoroom.Room.Server do
       {p, participants} ->
         if p.monitor, do: Process.demonitor(p.monitor, [:flush])
         cancel(p.disconnected)
+        cancel_pull_defer(p)
         if p.op, do: cancel(p.op.timer)
         if p.op, do: reply(p, Map.get(p.op, :request_tag), {:error, reason})
         if p.publish_tag, do: reply(p, p.publish_tag, {:error, reason})
@@ -1990,6 +2137,11 @@ defmodule Octoroom.Room.Server do
       pid: pid,
       monitor: Process.monitor(pid),
       session_id: nil,
+      # Pre-created Cloudflare session started on join, so `publish` skips a
+      # round trip: nil, {:creating, ref}, or {:ready, session_id}.
+      prepared_session: nil,
+      # A `publish` that arrived while `prepared_session` was still creating.
+      pending_publish: nil,
       # Its session: :none, :publishing (creating it), :adopting (after a
       # restart), :pending (published, not yet connected) or :live.
       media: :none,
@@ -2004,6 +2156,9 @@ defmodule Octoroom.Room.Server do
       # Names of the data outputs it's subscribed to (see `Room.worker/3`).
       data_subs: MapSet.new(),
       op: nil,
+      # Deferral state while waiting for peer outlets to finish connecting:
+      # nil, {:waiting, {ref, timer}}, or :ready.
+      pull_defer: nil,
       # The grace timer while its connection is down.
       disconnected: nil,
       # When each step of its join happened (monotonic ms), for telemetry:
@@ -2132,10 +2287,14 @@ defmodule Octoroom.Room.Server do
     if p.op, do: reply(p, Map.get(p.op, :request_tag), {:error, :republishing})
     for {_, _, tag} <- p.requests, do: reply(p, tag, {:error, :republishing})
 
+    p = cancel_pull_defer(p)
+
     p = %{
       p
       | media: :none,
         session_id: nil,
+        prepared_session: nil,
+        pending_publish: nil,
         tracks: %{},
         requests: [],
         subs: %{},
@@ -2144,8 +2303,23 @@ defmodule Octoroom.Room.Server do
 
     signal(p, :republish, %{reason: reason})
     signal(p, :resume, resume_data(p))
-    {:noreply, state |> put_p(p) |> reconcile()}
+    {:noreply, state |> put_p(p) |> prepare_session(p) |> reconcile()}
   end
+
+  # Pre-creates the participant's Cloudflare session in the background so
+  # `POST /sessions/new` overlaps with the client's getUserMedia + offer.
+  defp prepare_session(state, %{media: :none, prepared_session: nil} = p) do
+    if publish_list(p.meta) in [[], :invalid] do
+      state
+    else
+      ref = make_ref()
+      cf = state.cloudflare
+      run(state, p.id, {:prepare_session, ref}, fn -> Cloudflare.new_session(cf) end)
+      put_p(state, %{p | prepared_session: {:creating, ref}})
+    end
+  end
+
+  defp prepare_session(state, _p), do: state
 
   defp track_infos(state, p, names) do
     for name <- Enum.sort(names) do

@@ -354,6 +354,8 @@ defmodule MeetWeb.TraceStoreTest do
     assert :cloudflare in kinds
     assert :peer in kinds
     assert :pull in kinds
+    cf_span = Enum.find(join.spans, &(&1.kind == :cloudflare))
+    assert cf_span.label == "CF POST /sessions/new"
 
     # Smoke-test rendering both dashboard tabs without runtime template errors.
     snapshot = TraceStore.snapshot()
