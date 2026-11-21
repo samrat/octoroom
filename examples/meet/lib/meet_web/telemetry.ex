@@ -11,7 +11,9 @@ defmodule MeetWeb.Telemetry do
     children = [
       # Telemetry poller will execute the given period measurements
       # every 10_000ms. Learn more here: https://hexdocs.pm/telemetry_metrics
-      {:telemetry_poller, measurements: periodic_measurements(), period: 10_000}
+      {:telemetry_poller, measurements: periodic_measurements(), period: 10_000},
+      {MeetWeb.MetricsStorage, metrics()},
+      MeetWeb.TraceStore
       # Add reporters as children of your supervision tree.
       # {Telemetry.Metrics.ConsoleReporter, metrics: metrics()}
     ]
@@ -21,6 +23,98 @@ defmodule MeetWeb.Telemetry do
 
   def metrics do
     [
+      # Octoroom Agent Metrics (shown alongside Octoroom room metrics under ?nav=octoroom)
+      summary("octoroom_agent.turn.latency.transcript_ms",
+        tags: [:agent_id],
+        unit: :millisecond,
+        reporter_options: [nav: :octoroom],
+        description: "Speech end to turn reaching the back end"
+      ),
+      summary("octoroom_agent.turn.latency.llm_ms",
+        tags: [:agent_id],
+        unit: :millisecond,
+        reporter_options: [nav: :octoroom],
+        description: "Speech end to first LLM text"
+      ),
+      summary("octoroom_agent.turn.latency.audio_ms",
+        tags: [:agent_id],
+        unit: :millisecond,
+        reporter_options: [nav: :octoroom],
+        description: "Speech end to first audio handed to the outlet"
+      ),
+      summary("octoroom_agent.processor.async.stop.first_output_duration",
+        tags: [:agent_id, :processor],
+        unit: {:native, :millisecond},
+        reporter_options: [nav: :octoroom],
+        description: "Time to first output (TTFT for LLM, TTFB for TTS)"
+      ),
+      summary("octoroom_agent.processor.async.stop.duration",
+        tags: [:agent_id, :processor, :task, :status],
+        unit: {:native, :millisecond},
+        reporter_options: [nav: :octoroom],
+        description: "Total async stage duration"
+      ),
+      counter("octoroom_agent.processor.async.stop.count",
+        event_name: [:octoroom_agent, :processor, :async, :stop],
+        measurement: :duration,
+        tags: [:agent_id, :processor, :task, :status],
+        reporter_options: [nav: :octoroom],
+        description: "Completed async stages by status"
+      ),
+      counter("octoroom_agent.processor.async.exception.count",
+        event_name: [:octoroom_agent, :processor, :async, :exception],
+        measurement: :duration,
+        tags: [:agent_id, :processor, :task],
+        reporter_options: [nav: :octoroom],
+        description: "Crashed async stages"
+      ),
+      summary("octoroom_agent.tool.call.stop.duration",
+        tags: [:agent_id, :tool, :result],
+        unit: {:native, :millisecond},
+        reporter_options: [nav: :octoroom],
+        description: "Tool handler duration"
+      ),
+      counter("octoroom_agent.pipeline.interruption.count",
+        event_name: [:octoroom_agent, :pipeline, :interruption],
+        measurement: :killed_tasks,
+        tags: [:agent_id],
+        reporter_options: [nav: :octoroom],
+        description: "Pipeline interruptions"
+      ),
+
+      # Octoroom Room & WebRTC Metrics
+      summary("octoroom.participant.connected.duration_ms",
+        unit: :millisecond,
+        description: "Participant join to media connected"
+      ),
+      summary("octoroom.participant.first_pull.since_connected_ms",
+        unit: :millisecond,
+        description: "Connected to first remote track pulled"
+      ),
+      summary("octoroom.outlet.live.duration_ms",
+        tags: [:worker_id],
+        unit: :millisecond,
+        description: "Outlet start to first RTP packet sent"
+      ),
+      summary("octoroom.cloudflare.request.duration_ms",
+        tags: [:method, :result],
+        unit: :millisecond,
+        description: "Cloudflare Realtime SFU HTTP request duration"
+      ),
+      summary("octoroom.peer.connect.duration_ms",
+        tags: [:worker_id],
+        unit: :millisecond,
+        description: "Worker WebRTC peer connection time to Cloudflare"
+      ),
+      summary("octoroom.pull.stop.duration_ms",
+        unit: :millisecond,
+        description: "Batched track pull round-trip"
+      ),
+      counter("octoroom.failure.count",
+        tags: [:name, :given_up],
+        description: "Retried or abandoned room/worker failures"
+      ),
+
       # Phoenix Metrics
       summary("phoenix.endpoint.start.system_time",
         unit: {:native, :millisecond}

@@ -21,6 +21,21 @@ defmodule MeetWeb.Router do
     live "/r/:room", RoomLive
   end
 
+  if Application.compile_env(:meet, :dev_routes) do
+    import Phoenix.LiveDashboard.Router
+
+    scope "/dev" do
+      pipe_through :browser
+
+      live_dashboard "/dashboard",
+        metrics: MeetWeb.Telemetry,
+        metrics_history: {MeetWeb.MetricsStorage, :metrics_history, []},
+        additional_pages: [
+          octoroom: MeetWeb.OctoroomDashboardPage
+        ]
+    end
+  end
+
   # Other scopes may use custom stacks.
   # scope "/api", MeetWeb do
   #   pipe_through :api

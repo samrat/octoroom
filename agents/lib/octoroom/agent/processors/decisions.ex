@@ -297,14 +297,31 @@ defmodule Octoroom.Agent.Processors.Decisions do
 
   defp eval_task(seq, pcm, state) do
     wav = AudioTurn.wav(pcm, @sample_rate)
-    timing = %{audio_ms: AudioTurn.duration_ms(pcm, @sample_rate)}
-    timed_task(seq, state.evaluate, wav, Map.put(timing, :questions_id, state.questions_id))
+    audio_ms = AudioTurn.duration_ms(pcm, @sample_rate)
+    timing = %{audio_ms: audio_ms, questions_id: state.questions_id}
+
+    meta = %{
+      model: state.opts[:model],
+      modality: :audio,
+      audio_ms: audio_ms,
+      questions_id: state.questions_id
+    }
+
+    timed_task(seq, state.evaluate, wav, timing, meta)
   end
 
-  defp text_task(seq, text, state),
-    do: timed_task(seq, state.evaluate, text, %{questions_id: state.questions_id})
+  defp text_task(seq, text, state) do
+    meta = %{
+      model: state.opts[:model],
+      modality: :transcript,
+      chars: String.length(text),
+      questions_id: state.questions_id
+    }
 
-  defp timed_task(seq, evaluate, input, timing) do
+    timed_task(seq, state.evaluate, text, %{questions_id: state.questions_id}, meta)
+  end
+
+  defp timed_task(seq, evaluate, input, timing, meta) do
     task = fn _emit ->
       {micros, result} = :timer.tc(fn -> evaluate.(input) end)
 
@@ -314,7 +331,7 @@ defmodule Octoroom.Agent.Processors.Decisions do
       end
     end
 
-    {:async, {:evaluate, seq}, task}
+    {:async, {:evaluate, seq}, task, meta}
   end
 
   defp hand_off(%{rec: %{eval: eval} = rec} = state, turn_id) when eval != nil do

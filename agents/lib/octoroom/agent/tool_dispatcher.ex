@@ -12,9 +12,26 @@ defmodule Octoroom.Agent.ToolDispatcher do
   end
 
   defp handle_call(%{name: name} = call, tools, context) do
-    tools
-    |> Enum.find(&(&1.name == name))
-    |> dispatch(call, context)
+    meta = %{
+      room_id: Map.get(context, :room_id),
+      agent_id: Map.get(context, :agent_id),
+      tool: name,
+      call_id: Map.get(call, :id)
+    }
+
+    tool = Enum.find(tools, &(&1.name == name))
+
+    :telemetry.span([:octoroom_agent, :tool, :call], meta, fn ->
+      {{response, _event}, _context} = result = dispatch(tool, call, context)
+      outcome = tool_outcome(tool, response)
+      {result, Map.put(meta, :result, outcome)}
+    end)
+  end
+
+  defp tool_outcome(nil, _response), do: :unknown
+
+  defp tool_outcome(_tool, response) do
+    if get_in(response, [:response, :result]) == "error", do: :error, else: :ok
   end
 
   defp dispatch(%Tool{handler: {module, function}}, call, context) do

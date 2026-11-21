@@ -22,12 +22,15 @@ defmodule Octoroom.Agent.Processors.Transcriber do
 
   @impl true
   def init(opts, _ctx) do
-    case {Keyword.get(opts, :transcribe), Keyword.get(opts, :model)} do
+    model = Keyword.get(opts, :model)
+
+    case {Keyword.get(opts, :transcribe), model} do
       {transcribe, _model} when is_function(transcribe, 2) ->
-        {:ok, %{transcribe: transcribe}}
+        {:ok, %{transcribe: transcribe, model: model}}
 
       {nil, model} when is_binary(model) ->
-        {:ok, %{transcribe: fn pcm, rate -> AudioTurn.transcribe(pcm, rate, model) end}}
+        {:ok,
+         %{transcribe: fn pcm, rate -> AudioTurn.transcribe(pcm, rate, model) end, model: model}}
 
       _neither ->
         {:error, {:no_model, __MODULE__}}
@@ -38,7 +41,14 @@ defmodule Octoroom.Agent.Processors.Transcriber do
   def handle_frame(%Frames.UserAudio{} = frame, :downstream, state) do
     transcribe = state.transcribe
     task = fn _emit -> transcribe.(frame.audio, frame.sample_rate) end
-    {[{:push, frame, :downstream}, {:async, {:transcribe, frame.turn_id}, task}], state}
+
+    meta = %{
+      model: state.model,
+      turn_id: frame.turn_id,
+      audio_ms: audio_ms(frame.audio, frame.sample_rate)
+    }
+
+    {[{:push, frame, :downstream}, {:async, {:transcribe, frame.turn_id}, task, meta}], state}
   end
 
   def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
@@ -55,4 +65,9 @@ defmodule Octoroom.Agent.Processors.Transcriber do
     Logger.warning("AUDIO_TURN event=transcript_failed turn=#{turn_id} reason=#{inspect(reason)}")
     {[], state}
   end
+
+  defp audio_ms(pcm, rate) when is_binary(pcm) and is_integer(rate) and rate > 0,
+    do: div(byte_size(pcm) * 1_000, rate * 2)
+
+  defp audio_ms(_pcm, _rate), do: nil
 end

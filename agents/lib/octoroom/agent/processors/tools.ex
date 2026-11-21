@@ -101,8 +101,15 @@ defmodule Octoroom.Agent.Processors.Tools do
 
     {progress_message, progress} = progress
 
+    meta = %{
+      provider: frame.provider,
+      sync_tools: Enum.map(sync_calls, & &1.name),
+      async_tools: Enum.map(async_calls, & &1.name),
+      call_count: length(frame.calls)
+    }
+
     {:keep_state, %{data | tool_round?: true, progress_message: progress_message},
-     [{:push, frame, :downstream}, {:async, {:run, frame}, run}] ++ progress}
+     [{:push, frame, :downstream}, {:async, {:run, frame}, run, meta}] ++ progress}
   end
 
   # A blocking round finished.

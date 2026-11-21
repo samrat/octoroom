@@ -31,10 +31,13 @@ defmodule Octoroom.Agent.Processors.TTS do
     {synthesize, opts} = Keyword.pop(opts, :synthesize)
     {chunk_timeout_ms, opts} = Keyword.pop(opts, :chunk_timeout_ms, @chunk_timeout_ms)
 
-    with {:ok, synthesize} <- synthesizer(synthesize, opts) do
+    with {:ok, synthesize, info} <- synthesizer(synthesize, opts) do
       {:ok,
        %{
          synthesize: synthesize,
+         provider: info.provider,
+         model: info.model,
+         voice: info.voice,
          chunk_timeout_ms: chunk_timeout_ms,
          speaking?: false,
          started?: false,
@@ -44,7 +47,8 @@ defmodule Octoroom.Agent.Processors.TTS do
     end
   end
 
-  defp synthesizer(synthesize, _opts) when is_function(synthesize, 2), do: {:ok, synthesize}
+  defp synthesizer(synthesize, opts) when is_function(synthesize, 2),
+    do: {:ok, synthesize, %{provider: nil, model: opts[:model], voice: opts[:voice]}}
 
   defp synthesizer(nil, opts) do
     {rate, opts} = Keyword.pop(opts, :output_sample_rate)
@@ -52,8 +56,20 @@ defmodule Octoroom.Agent.Processors.TTS do
 
     with {:ok, module, opts} <- TTS.resolve(opts),
          {:ok, opts} <- TTS.connect(module, opts) do
-      {:ok, fn text, on_audio -> TTS.stream_with(module, text, on_audio, opts) end}
+      info = %{
+        provider: provider_name(module),
+        model: Keyword.get(opts, :model),
+        voice: Keyword.get(opts, :voice)
+      }
+
+      {:ok, fn text, on_audio -> TTS.stream_with(module, text, on_audio, opts) end, info}
     end
+  end
+
+  defp provider_name(module) do
+    Enum.find_value(TTS.providers(), module, fn {name, provider} ->
+      if provider == module, do: name
+    end)
   end
 
   defp put_present(opts, _key, nil), do: opts
@@ -115,10 +131,17 @@ defmodule Octoroom.Agent.Processors.TTS do
 
     started = if state.started?, do: [], else: [{:push, %Frames.TTSStarted{}, :downstream}]
 
+    meta = %{
+      provider: state.provider,
+      model: state.model,
+      voice: state.voice,
+      chars: String.length(text)
+    }
+
     {started ++
        [
          {:push, %Frames.TTSText{text: text}, :downstream},
-         {:async, :speak, task},
+         {:async, :speak, task, meta},
          {:timer, :chunk_timeout, state.chunk_timeout_ms}
        ], %{state | speaking?: true, started?: true}}
   end

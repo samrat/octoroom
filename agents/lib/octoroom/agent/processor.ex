@@ -7,8 +7,10 @@ defmodule Octoroom.Agent.Processor do
 
     * `{:push, frame, :downstream | :upstream}` - send a frame to the next or
       previous stage
-    * `{:async, key, fun}` - run `fun.(emit)` in a task owned by the runner.
-      Each `emit.(message)` arrives as `handle_async(key, message, state)`;
+    * `{:async, key, fun}` or `{:async, key, fun, meta}` - run `fun.(emit)`
+      in a task owned by the runner. Optional `meta` (a map) is merged into
+      the task's `[:octoroom_agent, :processor, :async, ...]` telemetry
+      metadata. Each `emit.(message)` arrives as `handle_async(key, message, state)`;
       the return value arrives as `{:done, result}` and a crash as
       `{:failed, reason}`, so emitted messages must not have those shapes
       (wrap them). Starting a key that is running replaces the old
@@ -48,6 +50,7 @@ defmodule Octoroom.Agent.Processor do
   @type effect ::
           {:push, struct(), direction()}
           | {:async, key :: term(), (emit :: (term() -> :ok) -> term())}
+          | {:async, key :: term(), (emit :: (term() -> :ok) -> term()), meta :: map()}
           | {:cancel, key :: term()}
           | {:timer, key :: term(), ms :: non_neg_integer()}
           | {:cancel_timer, key :: term()}

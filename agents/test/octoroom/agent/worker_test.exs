@@ -5,7 +5,7 @@ defmodule Octoroom.Agent.WorkerTest do
 
   import Octoroom.Agent.Pipeline.Spec
 
-  alias Octoroom.Agent.{Frames, Processors}
+  alias Octoroom.Agent.{Frames, Processors, Telemetry}
   alias Octoroom.Room.Server
   alias Octoroom.Test.{Client, FakeCloudflare, FakePeerMedia}
 
@@ -285,6 +285,119 @@ defmodule Octoroom.Agent.WorkerTest do
     # The reply goes out on the agent's track as 20 ms room frames.
     assert_receive {:ingest, ^cf, frame}, 1_000
     assert byte_size(frame) == 3_840
+  end
+
+  test "emits structured telemetry for async stages and turn latency", ctx do
+    test = self()
+    room_id = ctx.room_id
+    handler = {__MODULE__, room_id, make_ref()}
+
+    :telemetry.attach_many(
+      handler,
+      Telemetry.events(),
+      fn event, measurements, meta, _ ->
+        if meta[:room_id] == room_id, do: send(test, {:telemetry, event, measurements, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    %{alice: alice} = start(ctx)
+    say(ctx, alice, {:final, "Hi!"})
+
+    assert_receive {:telemetry, [:octoroom_agent, :turn, :decided], %{speech_to_decided_ms: _},
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      speaker: "Alice",
+                      text: "Hi!",
+                      outcome: :reply
+                    }},
+                   1_000
+
+    assert_receive {:telemetry, [:octoroom_agent, :processor, :async, :start], _,
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      processor: :llm,
+                      task: :reply,
+                      turn_id: turn_id
+                    }},
+                   1_000
+
+    assert is_integer(turn_id)
+
+    assert_receive {:telemetry, [:octoroom_agent, :processor, :async, :first_output],
+                    %{duration: ttft},
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      processor: :llm,
+                      task: :reply,
+                      turn_id: ^turn_id,
+                      frame: Frames.LLMText
+                    }},
+                   1_000
+
+    assert_receive {:telemetry, [:octoroom_agent, :processor, :async, :stop],
+                    %{duration: llm_dur, first_output_duration: ^ttft, outputs: llm_out},
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      processor: :llm,
+                      task: :reply,
+                      turn_id: ^turn_id,
+                      status: :ok
+                    }},
+                   1_000
+
+    assert llm_dur >= ttft and llm_out > 0
+
+    assert_receive {:telemetry, [:octoroom_agent, :processor, :async, :first_output],
+                    %{duration: ttfb},
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      processor: :tts,
+                      task: :speak,
+                      turn_id: ^turn_id,
+                      frame: Frames.OutputAudio
+                    }},
+                   1_000
+
+    assert_receive {:telemetry, [:octoroom_agent, :processor, :async, :stop],
+                    %{duration: tts_dur, first_output_duration: ^ttfb, outputs: tts_out},
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      processor: :tts,
+                      task: :speak,
+                      turn_id: ^turn_id,
+                      status: :ok
+                    }},
+                   1_000
+
+    assert tts_dur >= ttfb and tts_out > 0
+
+    assert_receive {:telemetry, [:octoroom_agent, :turn, :latency],
+                    %{
+                      transcript_ms: t,
+                      llm_ms: l,
+                      audio_ms: a,
+                      wait_ms: 0,
+                      processing_ms: p,
+                      stt_and_decision_ms: _
+                    },
+                    %{
+                      room_id: ^room_id,
+                      agent_id: "assistant",
+                      turn_id: ^turn_id,
+                      speaker: "Alice"
+                    }},
+                   1_000
+
+    assert t >= 0 and l >= t and a >= l and p == a
   end
 
   test "a restarted agent carries on the conversation, and apps can read it", ctx do

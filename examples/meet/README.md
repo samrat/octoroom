@@ -64,7 +64,9 @@ mix setup
 mix phx.server
 ```
 
-Open <http://localhost:4000> (or `/r/<name>` for another room). Use
+Open <http://localhost:4000> (or `/r/<name>` for another room). Live
+turn and join waterfalls are at <http://localhost:4000/dev/dashboard/octoroom>,
+and time-series metrics are at <http://localhost:4000/dev/dashboard/metrics?nav=octoroom>. Use
 headphones: the assistants' voices leaking into your mic sound like you.
 Building needs the system's libsrtp (`brew install srtp`); see the
 [Octoroom README](../../README.md).

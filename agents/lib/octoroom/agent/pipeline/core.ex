@@ -88,10 +88,11 @@ defmodule Octoroom.Agent.Pipeline.Core do
         telemetry: Map.get(ctx, :telemetry, %{})
       }
 
-      :telemetry.execute([:octoroom_agent, :pipeline, :init], %{stages: length(stages)}, %{
-        metadata: core.telemetry,
-        stages: Enum.map(stages, & &1.name)
-      })
+      :telemetry.execute(
+        [:octoroom_agent, :pipeline, :init],
+        %{stages: length(stages)},
+        base_meta(core, %{stages: Enum.map(stages, & &1.name)})
+      )
 
       {:ok, core}
     end
@@ -149,14 +150,23 @@ defmodule Octoroom.Agent.Pipeline.Core do
   @spec async_message(t(), term(), term()) :: {[command()], t()}
   def async_message(%__MODULE__{} = core, {index, key, _n} = id, message) do
     case Map.get(core.tasks, {index, key}) do
-      %{id: ^id} ->
+      %{id: ^id} = task ->
         run(core, fn core ->
-          core =
-            if match?({:done, _}, message) or match?({:failed, _}, message),
-              do: %{core | tasks: Map.delete(core.tasks, {index, key})},
-              else: core
+          case message do
+            {:done, result} ->
+              core = %{core | tasks: Map.delete(core.tasks, {index, key})}
+              async_stop(task, done_status(result))
+              call(core, index, :handle_async, [key, message])
 
-          call(core, index, :handle_async, [key, message])
+            {:failed, reason} ->
+              core = %{core | tasks: Map.delete(core.tasks, {index, key})}
+              async_exception(task, reason)
+              call(core, index, :handle_async, [key, message])
+
+            _streaming ->
+              on_effects = &record_async_output(&1, {index, key}, id, &2)
+              call(core, index, :handle_async, [key, message], on_effects)
+          end
         end)
 
       _unknown ->
@@ -217,6 +227,11 @@ defmodule Octoroom.Agent.Pipeline.Core do
   @spec observe(t(), Enumerable.t()) :: t()
   def observe(%__MODULE__{} = core, modules), do: %{core | observed: MapSet.new(modules)}
 
+  @doc "Sets a key in the telemetry metadata carried on every event emitted by this core."
+  @spec put_telemetry(t(), atom(), term()) :: t()
+  def put_telemetry(%__MODULE__{} = core, key, value),
+    do: %{core | telemetry: Map.put(core.telemetry, key, value)}
+
   @doc "Calls every processor's `terminate/2` and returns the cleanup commands."
   @spec terminate(t(), term()) :: [command()]
   def terminate(%__MODULE__{} = core, reason) do
@@ -227,6 +242,8 @@ defmodule Octoroom.Agent.Pipeline.Core do
         error -> Logger.warning("#{inspect(stage.name)} terminate failed: #{inspect(error)}")
       end
     end
+
+    for {_key, task} <- core.tasks, do: async_stop(task, {:terminated, reason})
 
     Enum.map(core.tasks, fn {_key, task} -> {:kill_task, task.id} end) ++
       Enum.map(core.timers, fn {_key, id} -> {:cancel_timer, id} end)
@@ -343,7 +360,7 @@ defmodule Octoroom.Agent.Pipeline.Core do
 
   # -- Callbacks and effects --
 
-  defp call(core, index, fun, args) do
+  defp call(core, index, fun, args, on_effects \\ nil) do
     stage = elem(core.stages, index)
     trace? = fun == :handle_frame and hd(args).__struct__ not in @untraced
     meta = if trace?, do: trace_start(core, stage, hd(args))
@@ -378,6 +395,7 @@ defmodule Octoroom.Agent.Pipeline.Core do
       end
 
     core = %{core | stages: put_elem(core.stages, index, %{stage | state: state})}
+    core = if on_effects, do: on_effects.(core, effects), else: core
     Enum.reduce(effects, core, &effect(&2, index, &1))
   end
 
@@ -385,11 +403,25 @@ defmodule Octoroom.Agent.Pipeline.Core do
        when is_struct(frame) and direction in [:downstream, :upstream],
        do: route(core, index, frame, direction)
 
-  defp effect(core, index, {:async, key, fun}) when is_function(fun, 1) do
+  defp effect(core, index, {:async, key, fun}) when is_function(fun, 1),
+    do: effect(core, index, {:async, key, fun, %{}})
+
+  defp effect(core, index, {:async, key, fun, extra_meta})
+       when is_function(fun, 1) and is_map(extra_meta) do
     core = effect(core, index, {:cancel, key})
     {id, core} = new_id(core, index, key)
     keep? = core.current != nil and Frame.uninterruptible?(core.current)
-    task = %{id: id, keep?: keep?}
+    stage = elem(core.stages, index)
+    {started, meta} = async_start(core, stage, id, key, keep?, extra_meta)
+
+    task = %{
+      id: id,
+      keep?: keep?,
+      started: started,
+      first_output_at: nil,
+      outputs: 0,
+      meta: meta
+    }
 
     %{core | tasks: Map.put(core.tasks, {index, key}, task)}
     |> command({:start_task, id, fun})
@@ -397,8 +429,12 @@ defmodule Octoroom.Agent.Pipeline.Core do
 
   defp effect(core, index, {:cancel, key}) do
     case Map.pop(core.tasks, {index, key}) do
-      {nil, _tasks} -> core
-      {task, tasks} -> command(%{core | tasks: tasks}, {:kill_task, task.id})
+      {nil, _tasks} ->
+        core
+
+      {task, tasks} ->
+        async_stop(task, :cancelled)
+        command(%{core | tasks: tasks}, {:kill_task, task.id})
     end
   end
 
@@ -451,7 +487,10 @@ defmodule Octoroom.Agent.Pipeline.Core do
     {kept, killed} = Enum.split_with(core.tasks, fn {_key, task} -> task.keep? end)
 
     core =
-      Enum.reduce(killed, core, fn {_key, task}, core -> command(core, {:kill_task, task.id}) end)
+      Enum.reduce(killed, core, fn {_key, task}, core ->
+        async_stop(task, :interrupted)
+        command(core, {:kill_task, task.id})
+      end)
 
     # System frames live in their own queue, which an interruption keeps.
     queue =
@@ -460,7 +499,7 @@ defmodule Octoroom.Agent.Pipeline.Core do
     :telemetry.execute(
       [:octoroom_agent, :pipeline, :interruption],
       %{killed_tasks: length(killed), dropped_frames: :queue.len(core.queue) - :queue.len(queue)},
-      %{metadata: core.telemetry, generation: generation}
+      base_meta(core, %{generation: generation})
     )
 
     core =
@@ -479,19 +518,25 @@ defmodule Octoroom.Agent.Pipeline.Core do
 
   # -- Telemetry --
 
+  defp base_meta(core, extra) do
+    core.telemetry
+    |> Map.put(:metadata, core.telemetry)
+    |> Map.merge(extra)
+  end
+
   defp trace_start(core, stage, %module{}) do
-    meta = %{
-      metadata: core.telemetry,
-      processor: stage.name,
-      frame: module,
-      generation: core.generation
-    }
+    meta =
+      base_meta(core, %{
+        processor: stage.name,
+        frame: module,
+        generation: core.generation
+      })
 
     start = System.monotonic_time()
 
     :telemetry.execute(
       [:octoroom_agent, :processor, :frame, :start],
-      %{system_time: System.system_time()},
+      %{system_time: System.system_time(), monotonic_time: start},
       meta
     )
 
@@ -499,18 +544,140 @@ defmodule Octoroom.Agent.Pipeline.Core do
   end
 
   defp trace_stop({start, meta}) do
+    now = System.monotonic_time()
+
     :telemetry.execute(
       [:octoroom_agent, :processor, :frame, :stop],
-      %{duration: System.monotonic_time() - start},
+      %{duration: now - start, monotonic_time: now},
       meta
     )
   end
 
   defp trace_exception({start, meta}, error) do
+    now = System.monotonic_time()
+
     :telemetry.execute(
       [:octoroom_agent, :processor, :frame, :exception],
-      %{duration: System.monotonic_time() - start},
+      %{duration: now - start, monotonic_time: now},
       Map.merge(meta, %{kind: :error, reason: error})
     )
   end
+
+  defp async_start(core, stage, id, key, keep?, extra_meta) do
+    started = System.monotonic_time()
+
+    reserved = %{
+      metadata: core.telemetry,
+      processor: stage.name,
+      module: stage.module,
+      task: task_kind(key),
+      key: key,
+      task_id: id,
+      generation: core.generation,
+      uninterruptible: keep?
+    }
+
+    trigger =
+      case core.current do
+        %module{} -> %{trigger: module}
+        _ -> %{}
+      end
+
+    meta =
+      extra_meta
+      |> Map.merge(trigger)
+      |> Map.merge(core.telemetry)
+      |> Map.merge(reserved)
+
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :start],
+      %{system_time: System.system_time(), monotonic_time: started},
+      meta
+    )
+
+    {started, meta}
+  end
+
+  defp record_async_output(core, task_key, id, effects) do
+    pushed = for {:push, frame, _direction} <- effects, do: frame
+
+    case {pushed, Map.get(core.tasks, task_key)} do
+      {[_ | _], %{id: ^id} = task} ->
+        task =
+          if task.first_output_at == nil do
+            now = System.monotonic_time()
+
+            :telemetry.execute(
+              [:octoroom_agent, :processor, :async, :first_output],
+              %{duration: now - task.started, monotonic_time: now},
+              Map.put(task.meta, :frame, hd(pushed).__struct__)
+            )
+
+            %{task | first_output_at: now, outputs: task.outputs + length(pushed)}
+          else
+            %{task | outputs: task.outputs + length(pushed)}
+          end
+
+        %{core | tasks: Map.put(core.tasks, task_key, task)}
+
+      _ ->
+        core
+    end
+  end
+
+  defp async_stop(task, outcome) do
+    now = System.monotonic_time()
+
+    measurements =
+      %{duration: now - task.started, monotonic_time: now, outputs: task.outputs}
+      |> maybe_put_first_output(task)
+
+    extra =
+      case outcome do
+        {:error, reason} -> %{status: :error, reason: reason}
+        {:terminated, reason} -> %{status: :terminated, reason: reason}
+        status when is_atom(status) -> %{status: status}
+      end
+
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :stop],
+      measurements,
+      Map.merge(task.meta, extra)
+    )
+  end
+
+  defp async_exception(task, reason) do
+    now = System.monotonic_time()
+
+    measurements =
+      %{duration: now - task.started, monotonic_time: now, outputs: task.outputs}
+      |> maybe_put_first_output(task)
+
+    {kind, err_reason} =
+      case reason do
+        {kind, err} when kind in [:error, :exit, :throw] -> {kind, err}
+        other -> {:error, other}
+      end
+
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :exception],
+      measurements,
+      Map.merge(task.meta, %{kind: kind, reason: err_reason})
+    )
+  end
+
+  defp maybe_put_first_output(measurements, %{first_output_at: nil}), do: measurements
+
+  defp maybe_put_first_output(measurements, %{first_output_at: at, started: started}),
+    do: Map.put(measurements, :first_output_duration, at - started)
+
+  defp done_status({:error, reason}), do: {:error, reason}
+  defp done_status(_result), do: :ok
+
+  defp task_kind(key) when is_atom(key), do: key
+
+  defp task_kind(key) when is_tuple(key) and tuple_size(key) > 0 and is_atom(elem(key, 0)),
+    do: elem(key, 0)
+
+  defp task_kind(_key), do: :async
 end

@@ -31,6 +31,7 @@ defmodule Octoroom.Agent.Processors.LLM do
       {:ok,
        %{
          provider: Map.get(opts, :provider),
+         model: Map.get(opts, :model),
          request: request,
          stream?: Map.get(opts, :stream, true),
          tool_call_seen?: false,
@@ -78,11 +79,20 @@ defmodule Octoroom.Agent.Processors.LLM do
   @impl true
   def handle_frame(%Frames.LLMContext{messages: messages, tools: tools}, :downstream, state) do
     request = state.request
-    opts = [input: messages, tools: tools || [], stream: state.stream?]
+    tools = tools || []
+    opts = [input: messages, tools: tools, stream: state.stream?]
+
+    meta = %{
+      provider: state.provider,
+      model: state.model,
+      stream: state.stream?,
+      message_count: length(messages),
+      tool_count: length(tools)
+    }
 
     {[
        {:push, %Frames.LLMResponseStart{}, :downstream},
-       {:async, :reply, fn emit -> request.(opts, wrap(emit)) end}
+       {:async, :reply, fn emit -> request.(opts, wrap(emit)) end, meta}
      ], %{state | tool_call_seen?: false, spoke?: false}}
   end
 

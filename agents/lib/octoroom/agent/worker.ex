@@ -477,8 +477,22 @@ defmodule Octoroom.Agent.Worker do
 
   # A held turn's wait ran out with nobody else speaking: answer it.
   def handle_info({:octoroom_agent_floor, ref}, %{waiting: %{ref: ref} = w} = state) do
+    wait_ms = max(now() - w.waited_from, 0)
+    emit_floor_wait(state, w, wait_ms, :replied)
     actions = [emit: {:agent, {:waiting, nil}}]
-    {state, actions} = commit(w.input, w.name, w.frame, true, %{state | waiting: nil}, actions)
+
+    {state, actions} =
+      commit(
+        w.input,
+        w.name,
+        w.frame,
+        true,
+        %{state | waiting: nil},
+        actions,
+        wait_ms: wait_ms,
+        decided_at: w.decided_at
+      )
+
     result(state, actions)
   end
 
@@ -952,6 +966,7 @@ defmodule Octoroom.Agent.Worker do
     {name, state} = speaker(input, state)
     {state, actions} = end_wait(state, actions)
     {outcome, why} = outcome(input, frame, state)
+    decided_at = now()
 
     event = %{
       source: input,
@@ -962,29 +977,40 @@ defmodule Octoroom.Agent.Worker do
       decision: frame.decision
     }
 
+    emit_turn_decided(state, event, decided_at)
     actions = actions ++ [emit: {:agent, {:decision, event}}]
 
     case outcome do
-      :reply -> commit(input, name, frame, true, state, actions)
+      :reply -> commit(input, name, frame, true, state, actions, decided_at: decided_at)
       :listen -> commit(input, name, frame, false, state, actions)
-      :wait -> wait(input, name, frame, state, actions)
+      :wait -> wait(input, name, frame, decided_at, state, actions)
     end
   end
 
   # Into the back end, as a reply-starting turn or as history.
-  defp commit(input, name, frame, respond?, state, actions) do
+  defp commit(input, name, frame, respond?, state, actions, opts \\ []) do
     seq = state.seq + 1
 
     {state, actions} =
       if respond? do
-        speech_end = Map.get(state.vad_stop, input, now())
+        committed_at = now()
+        speech_end = Map.get(state.vad_stop, input, committed_at)
+        decided_at = Keyword.get(opts, :decided_at, committed_at)
+        wait_ms = Keyword.get(opts, :wait_ms, 0)
 
         state = %{
           state
           | addressee: input,
             addressee_name: name,
             last_reply: nil,
-            turn: %{speech_end: speech_end, transcript: now()}
+            back: %{state.back | core: Core.put_telemetry(state.back.core, :turn_id, seq)},
+            turn: %{
+              id: seq,
+              speech_end: speech_end,
+              decided_at: decided_at,
+              transcript: committed_at,
+              wait_ms: wait_ms
+            }
         }
 
         # Any follow-up window is used up: a reply is on its way.
@@ -1000,11 +1026,20 @@ defmodule Octoroom.Agent.Worker do
   end
 
   # Unsure: hold the turn for `wait_ms`. If nobody speaks, answer it.
-  defp wait(input, name, frame, state, actions) do
+  defp wait(input, name, frame, decided_at, state, actions) do
     ref = make_ref()
     ms = state.thresholds.wait_ms
     Process.send_after(self(), {:octoroom_agent_floor, ref}, ms)
-    waiting = %{input: input, name: name, frame: frame, ref: ref}
+
+    waiting = %{
+      input: input,
+      name: name,
+      frame: frame,
+      ref: ref,
+      waited_from: now(),
+      decided_at: decided_at
+    }
+
     event = {:agent, {:waiting, %{source: input, speaker: name, ms: ms}}}
     set_presence(%{state | waiting: waiting}, "waiting", actions ++ [emit: event])
   end
@@ -1014,6 +1049,7 @@ defmodule Octoroom.Agent.Worker do
   defp end_wait(%{waiting: nil} = state, actions), do: {state, actions}
 
   defp end_wait(%{waiting: w} = state, actions) do
+    emit_floor_wait(state, w, max(now() - w.waited_from, 0), :yielded)
     actions = actions ++ [emit: {:agent, {:waiting, nil}}]
     {state, actions} = commit(w.input, w.name, w.frame, false, %{state | waiting: nil}, actions)
 
@@ -1381,6 +1417,7 @@ defmodule Octoroom.Agent.Worker do
     actions = actions ++ [emit: {:agent, {:decision, event}}]
     # Latency is measured from now, not from the speaker's last VAD stop.
     state = update_in(state.vad_stop, &Map.delete(&1, input))
+    emit_turn_decided(state, event, now())
     frame = %Frames.Transcription{text: text, source: input}
     {state, actions} = commit(input, name, frame, true, state, actions)
     result(state, actions)
@@ -1390,12 +1427,90 @@ defmodule Octoroom.Agent.Worker do
 
   defp now, do: System.monotonic_time(:millisecond)
 
+  defp emit_turn_decided(state, event, decided_at) do
+    speech_end = Map.get(state.vad_stop, event.source, decided_at)
+
+    measurements =
+      %{
+        system_time: System.system_time(),
+        monotonic_time: System.monotonic_time(),
+        speech_to_decided_ms: max(decided_at - speech_end, 0)
+      }
+      |> then(fn m ->
+        case event.decision do
+          %{latency_ms: ms} when is_number(ms) -> Map.put(m, :decision_ms, ms)
+          _ -> m
+        end
+      end)
+
+    :telemetry.execute(
+      [:octoroom_agent, :turn, :decided],
+      measurements,
+      %{
+        room_id: state.room_id,
+        agent_id: state.id,
+        input: event.source,
+        speaker: event.speaker,
+        text: event.text,
+        outcome: event.outcome,
+        why: event.why,
+        decision: event.decision
+      }
+    )
+  end
+
+  defp emit_floor_wait(state, waiting, duration_ms, outcome) do
+    :telemetry.execute(
+      [:octoroom_agent, :turn, :floor_wait],
+      %{
+        duration_ms: duration_ms,
+        system_time: System.system_time(),
+        monotonic_time: System.monotonic_time()
+      },
+      %{
+        room_id: state.room_id,
+        agent_id: state.id,
+        input: waiting.input,
+        speaker: waiting.name,
+        outcome: outcome
+      }
+    )
+  end
+
   defp first_audio(%{turn: %{speech_end: speech_end, transcript: transcript} = turn} = state) do
+    transcript_ms = transcript - speech_end
+    llm_ms = if(turn[:llm], do: turn.llm - speech_end)
+    audio_ms = now() - speech_end
+    wait_ms = Map.get(turn, :wait_ms, 0)
+    decided_at = Map.get(turn, :decided_at, transcript)
+
     latency = %{
-      transcript: transcript - speech_end,
-      llm: if(turn[:llm], do: turn.llm - speech_end),
-      audio: now() - speech_end
+      transcript: transcript_ms,
+      llm: llm_ms,
+      audio: audio_ms
     }
+
+    measurements =
+      %{
+        transcript_ms: transcript_ms,
+        audio_ms: audio_ms,
+        wait_ms: wait_ms,
+        processing_ms: max(audio_ms - wait_ms, 0),
+        stt_and_decision_ms: max(decided_at - speech_end, 0)
+      }
+      |> then(fn m -> if llm_ms, do: Map.put(m, :llm_ms, llm_ms), else: m end)
+
+    :telemetry.execute(
+      [:octoroom_agent, :turn, :latency],
+      measurements,
+      %{
+        room_id: state.room_id,
+        agent_id: state.id,
+        turn_id: turn[:id],
+        input: state.addressee,
+        speaker: state.addressee_name
+      }
+    )
 
     Logger.info(
       "agent #{state.id} latency: transcript=#{latency.transcript}ms " <>
