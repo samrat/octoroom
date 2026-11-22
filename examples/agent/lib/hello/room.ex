@@ -12,18 +12,42 @@ defmodule Hello.Room do
   import Octoroom.Agent, only: [agent: 3]
 
   @impl true
-  def join(_params, _socket), do: {:ok, %{name: "Guest"}}
+  def join(params, _socket) do
+    meta = %{name: "Guest"}
+
+    case params["pipeline"] do
+      id when is_binary(id) ->
+        if Hello.Assistant.valid_pipeline?(id),
+          do: {:ok, Map.put(meta, :pipeline, id)},
+          else: {:ok, meta}
+
+      _ ->
+        {:ok, meta}
+    end
+  end
 
   @impl true
   def workers(%{participants: []}), do: []
 
   def workers(room) do
-    [
-      agent("assistant", Application.get_env(:hello, :agent, Hello.Assistant),
-        hears: Enum.map(room.participants, &mic/1),
-        respond: :always
-      )
-    ]
+    pipeline = selected_pipeline(room)
+    info = Hello.Assistant.pipeline_info(pipeline)
+
+    opts =
+      [hears: Enum.map(room.participants, &mic/1)] ++
+        if info.agent == Hello.Booking do
+          [respond: :always]
+        else
+          [args: %{pipeline: info.id}]
+        end
+
+    [agent("assistant", info.agent, opts)]
+  end
+
+  defp selected_pipeline(room) do
+    room.assigns[:pipeline] ||
+      Enum.find_value(room.participants, fn p -> p.meta[:pipeline] || p.meta["pipeline"] end) ||
+      Hello.Assistant.default_pipeline()
   end
 
   @impl true

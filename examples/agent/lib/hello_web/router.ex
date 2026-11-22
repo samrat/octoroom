@@ -20,6 +20,21 @@ defmodule HelloWeb.Router do
     live "/", AgentLive
   end
 
+  if Application.compile_env(:hello, :dev_routes) do
+    import Phoenix.LiveDashboard.Router
+
+    scope "/dev" do
+      pipe_through :browser
+
+      live_dashboard "/dashboard",
+        metrics: HelloWeb.Telemetry,
+        metrics_history: {HelloWeb.MetricsStorage, :metrics_history, []},
+        additional_pages: [
+          octoroom: HelloWeb.OctoroomDashboardPage
+        ]
+    end
+  end
+
   # Other scopes may use custom stacks.
   # scope "/api", HelloWeb do
   #   pipe_through :api

@@ -31,6 +31,8 @@ defmodule HelloWeb.Layouts do
     default: nil,
     doc: "the current [scope](https://hexdocs.pm/phoenix/scopes.html)"
 
+  attr :fluid, :boolean, default: false, doc: "fill the window below the header"
+
   slot :inner_block, required: true
 
   def app(assigns) do
@@ -62,7 +64,11 @@ defmodule HelloWeb.Layouts do
       </div>
     </header>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
+    <main :if={@fluid} class="h-[calc(100dvh-4rem)]">
+      {render_slot(@inner_block)}
+    </main>
+
+    <main :if={!@fluid} class="px-4 py-20 sm:px-6 lg:px-8">
       <div class="mx-auto max-w-2xl space-y-4">
         {render_slot(@inner_block)}
       </div>

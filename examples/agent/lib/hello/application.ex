@@ -7,8 +7,13 @@ defmodule Hello.Application do
 
   @impl true
   def start(_type, _args) do
+    # Logs how long each step of a join and each agent async stage take.
+    Octoroom.Telemetry.attach_default_logger()
+    Octoroom.Agent.Telemetry.attach_default_logger()
+
     children = [
       HelloWeb.Telemetry,
+      Hello.Clinic,
       {DNSCluster, query: Application.get_env(:hello, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Hello.PubSub},
       # Start a worker by calling: Hello.Worker.start_link(arg)
