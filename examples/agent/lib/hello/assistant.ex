@@ -28,15 +28,21 @@ defmodule Hello.Assistant do
       agent: __MODULE__
     },
     %{
+      id: "cascaded_openai",
+      name: "Cascaded · GPT-5.4 Mini + AssemblyAI EU",
+      label: "AssemblyAI EU → GPT-5.4 Mini → AssemblyAI EU",
+      agent: __MODULE__
+    },
+    %{
       id: "cascaded_nemotron",
-      name: "Cascaded · Nemotron + AssemblyAI",
-      label: "Soniox → Nemotron 3.5 Lightning → AssemblyAI",
+      name: "Cascaded · Nemotron + AssemblyAI EU",
+      label: "AssemblyAI EU → Nemotron 3.5 Lightning → AssemblyAI EU",
       agent: __MODULE__
     },
     %{
       id: "cascaded_gemini",
-      name: "Cascaded · Gemini Flash + AssemblyAI",
-      label: "Soniox → Gemini 3.5 Flash → AssemblyAI",
+      name: "Cascaded · Gemini 3.5 Flash Lite + AssemblyAI EU",
+      label: "AssemblyAI EU → Gemini 3.5 Flash Lite → AssemblyAI EU",
       agent: __MODULE__
     },
     %{
@@ -48,7 +54,7 @@ defmodule Hello.Assistant do
     %{
       id: "booking",
       name: "Script · Clef Flash Booking",
-      label: "Soniox → Clef Flash Script → AssemblyAI",
+      label: "AssemblyAI EU → Clef Flash Script → AssemblyAI EU",
       agent: Hello.Booking
     }
   ]
@@ -77,8 +83,10 @@ defmodule Hello.Assistant do
     You are on a direct one-on-one phone call with a patient, so always respond to the caller.
     #{Clinic.date_context()}
     Use your tools to check real availability, list existing appointments, book new appointments, or cancel appointments — never invent open slots or confirmation codes without calling a tool first.
+    Before calling a tool, say a brief natural filler in 3 to 5 words (like "Let me check that." or "One moment, booking that.") so the caller never hears dead silence.
     Be warm, calm, and helpful. Ask one short question at a time and never give medical advice or diagnoses.
     Keep your spoken replies concise, natural, and to one or two short sentences.
+    Always speak times naturally in 12-hour format (like "9 AM", "10:30 AM", "2 PM", or "3:30 PM"), while still passing 24-hour HH:MM times to your tools.
     """
   end
 
@@ -98,34 +106,60 @@ defmodule Hello.Assistant do
     )
   end
 
+  @eu_stt [
+    provider: :assembly_ai,
+    model: "assemblyai-stt-3-7-realtime-agent",
+    region: :eu,
+    min_end_of_turn_silence_when_confident: 160
+  ]
+
+  @eu_tts [provider: :assembly_ai, model: "assemblyai-tts-1", region: :eu]
+
+  def build_pipeline("cascaded_openai") do
+    Spec.default(
+      vad: [min_silence_ms: 200],
+      stt: @eu_stt,
+      llm: [
+        provider: :openai,
+        model: "gpt-5.4-mini",
+        reasoning_effort: :none
+      ],
+      tts: @eu_tts
+    )
+  end
+
   def build_pipeline("cascaded_nemotron") do
     Spec.default(
-      stt: "soniox:stt-rt-v6",
+      vad: [min_silence_ms: 200],
+      stt: @eu_stt,
       llm: [
         provider: :openrouter,
         model: "nvidia/nemotron-3.5-lightning",
         reasoning_effort: :none,
         provider_options: [openrouter_provider: %{sort: "latency"}]
       ],
-      tts: "assembly_ai:assemblyai-tts-1"
+      tts: @eu_tts
     )
   end
 
   def build_pipeline("cascaded_gemini") do
     Spec.default(
-      stt: "soniox:stt-rt-v6",
+      vad: [min_silence_ms: 200],
+      stt: @eu_stt,
       llm: [
         provider: :google,
-        model: "gemini-3.5-flash",
-        reasoning_effort: :minimal
+        model: "gemini-3.5-flash-lite",
+        reasoning_effort: :minimal,
+        provider_options: [google_include_thoughts: false]
       ],
-      tts: "assembly_ai:assemblyai-tts-1"
+      tts: @eu_tts
     )
   end
 
   def build_pipeline("cascaded_local_tts") do
     Spec.default(
-      stt: "reson8:rumble-2",
+      vad: [min_silence_ms: 200],
+      stt: [provider: :reson8, model: "rumble-2", language_hints: ["en"]],
       llm: [
         provider: :openrouter,
         model: "nvidia/nemotron-3.5-lightning",

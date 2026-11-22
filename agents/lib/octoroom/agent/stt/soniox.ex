@@ -37,7 +37,7 @@ defmodule Octoroom.Agent.STT.Soniox do
   def start_link(opts) do
     with {:ok, api_key} <- SpeechProvider.api_key(opts, "SONIOX_API_KEY") do
       WebSockex.start_link(
-        @endpoint,
+        endpoint(opts),
         __MODULE__,
         %{
           owner: Keyword.get(opts, :owner, self()),
@@ -215,6 +215,13 @@ defmodule Octoroom.Agent.STT.Soniox do
   defp notify(state, event) do
     STT.notify(state.owner, event)
     state
+  end
+
+  defp endpoint(opts) do
+    case Keyword.get(opts, :url) do
+      url when is_binary(url) -> url
+      nil -> if(Keyword.get(opts, :region) == :eu, do: "wss://stt-rt.eu.soniox.com/transcribe-websocket", else: @endpoint)
+    end
   end
 
   defp config(api_key, opts) do

@@ -229,6 +229,19 @@ defmodule Octoroom.Agent.Pipeline.Core do
 
   @doc "Sets a key in the telemetry metadata carried on every event emitted by this core."
   @spec put_telemetry(t(), atom(), term()) :: t()
+  def put_telemetry(%__MODULE__{} = core, :turn_id, value) do
+    tasks =
+      Map.new(core.tasks, fn
+        {{_index, :preemptive} = k, %{meta: %{turn_id: nil} = meta} = task} ->
+          {k, %{task | meta: Map.put(meta, :turn_id, value)}}
+
+        entry ->
+          entry
+      end)
+
+    %{core | telemetry: Map.put(core.telemetry, :turn_id, value), tasks: tasks}
+  end
+
   def put_telemetry(%__MODULE__{} = core, key, value),
     do: %{core | telemetry: Map.put(core.telemetry, key, value)}
 
@@ -584,9 +597,9 @@ defmodule Octoroom.Agent.Pipeline.Core do
       end
 
     meta =
-      extra_meta
+      core.telemetry
+      |> Map.merge(extra_meta)
       |> Map.merge(trigger)
-      |> Map.merge(core.telemetry)
       |> Map.merge(reserved)
 
     :telemetry.execute(

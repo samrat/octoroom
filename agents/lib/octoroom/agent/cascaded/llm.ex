@@ -6,7 +6,50 @@ defmodule Octoroom.Agent.Cascaded.LLM do
 
   alias Octoroom.Agent.Cascaded.ReqLLMChat
 
-  @req_llm_providers [:google, :openrouter]
+  @req_llm_providers [:google, :openrouter, :openai, :anthropic, :groq, :cerebras]
+
+  def providers, do: @req_llm_providers
+
+  @doc false
+  def normalize_opts(spec) when is_binary(spec) do
+    case split_model(spec) do
+      {:ok, provider, model} -> [provider: provider, model: model]
+      :error -> [model: spec]
+    end
+  end
+
+  def normalize_opts(opts) when is_list(opts) do
+    if Keyword.has_key?(opts, :provider) do
+      opts
+    else
+      case Keyword.get(opts, :model) do
+        model when is_binary(model) ->
+          case split_model(model) do
+            {:ok, provider, id} ->
+              opts |> Keyword.put(:model, id) |> Keyword.put(:provider, provider)
+
+            :error ->
+              opts
+          end
+
+        _other ->
+          opts
+      end
+    end
+  end
+
+  def normalize_opts(other), do: other
+
+  defp split_model(spec) do
+    with [prefix, id] <- String.split(spec, ":", parts: 2),
+         true <- id != "",
+         provider when not is_nil(provider) <-
+           Enum.find(@req_llm_providers, &(Atom.to_string(&1) == prefix)) do
+      {:ok, provider, id}
+    else
+      _ -> :error
+    end
+  end
 
   def run_turn(opts) do
     case Keyword.fetch!(opts, :provider) do

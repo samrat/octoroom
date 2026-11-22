@@ -85,12 +85,16 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     * `:vad` - `Octoroom.Agent.Processors.VAD`'s (the local Silero model).
       `false` leaves the VAD out: turn taking and barge-in fall back to the
       STT provider.
+    * `:preemptive` - boolean forwarded to `Octoroom.Agent.Processors.STTTurns`
+      to enable or disable preemptive LLM generation while STT finalizes
+      (defaults to `true` when VAD is enabled, `false` when `vad: false`).
 
-  `:stt` and `:tts` also take just a `"provider:model"` string.
+  `:stt`, `:llm` and `:tts` also take just a `"provider:model"` string (or
+  `model: "provider:model"` alongside extra stage options).
 
       Spec.default(
         stt: "soniox:stt-rt-v6",
-        llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+        llm: "google:gemini-3.5-flash",
         tts: [provider: :assembly_ai, model: "assemblyai-tts-1", voice: "aai-titus"]
       )
 
@@ -109,16 +113,36 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     alias Octoroom.Agent.Processors
     alias Octoroom.Agent.{STT, TTS}
 
-    opts = Keyword.validate!(opts, [:stt, :llm, :tts, :transcriber, vad: []])
+    opts = Keyword.validate!(opts, [:stt, :llm, :tts, :transcriber, :preemptive, vad: []])
     vad = opts[:vad]
+
+    preemptive_opt =
+      case Keyword.fetch(opts, :preemptive) do
+        {:ok, value} when is_boolean(value) ->
+          [preemptive: value]
+
+        {:ok, value} ->
+          raise ArgumentError, "preemptive: expected a boolean, got: #{inspect(value)}"
+
+        :error ->
+          []
+      end
+
     stt = named!(opts, :stt, &STT.resolve/1)
     tts = named!(opts, :tts, &TTS.resolve/1)
-    llm = Keyword.fetch!(opts, :llm)
+    raw_llm = Keyword.fetch!(opts, :llm)
+    llm = Octoroom.Agent.Cascaded.LLM.normalize_opts(raw_llm)
 
-    named? = llm[:provider] != nil and is_atom(llm[:provider]) and is_binary(llm[:model])
+    named? =
+      is_list(llm) and is_atom(llm[:provider]) and not is_nil(llm[:provider]) and
+        is_binary(llm[:model]) and llm[:model] != ""
 
-    if not named? and llm[:request] == nil,
-      do: raise(ArgumentError, "llm: needs a :provider and a :model, got: #{inspect(llm)}")
+    if not named? and not (is_list(llm) and llm[:request] != nil),
+      do:
+        raise(
+          ArgumentError,
+          "llm: needs a :provider and a :model, such as \"provider:model\", got: #{inspect(raw_llm)}"
+        )
 
     front = if vad, do: processor(:vad, Processors.VAD, vad), else: new()
 
@@ -127,7 +151,11 @@ defmodule Octoroom.Agent.Pipeline.Spec do
         front =
           front
           |> processor(:stt, Processors.STT, stt)
-          |> processor(:turns, Processors.STTTurns, vad: vad != false, interrupt: false)
+          |> processor(
+            :turns,
+            Processors.STTTurns,
+            [vad: vad != false, interrupt: false] ++ preemptive_opt
+          )
 
         {front, new()}
       else

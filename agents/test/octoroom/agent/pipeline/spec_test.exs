@@ -73,6 +73,29 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
     {front, _back} = default(vad: false, stt: @stt, llm: @llm, tts: "inworld:inworld-tts-2")
     assert names(front) == [:stt, :turns]
     assert opts(front, :turns) == [vad: false, interrupt: false]
+
+    {front, _back} = default(stt: @stt, llm: @llm, tts: @tts, preemptive: false)
+    assert opts(front, :turns) == [vad: true, interrupt: false, preemptive: false]
+
+    assert_raise ArgumentError, ~r/preemptive: expected a boolean/, fn ->
+      default(stt: @stt, llm: @llm, tts: @tts, preemptive: :always)
+    end
+
+    {_front, back} = default(stt: @stt, llm: "google:gemini-3.5-flash", tts: @tts)
+    assert opts(back, :llm) == [provider: :google, model: "gemini-3.5-flash"]
+
+    {_front, back} =
+      default(
+        stt: @stt,
+        llm: [model: "openrouter:nvidia/nemotron-3.5-lightning", reasoning_effort: :none],
+        tts: @tts
+      )
+
+    assert opts(back, :llm) == [
+             provider: :openrouter,
+             model: "nvidia/nemotron-3.5-lightning",
+             reasoning_effort: :none
+           ]
   end
 
   test "default picks no provider and no model" do
@@ -90,7 +113,16 @@ defmodule Octoroom.Agent.Pipeline.SpecTest do
       default(stt: @stt, llm: @llm, tts: [provider: :inworld, voice: "Ashley"])
     end
 
-    for llm <- [[], [provider: :google], [model: "gemini-3.5-flash"]] do
+    for llm <- [
+          [],
+          [provider: :google],
+          [provider: :google, model: ""],
+          [model: "gemini-3.5-flash"],
+          "google",
+          "google:",
+          "nobody:gemini-3.5-flash",
+          :google
+        ] do
       assert_raise ArgumentError, ~r/llm: needs a :provider and a :model/, fn ->
         default(stt: @stt, llm: llm, tts: @tts)
       end

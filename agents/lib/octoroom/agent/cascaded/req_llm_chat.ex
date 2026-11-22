@@ -17,18 +17,22 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
     max_tokens = Keyword.get(opts, :max_tokens)
     reasoning_effort = Keyword.get(opts, :reasoning_effort)
 
+    provider = Keyword.fetch!(opts, :provider)
+    token = Keyword.get(opts, :token)
+
     request_opts =
       [
         tools: Enum.map(tools, &to_req_llm_tool/1),
         tool_choice: :auto
       ]
+      |> maybe_put(:api_key, token)
       |> maybe_put(:max_tokens, max_tokens)
       |> maybe_put(:reasoning_effort, reasoning_effort)
       |> maybe_put(:provider_options, Keyword.get(opts, :provider_options))
 
     with {:ok, response} <-
            ReqLLM.generate_text(
-             %{provider: Keyword.fetch!(opts, :provider), id: model},
+             resolve_model(provider, model),
              input,
              request_opts
            ) do
@@ -56,18 +60,27 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
     process_stream_fun =
       Keyword.get(opts, :process_stream_fun, &ReqLLM.StreamResponse.process_stream/2)
 
+    provider = Keyword.fetch!(opts, :provider)
+    token = Keyword.get(opts, :token)
+
     request_opts =
       [
         tools: Enum.map(tools, &to_req_llm_tool/1),
         tool_choice: :auto
       ]
+      |> maybe_put(:api_key, token)
       |> maybe_put(:max_tokens, max_tokens)
       |> maybe_put(:reasoning_effort, reasoning_effort)
       |> maybe_put(:provider_options, Keyword.get(opts, :provider_options))
 
+    model_spec =
+      if stream_fun == (&ReqLLM.stream_text/3),
+        do: resolve_model(provider, model),
+        else: %{provider: provider, id: model}
+
     with {:ok, stream_response} <-
            stream_fun.(
-             %{provider: Keyword.fetch!(opts, :provider), id: model},
+             model_spec,
              input,
              request_opts
            ),
@@ -179,6 +192,13 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
 
   defp to_req_llm_tool_call(%{"id" => id, "name" => name, "arguments" => arguments}) do
     ToolCall.new(id, name, Jason.encode!(arguments || %{}))
+  end
+
+  defp resolve_model(provider, id) do
+    case ReqLLM.model({provider, id, []}) do
+      {:ok, %LLMDB.Model{} = model} -> model
+      _ -> %{provider: provider, id: id}
+    end
   end
 
   defp maybe_put(opts, _key, nil), do: opts

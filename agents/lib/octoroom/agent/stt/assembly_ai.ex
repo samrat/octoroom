@@ -29,7 +29,7 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
 
   @impl STT
   def default_options,
-    do: [sample_rate: 16_000, format_turns: false]
+    do: [sample_rate: 16_000, format_turns: false, chunk_ms: 50]
 
   @impl STT
   def start_link(opts) do
@@ -37,7 +37,7 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
       format_turns = Keyword.get(opts, :format_turns, false)
 
       WebSockex.start_link(
-        "#{@endpoint}?#{query(opts, format_turns)}",
+        "#{endpoint(opts)}?#{query(opts, format_turns)}",
         __MODULE__,
         %{
           owner: Keyword.get(opts, :owner, self()),
@@ -66,6 +66,20 @@ defmodule Octoroom.Agent.STT.AssemblyAI do
 
   @impl STT
   def close(pid), do: WebSockex.cast(pid, :terminate_session)
+
+  defp endpoint(opts) do
+    case Keyword.get(opts, :url) do
+      url when is_binary(url) ->
+        url
+
+      nil ->
+        case Keyword.get(opts, :region) do
+          :eu -> "wss://streaming.eu.assemblyai.com/v3/ws"
+          :us -> "wss://streaming.us.assemblyai.com/v3/ws"
+          _global -> @endpoint
+        end
+    end
+  end
 
   defp query(opts, format_turns) do
     %{

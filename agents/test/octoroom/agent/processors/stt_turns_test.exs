@@ -42,4 +42,35 @@ defmodule Octoroom.Agent.Processors.STTTurnsTest do
 
     assert starts(harness) == 1
   end
+
+  test "VAD stop pushes FinalizeTranscript upstream when speech has not finalized yet" do
+    harness =
+      processor(:turns, STTTurns, interrupt: false)
+      |> Harness.start!()
+      |> Harness.push([%Frames.VADUserStartedSpeaking{}, %Frames.VADUserStoppedSpeaking{}])
+
+    assert [%Frames.FinalizeTranscript{}] = Harness.upstream(harness)
+  end
+
+  test "VAD stop does not push FinalizeTranscript if the transcript already finalized" do
+    harness =
+      processor(:turns, STTTurns, interrupt: false)
+      |> Harness.start!()
+      |> Harness.push([
+        %Frames.VADUserStartedSpeaking{},
+        %Frames.Transcription{text: "hello"},
+        %Frames.VADUserStoppedSpeaking{}
+      ])
+
+    assert Harness.upstream(harness) == []
+  end
+
+  test "finalize_on_vad: false leaves endpointing to the STT provider" do
+    harness =
+      processor(:turns, STTTurns, interrupt: false, finalize_on_vad: false)
+      |> Harness.start!()
+      |> Harness.push([%Frames.VADUserStartedSpeaking{}, %Frames.VADUserStoppedSpeaking{}])
+
+    assert Harness.upstream(harness) == []
+  end
 end

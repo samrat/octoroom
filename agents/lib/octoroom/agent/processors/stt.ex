@@ -2,11 +2,12 @@ defmodule Octoroom.Agent.Processors.STT do
   @moduledoc """
   Streaming speech-to-text through an `Octoroom.Agent.STT` provider.
 
-  `InputAudio` passes through and is sent to the provider in 100 ms chunks.
-  Transcripts come back as `InterimTranscription` and `Transcription`
-  frames. A `FinalizeTranscript` frame moving upstream asks the provider to
-  finalize what it has heard now. A failed session is replaced after a
-  backoff.
+  `InputAudio` passes through and is sent to the provider in 20 ms chunks
+  (configurable with `:chunk_ms`, or the provider's own minimum such as 50 ms
+  for AssemblyAI). Transcripts come back as `InterimTranscription` and
+  `Transcription` frames. A `FinalizeTranscript` frame moving upstream flushes
+  buffered audio and asks the provider to finalize what it has heard now. A
+  failed session is replaced after a backoff.
 
   Options are `Octoroom.Agent.STT`'s: `:provider` and `:model` (both needed),
   `:model`, `:api_key`, `:sample_rate` and the provider's own. The session starts
@@ -20,8 +21,7 @@ defmodule Octoroom.Agent.Processors.STT do
 
   alias Octoroom.Agent.{Frames, STT}
 
-  @min_chunk_ms 50
-  @target_chunk_ms 100
+  @default_chunk_ms 20
   # Audio held while (re)connecting.
   @max_buffer_ms 5_000
   @reconnect_ms [1_000, 2_000, 5_000, 10_000]
@@ -30,6 +30,8 @@ defmodule Octoroom.Agent.Processors.STT do
   def init(opts, ctx) do
     with {:ok, module, provider_opts} <- STT.resolve(opts) do
       sample_rate = Keyword.fetch!(provider_opts, :sample_rate)
+      chunk_ms = Keyword.get(provider_opts, :chunk_ms, @default_chunk_ms)
+      chunk_bytes = div(sample_rate * 2 * chunk_ms, 1_000)
 
       state = %{
         provider: provider_name(module),
@@ -42,8 +44,8 @@ defmodule Octoroom.Agent.Processors.STT do
         # The input the audio came from; transcripts carry it. One session
         # hears one source.
         source: nil,
-        min_chunk_bytes: div(sample_rate * 2 * @min_chunk_ms, 1_000),
-        target_chunk_bytes: div(sample_rate * 2 * @target_chunk_ms, 1_000),
+        min_chunk_bytes: chunk_bytes,
+        target_chunk_bytes: chunk_bytes,
         max_buffer_bytes: div(sample_rate * 2 * @max_buffer_ms, 1_000),
         # For reconnecting: the host, which attempt this is, and a ref that
         # tells this stage's reconnect messages from others'.
@@ -79,7 +81,15 @@ defmodule Octoroom.Agent.Processors.STT do
     do: {[{:push, frame, :downstream}], send_audio(%{state | source: frame.source}, audio)}
 
   def handle_frame(%Frames.FinalizeTranscript{}, :upstream, state) do
-    if state.connected?, do: STT.finalize(state.module, state.socket)
+    state =
+      if state.connected? do
+        state = flush_buffer(state)
+        STT.finalize(state.module, state.socket)
+        state
+      else
+        state
+      end
+
     {[], state}
   end
 
@@ -206,10 +216,20 @@ defmodule Octoroom.Agent.Processors.STT do
     %{state | buffer: rest}
   end
 
-  defp end_session(%{connected?: true} = state) do
+  defp flush_buffer(state) do
     {chunks, rest} = split(state.buffer, state.target_chunk_bytes)
-    chunks = if byte_size(rest) >= state.min_chunk_bytes, do: chunks ++ [rest], else: chunks
+
+    {chunks, rest} =
+      if byte_size(rest) >= state.min_chunk_bytes,
+        do: {chunks ++ [rest], <<>>},
+        else: {chunks, rest}
+
     Enum.each(chunks, &state.module.send_audio(state.socket, &1))
+    %{state | buffer: rest}
+  end
+
+  defp end_session(%{connected?: true} = state) do
+    state = flush_buffer(state)
     state.module.close(state.socket)
     %{state | buffer: <<>>}
   end

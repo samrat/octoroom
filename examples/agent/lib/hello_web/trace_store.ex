@@ -103,6 +103,8 @@ defmodule HelloWeb.TraceStore do
       joins: [],
       # {room_id, agent_id, input} => [span, ...]
       pending_decisions: %{},
+      # {room_id, agent_id} => [span, ...] for preemptive LLM spans finished before :decided
+      pending_preemptive: %{},
       # {room_id, agent_id} => utterance_id
       active_utterance: %{},
       # {room_id, agent_id, turn_id} => utterance_id
@@ -189,6 +191,12 @@ defmodule HelloWeb.TraceStore do
     {front_spans, state} =
       build_front_spans(speech_end_ms, now_ms, speech_to_decided, decision_span, meta, state)
 
+    {preemptive_span, pending_preemptive} =
+      pop_recent_decision(state.pending_preemptive, {room_id, agent_id}, now_ms)
+
+    state = %{state | pending_preemptive: pending_preemptive}
+    initial_spans = front_spans ++ List.wrap(preemptive_span)
+
     {call_id, state} = ensure_call(room_id, now_ms, wall_at, state)
 
     {utterance_id, state} =
@@ -215,7 +223,7 @@ defmodule HelloWeb.TraceStore do
             why: meta[:why],
             decision: meta[:decision]
           })
-          |> append_spans(front_spans)
+          |> append_spans(initial_spans)
 
         u
         |> put_in([:lanes, agent_id], lane)
@@ -224,7 +232,7 @@ defmodule HelloWeb.TraceStore do
         |> recompute_bounds()
       end)
 
-    broadcast_room_spans(room_id, agent_id, front_spans, now_ms)
+    broadcast_room_spans(room_id, agent_id, initial_spans, now_ms)
     put_in(state.active_utterance[{room_id, agent_id}], utterance_id)
   end
 
@@ -269,6 +277,28 @@ defmodule HelloWeb.TraceStore do
 
           u |> put_in([:lanes, agent_id], lane) |> recompute_bounds()
         end)
+    end
+  end
+
+  # A preemptive LLM task that finished or was cancelled before a turn committed
+  # has no `turn_id`: hold `:ok` spans for the upcoming `:decided` event and drop
+  # abandoned cancellations so they never attach to the previous utterance.
+  defp record(
+         [:octoroom_agent, :processor, :async, status],
+         m,
+         %{preemptive: true, turn_id: nil} = meta,
+         now_ms,
+         _wall_at,
+         state
+       )
+       when status in [:stop, :exception] do
+    if status == :stop and meta[:status] == :ok do
+      {span, state} = build_async_span(status, m, meta, now_ms, state)
+      key = {meta[:room_id], meta[:agent_id]}
+      pending = Map.update(state.pending_preemptive, key, [span], &Enum.take([span | &1], 3))
+      %{state | pending_preemptive: pending}
+    else
+      state
     end
   end
 

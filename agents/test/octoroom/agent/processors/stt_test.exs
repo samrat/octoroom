@@ -46,6 +46,48 @@ defmodule Octoroom.Agent.Processors.STTTest do
     assert byte_size(state.buffer) == 16_000 * 2 * 5
   end
 
+  defmodule CaptureSTT do
+    @behaviour Octoroom.Agent.STT
+
+    @impl true
+    def default_options, do: [sample_rate: 16_000]
+
+    @impl true
+    def start_link(_opts), do: {:ok, self()}
+
+    @impl true
+    def send_audio(pid, audio), do: send(pid, {:sent_audio, byte_size(audio)}) && :ok
+
+    @impl true
+    def finalize(pid), do: send(pid, :finalized) && :ok
+
+    @impl true
+    def close(_pid), do: :ok
+  end
+
+  test "sends 20 ms chunks immediately by default and respects provider chunk_ms" do
+    {:ok, state} = STT.init([provider: CaptureSTT, model: "m"], %{})
+    state = %{state | socket: self(), connected?: true}
+
+    {_effects, state} = STT.handle_frame(audio(20), :downstream, state)
+    assert_received {:sent_audio, 640}
+    assert state.buffer == <<>>
+
+    {:ok, aai} = STT.init([provider: :assembly_ai, model: "assemblyai-stt-3-7-realtime"], %{})
+    assert aai.target_chunk_bytes == div(16_000 * 2 * 50, 1_000)
+  end
+
+  test "FinalizeTranscript flushes eligible buffered audio before finalizing" do
+    {:ok, state} = STT.init([provider: CaptureSTT, model: "m", chunk_ms: 20], %{})
+    state = %{state | socket: self(), connected?: true, buffer: audio(20).audio}
+
+    assert {[], %{buffer: <<>>}} =
+             STT.handle_frame(%Octoroom.Agent.Frames.FinalizeTranscript{}, :upstream, state)
+
+    assert_received {:sent_audio, 640}
+    assert_received :finalized
+  end
+
   defp audio(ms),
     do: %Octoroom.Agent.Frames.InputAudio{audio: :binary.copy(<<0, 0>>, div(16_000 * ms, 1_000))}
 end

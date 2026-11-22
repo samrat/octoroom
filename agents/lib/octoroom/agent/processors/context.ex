@@ -156,6 +156,21 @@ defmodule Octoroom.Agent.Processors.Context do
        when is_map_key(state.audio_turns, turn_id),
        do: audio_transcript(frame, text, state)
 
+  defp frame(%Frames.PreemptiveTranscription{text: text} = frame, :downstream, state)
+       when is_binary(text) and text != "" do
+    content = if is_binary(frame.speaker), do: "[#{frame.speaker}] " <> text, else: text
+    message = %{role: "user", content: content}
+    history = append(state.history, message, state)
+
+    input =
+      state.instructions
+      |> prompt_input(history)
+      |> attach_frames(state, frame.source)
+
+    {[{:push, %Frames.PreemptiveLLMContext{text: text, messages: input, tools: state.tools},
+       :downstream}], state}
+  end
+
   defp frame(%Frames.Transcription{text: text} = frame, :downstream, state)
        when text != "" do
     extra = if frame.speaker, do: %{speaker: frame.speaker, source: frame.source}, else: %{}

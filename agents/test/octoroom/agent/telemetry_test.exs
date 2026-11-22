@@ -386,6 +386,54 @@ defmodule Octoroom.Agent.TelemetryTest do
       assert_received {:telemetry, [:octoroom_agent, :processor, :async, :stop], _,
                        %{processor: :llm, task: :reply, status: :cancelled}}
     end
+
+    test "preemptive LLM tasks start with turn_id: nil and adopt the next turn's turn_id on commit" do
+      room = tag()
+      attach(Telemetry.events(), room)
+
+      llm_request = fn _opts, emit ->
+        emit.({:text_delta, "Sure."})
+        {:ok, %{text: "Sure.", function_calls: [], continuation: []}}
+      end
+
+      harness =
+        processor(:llm, Processors.LLM,
+          provider: :openai,
+          model: "gpt-5.4-mini",
+          request: llm_request
+        )
+        |> Harness.start!(
+          async: :manual,
+          ctx: %{telemetry: %{room_id: room, agent_id: "assistant", turn_id: 1}}
+        )
+        |> Harness.push(%Frames.PreemptiveLLMContext{
+          text: "book tomorrow",
+          messages: [%{role: "user", content: "book tomorrow"}],
+          tools: []
+        })
+
+      assert_received {:telemetry, [:octoroom_agent, :processor, :async, :start], _,
+                       %{processor: :llm, task: :preemptive, preemptive: true, turn_id: nil}}
+
+      # Turn 2 commits: Core updates turn_id to 2 before pushing the confirmed context.
+      harness = %{harness | core: Core.put_telemetry(harness.core, :turn_id, 2)}
+
+      harness
+      |> Harness.push(%Frames.LLMContext{
+        messages: [%{role: "user", content: "Book tomorrow."}],
+        tools: []
+      })
+      |> Harness.run_tasks()
+
+      assert_received {:telemetry, [:octoroom_agent, :processor, :async, :stop], _,
+                       %{
+                         processor: :llm,
+                         task: :preemptive,
+                         preemptive: true,
+                         turn_id: 2,
+                         status: :ok
+                       }}
+    end
   end
 
   describe "Octoroom.Agent.Telemetry helpers" do

@@ -42,6 +42,9 @@ defmodule Octoroom.Agent.Frames do
 
   # data: delivered in order; dropped by an interruption unless uninterruptible
   defframe(InterimTranscription, :data, fields: [:text, :source])
+  # Speculative turn emitted at VAD silence using the latest interim transcript
+  # so the LLM can start in parallel with STT finalization.
+  defframe(PreemptiveTranscription, :data, fields: [:text, :source, speaker: nil])
   # `annotation`: text for the LLM only, put before the user's words (how
   # they sounded, for example); conversation events get just `text`.
   # `speaker`: who said it, shown to the LLM as `[speaker] text`.
@@ -89,6 +92,7 @@ defmodule Octoroom.Agent.Frames do
   defframe(ToolResults, :data, fields: [:messages, results: []], uninterruptible: true)
   defframe(AsyncToolResult, :data, fields: [:result], uninterruptible: true)
   defframe(LLMContext, :data, fields: [:messages, :tools])
+  defframe(PreemptiveLLMContext, :data, fields: [:text, :messages, :tools])
 
   # A finished reply whose audio is still playing: the LLM sees it in
   # replies that start meanwhile. `AssistantMessage` replaces it once it's

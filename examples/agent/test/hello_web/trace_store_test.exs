@@ -374,4 +374,99 @@ defmodule HelloWeb.TraceStoreTest do
       assert html =~ "octo-wf"
     end
   end
+
+  test "keeps preemptive LLM spans off the previous utterance and attaches them to the new turn" do
+    ms = &System.convert_time_unit(&1, :millisecond, :native)
+
+    # Turn 1 commits with turn_id 1
+    :telemetry.execute(
+      [:octoroom_agent, :turn, :decided],
+      %{speech_to_decided_ms: 300},
+      %{
+        room_id: "p-room",
+        agent_id: "assistant",
+        input: "p1/mic",
+        speaker: "Guest",
+        text: "First turn",
+        outcome: :reply,
+        why: :always,
+        decision: nil,
+        stt_provider: :assembly_ai,
+        stt_model: "assemblyai-stt-3-7-realtime-agent"
+      }
+    )
+
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :stop],
+      %{duration: ms.(300), first_output_duration: ms.(200), outputs: 3},
+      %{
+        room_id: "p-room",
+        agent_id: "assistant",
+        turn_id: 1,
+        processor: :llm,
+        task: :reply,
+        model: "gpt-5.4-mini",
+        status: :ok
+      }
+    )
+
+    # Abandoned preemptive cancellation (turn_id: nil) must NOT pollute Turn 1.
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :stop],
+      %{duration: ms.(90), outputs: 0},
+      %{
+        room_id: "p-room",
+        agent_id: "assistant",
+        turn_id: nil,
+        preemptive: true,
+        processor: :llm,
+        task: :preemptive,
+        model: "gpt-5.4-mini",
+        status: :cancelled
+      }
+    )
+
+    # Preemptive LLM that finished before Turn 2's :decided arrives (turn_id: nil, status: :ok).
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :stop],
+      %{duration: ms.(250), first_output_duration: ms.(180), outputs: 2},
+      %{
+        room_id: "p-room",
+        agent_id: "assistant",
+        turn_id: nil,
+        preemptive: true,
+        processor: :llm,
+        task: :preemptive,
+        model: "gpt-5.4-mini",
+        status: :ok
+      }
+    )
+
+    # Turn 2 decides (utterances are separated by typing so grouping doesn't merge them).
+    :telemetry.execute(
+      [:octoroom_agent, :turn, :decided],
+      %{speech_to_decided_ms: 280},
+      %{
+        room_id: "p-room",
+        agent_id: "assistant",
+        input: "p1/mic",
+        speaker: "Guest",
+        text: "Second turn",
+        outcome: :reply,
+        why: :typed,
+        decision: nil
+      }
+    )
+
+    %{utterances: [u2, u1]} = TraceStore.snapshot()
+    assert u1.text == "First turn"
+    assert u2.text == "Second turn"
+
+    u1_llms = Enum.filter(u1.lanes["assistant"].spans, &(&1.kind == :llm))
+    u2_llms = Enum.filter(u2.lanes["assistant"].spans, &(&1.kind == :llm))
+
+    assert length(u1_llms) == 1
+    assert length(u2_llms) == 1
+    assert hd(u2_llms).status == :ok
+  end
 end

@@ -32,8 +32,13 @@ defmodule Hello.Booking do
     script = script()
 
     front =
-      processor(:vad, Processors.VAD)
-      |> processor(:stt, Processors.STT, provider: :soniox, model: "stt-rt-v6")
+      processor(:vad, Processors.VAD, min_silence_ms: 200)
+      |> processor(:stt, Processors.STT,
+        provider: :assembly_ai,
+        model: "assemblyai-stt-3-7-realtime-agent",
+        region: :eu,
+        min_end_of_turn_silence_when_confident: 160
+      )
       |> processor(:turns, Processors.STTTurns, interrupt: false)
       |> processor(:decisions, Processors.Decisions,
         model: "openrouter:cloudflare/clef-flash",
@@ -45,7 +50,11 @@ defmodule Hello.Booking do
       processor(:script, Script, script: script, start: @start)
       |> processor(:context, Processors.Context)
       |> processor(:chunker, Processors.TextChunker)
-      |> processor(:tts, Processors.TTS, provider: :assembly_ai, model: "assemblyai-tts-1")
+      |> processor(:tts, Processors.TTS,
+        provider: :assembly_ai,
+        model: "assemblyai-tts-1",
+        region: :eu
+      )
       |> processor(:collector, Processors.AssistantCollector)
 
     {front, back}

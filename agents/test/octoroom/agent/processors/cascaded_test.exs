@@ -178,6 +178,74 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
     assert Harness.state(harness, :tools).name == :idle
   end
 
+  test "preemptive generation promotes on matching final without a second LLM call" do
+    test_pid = self()
+
+    plain_llm = fn opts, emit ->
+      send(test_pid, {:llm_request, opts})
+      emit.({:text_delta, "Tomorrow at 10 works."})
+      {:ok, %{text: "Tomorrow at 10 works.", function_calls: [], continuation: []}}
+    end
+
+    harness =
+      spec(self())
+      |> replace(:llm, processor(:llm, Processors.LLM, request: plain_llm))
+      |> Harness.start!(ctx: %{ctx() | tools: []}, async: :manual)
+      |> Harness.push(%Frames.VADUserStartedSpeaking{})
+      |> Harness.info(:stt, {:stt, {:partial, "how about tomorrow"}})
+      |> Harness.push(%Frames.VADUserStoppedSpeaking{})
+
+    # Speculative LLM task started immediately on VAD stop, before final transcript arrives.
+    assert Harness.pending_tasks(harness) == [{:llm, :preemptive}]
+    harness = Harness.run_tasks(harness)
+    assert_received {:llm_request, first}
+    assert List.last(first[:input]).content == "how about tomorrow"
+    # Nothing has been spoken yet while waiting for final confirmation.
+    assert Harness.outputs(harness, Frames.OutputAudio) == []
+
+    # Final arrives with matching words (different casing/punctuation) -> promoted with no second call.
+    harness = Harness.info(harness, :stt, {:stt, {:final, "How about tomorrow?"}})
+    harness = Harness.run_tasks(harness)
+    refute_received {:llm_request, _second}
+
+    spoken = harness |> Harness.outputs(Frames.OutputAudio) |> Enum.map(& &1.audio)
+    assert spoken == ["audio:Tomorrow at 10 works."]
+  end
+
+  test "preemptive generation cancels and re-runs when final transcript differs" do
+    test_pid = self()
+
+    plain_llm = fn opts, emit ->
+      send(test_pid, {:llm_request, opts})
+      last = List.last(opts[:input]).content
+      emit.({:text_delta, "Heard: " <> last <> "."})
+      {:ok, %{text: "Heard: " <> last <> ".", function_calls: [], continuation: []}}
+    end
+
+    harness =
+      spec(self())
+      |> replace(:llm, processor(:llm, Processors.LLM, request: plain_llm))
+      |> Harness.start!(ctx: %{ctx() | tools: []}, async: :manual)
+      |> Harness.push(%Frames.VADUserStartedSpeaking{})
+      |> Harness.info(:stt, {:stt, {:partial, "book tuesday"}})
+      |> Harness.push(%Frames.VADUserStoppedSpeaking{})
+
+    assert Harness.pending_tasks(harness) == [{:llm, :preemptive}]
+
+    # Final transcript corrected the day -> speculative task is cancelled, real one runs.
+    harness =
+      harness
+      |> Harness.info(:stt, {:stt, {:final, "Book Thursday."}})
+      |> Harness.run_tasks()
+
+    assert_received {:llm_request, confirmed}
+    assert List.last(confirmed[:input]).content == "Book Thursday."
+    refute_received {:llm_request, _other}
+
+    spoken = harness |> Harness.outputs(Frames.OutputAudio) |> Enum.map(& &1.audio)
+    assert spoken == ["audio:Heard: Book Thursday.."]
+  end
+
   defp apply_command({:output, frame}, harness),
     do: %{harness | outputs: [frame | harness.outputs]}
 

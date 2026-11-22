@@ -156,4 +156,41 @@ defmodule Octoroom.Agent.Cascaded.LLMTest do
                %{call_id: "call-1", name: "set_voice_focus", response: %{result: "ok"}}
              ])
   end
+
+  test "routes direct OpenAI turns through ReqLLM with reasoning_effort: :none" do
+    parent = self()
+
+    stream_fun = fn model, input, opts ->
+      send(parent, {:stream_request, model, input, opts})
+      {:ok, :stream_response}
+    end
+
+    process_stream_fun = fn :stream_response, callbacks ->
+      callbacks[:on_result].("Sure thing.")
+
+      {:ok,
+       %Response{
+         id: "response-2",
+         model: "gpt-5.4-nano",
+         context: [],
+         message: %Message{role: :assistant, content: [ContentPart.text("Sure thing.")]},
+         finish_reason: :stop
+       }}
+    end
+
+    assert {:ok, %{text: "Sure thing.", function_calls: []}} =
+             LLM.stream_turn(
+               provider: :openai,
+               model: "gpt-5.4-nano",
+               token: "sk-test",
+               input: [%{role: "user", content: "Book tomorrow"}],
+               reasoning_effort: :none,
+               stream_fun: stream_fun,
+               process_stream_fun: process_stream_fun
+             )
+
+    assert_receive {:stream_request, %{provider: :openai, id: "gpt-5.4-nano"}, _input, opts}
+    assert Keyword.fetch!(opts, :reasoning_effort) == :none
+    assert Keyword.fetch!(opts, :api_key) == "sk-test"
+  end
 end

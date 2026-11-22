@@ -185,14 +185,14 @@ defmodule HelloWeb.AgentLiveTest do
     |> render_change(%{"pipeline" => "cascaded_nemotron"})
 
     assert has_element?(view, ~s(#agent[data-pipeline="cascaded_nemotron"]))
-    assert has_element?(view, "#pipeline-label", "Soniox → Nemotron 3.5 Lightning → AssemblyAI")
+    assert has_element?(view, "#pipeline-label", "AssemblyAI EU → Nemotron 3.5 Lightning → AssemblyAI EU")
 
     view
     |> element("form[phx-change=select_pipeline]")
     |> render_change(%{"pipeline" => "booking"})
 
     assert has_element?(view, ~s(#agent[data-pipeline="booking"]))
-    assert has_element?(view, "#pipeline-label", "Soniox → Clef Flash Script → AssemblyAI")
+    assert has_element?(view, "#pipeline-label", "AssemblyAI EU → Clef Flash Script → AssemblyAI EU")
     refute has_element?(view, "#tool-chips")
 
     # Every assistant pipeline preset builds a valid pipeline spec and room worker spec.

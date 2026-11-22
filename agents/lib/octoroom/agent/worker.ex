@@ -1013,6 +1013,20 @@ defmodule Octoroom.Agent.Worker do
 
   defp front_command(
          input,
+         {:output, %Frames.PreemptiveTranscription{text: text} = frame},
+         {state, actions}
+       )
+       when is_binary(text) and text != "" do
+    if preempt_allowed?(input, text, state) do
+      {name, state} = speaker(input, state)
+      push_back(state, %{frame | speaker: name}, actions)
+    else
+      {state, actions}
+    end
+  end
+
+  defp front_command(
+         input,
          {:output, %Frames.Transcription{text: text} = frame},
          {state, actions}
        )
@@ -1183,6 +1197,22 @@ defmodule Octoroom.Agent.Worker do
     if state.presence == "waiting",
       do: set_presence(state, "listening", actions),
       else: {state, actions}
+  end
+
+  defp preempt_allowed?(input, text, state) do
+    case mode(state) do
+      :always ->
+        true
+
+      :addressed when state.gate != :decision ->
+        named = fn pattern -> Regex.match?(pattern, text) end
+
+        named.(state.name_pattern) or
+          (not Enum.any?(state.other_names, named) and follow_up?(input, state))
+
+      _other ->
+        false
+    end
   end
 
   # Mixed: the model decides for itself.
