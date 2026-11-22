@@ -86,7 +86,7 @@ defmodule Octoroom.Agent.Frames do
   # `spoke?`: the LLM said something before the calls (so no progress
   # message is needed).
   defframe(ToolCalls, :data, fields: [:calls, :continuation, :provider, spoke?: false])
-  defframe(ToolResults, :data, fields: [:messages], uninterruptible: true)
+  defframe(ToolResults, :data, fields: [:messages, results: []], uninterruptible: true)
   defframe(AsyncToolResult, :data, fields: [:result], uninterruptible: true)
   defframe(LLMContext, :data, fields: [:messages, :tools])
 

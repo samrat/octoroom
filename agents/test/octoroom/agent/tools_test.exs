@@ -5,6 +5,7 @@ defmodule Octoroom.Agent.ToolsTest do
   alias Octoroom.Agent.ToolAdapters.Gemini
   alias Octoroom.Agent.ToolAdapters.OpenAI
   alias Octoroom.Agent.ToolDispatcher
+  alias Octoroom.Agent.ToolResult
 
   defmodule FocusHandler do
     def set_focus(%{id: id, name: name, args: args}, context) do
@@ -69,6 +70,26 @@ defmodule Octoroom.Agent.ToolsTest do
             ],
             %{focus: "Prototype review"}} =
              ToolDispatcher.handle_calls([call], [focus_tool()], %{})
+  end
+
+  test "ToolResult.summary compacts and truncates large tool payloads" do
+    big = String.duplicate("a", 1_500)
+
+    summary =
+      ToolResult.summary(%{
+        call_id: "c1",
+        name: "search",
+        args: %{"query" => big},
+        response: %{"body" => big}
+      })
+
+    assert summary.call_id == "c1"
+    assert summary.name == "search"
+    assert String.ends_with?(summary.args, "…")
+    assert String.length(summary.args) <= 301
+    assert String.ends_with?(summary.response, "…")
+    assert String.length(summary.response) <= 1_001
+    assert ToolResult.format(summary) == "search(#{summary.args}) -> #{summary.response}"
   end
 
   defp review_card_tool do

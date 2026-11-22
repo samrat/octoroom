@@ -6,6 +6,7 @@ defmodule Octoroom.Agent.Processors.ContextTest do
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.Test, as: Harness
   alias Octoroom.Agent.Processors.Context
+  alias Octoroom.Agent.Restore
 
   defp start, do: processor(:context, Context) |> Harness.start!(ctx: %{owner: self()})
 
@@ -158,7 +159,7 @@ defmodule Octoroom.Agent.Processors.ContextTest do
     assert c1.id == c2.id and c2.sequence > c1.sequence
   end
 
-  test "carries on from what was saved" do
+  test "carries on from what was saved, with a reconnect notice by default" do
     saved = %{
       history: [
         %{role: "user", content: "[Alice] My name is Alice."},
@@ -172,9 +173,174 @@ defmodule Octoroom.Agent.Processors.ContextTest do
       |> Harness.start!(ctx: %{owner: self(), saved: saved})
       |> Harness.push(%Frames.Transcription{text: "What's my name?", turn_id: 1})
 
-    assert last_request(harness) == saved.history ++ [%{role: "user", content: "What's my name?"}]
+    assert last_request(harness) ==
+             saved.history ++
+               [
+                 %{role: "user", content: Restore.default_context_notice()},
+                 %{role: "user", content: "What's my name?"}
+               ]
 
     assert_received {:voice_pipeline, _,
                      {:conversation, %{conversation_id: "conv", sequence: 8, role: "user"}}}
+  end
+
+  test "restore option controls history, tool results, and reconnect notice" do
+    saved = %{
+      history: [
+        %{role: "user", content: "[Alice] Check Friday."},
+        %{
+          role: "user",
+          content: ~s|[Tool result, not said by the user] check() -> {"open":true}|,
+          tool_result: true
+        },
+        %{role: "assistant", content: "Friday is open."}
+      ],
+      conversation: %{id: "conv", sequence: 3}
+    }
+
+    # Omit reconnect notice and tool results.
+    harness =
+      processor(:context, Context, restore: [tool_results: false, notice: false])
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Transcription{text: "Book it.", turn_id: 1})
+
+    assert last_request(harness) == [
+             %{role: "user", content: "[Alice] Check Friday."},
+             %{role: "assistant", content: "Friday is open."},
+             %{role: "user", content: "Book it."}
+           ]
+
+    # Custom reconnect notice, keeping tool results without conversation history.
+    harness =
+      processor(:context, Context,
+        restore: [history: false, tool_results: true, notice: "[Reconnected] Brief recap above."]
+      )
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Transcription{text: "Book it.", turn_id: 1})
+
+    assert last_request(harness) == [
+             %{
+               role: "user",
+               content: ~s|[Tool result, not said by the user] check() -> {"open":true}|
+             },
+             %{role: "user", content: "[Reconnected] Brief recap above."},
+             %{role: "user", content: "Book it."}
+           ]
+
+    # restore: false starts fresh.
+    harness =
+      processor(:context, Context, restore: false)
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Transcription{text: "Hello?", turn_id: 1})
+
+    assert last_request(harness) == [%{role: "user", content: "Hello?"}]
+  end
+
+  test "restore: [prompt: true | string] triggers a reply on Start unless a turn arrives first" do
+    saved = %{
+      history: [
+        %{role: "user", content: "[Alice] Check Friday."},
+        %{role: "assistant", content: "Friday is open."}
+      ],
+      conversation: %{id: "conv", sequence: 2}
+    }
+
+    # prompt: true replies directly to the restored context (including the reconnect notice)
+    # without duplicating the notice.
+    harness =
+      processor(:context, Context, restore: [prompt: true])
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Start{})
+
+    assert Harness.timer_pending?(harness, :context, :restore_prompt)
+    harness = Harness.fire_timer(harness, :context, :restore_prompt)
+
+    assert last_request(harness) ==
+             saved.history ++ [%{role: "user", content: Restore.default_context_notice()}]
+
+    assert {:status, "Thinking"} in Harness.notifications(harness)
+
+    # Custom prompt string sends an app-originated prompt message.
+    harness =
+      processor(:context, Context,
+        restore: [notice: false, prompt: "Let Alice know you're back and continue."]
+      )
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Start{})
+      |> Harness.fire_timer(:context, :restore_prompt)
+
+    assert last_request(harness) ==
+             saved.history ++
+               [
+                 %{
+                   role: "user",
+                   content:
+                     "[From the app, not said by anyone on the call] Let Alice know you're back and continue."
+                 }
+               ]
+
+    # If the user speaks before the delay elapses, the pending restore prompt is cancelled.
+    harness =
+      processor(:context, Context, restore: [prompt: true])
+      |> Harness.start!(ctx: %{owner: self(), saved: saved})
+      |> Harness.push(%Frames.Start{})
+      |> Harness.push(%Frames.Transcription{text: "Are you there?", turn_id: 1})
+
+    refute Harness.timer_pending?(harness, :context, :restore_prompt)
+  end
+
+  test "saves blocking tool call results into history and memory before the reply completes" do
+    harness =
+      start()
+      |> Harness.push(%Frames.Transcription{text: "Check Friday.", speaker: "Alice", turn_id: 1})
+      |> Harness.push(
+        %Frames.ToolResults{
+          messages: [],
+          results: [
+            %{
+              call_id: "c1",
+              name: "check_availability",
+              args: ~s({"date":"2026-11-27"}),
+              response: ~s({"slots":["09:00","14:00"]})
+            }
+          ]
+        },
+        :upstream
+      )
+
+    # Even before the assistant reply arrives, the tool result is saved in memory.
+    assert Enum.any?(memories(), fn %{history: hist} ->
+             Enum.any?(
+               hist,
+               &(&1.role == "user" and
+                   &1.content =~ ~s|check_availability({"date":"2026-11-27"})| and
+                   &1.content =~ ~s|"09:00"|)
+             )
+           end)
+
+    assert_received {:voice_pipeline, _,
+                     {:tool_result,
+                      %{
+                        call_id: "c1",
+                        name: "check_availability",
+                        args: ~s({"date":"2026-11-27"}),
+                        response: ~s({"slots":["09:00","14:00"]})
+                      }}}
+
+    harness =
+      Harness.push(
+        harness,
+        %Frames.AssistantMessage{text: "Friday has 9 AM and 2 PM open."},
+        :upstream
+      )
+
+    assert [
+             %{role: "user", content: "[Alice] Check Friday."},
+             %{
+               role: "user",
+               content: "[Tool result, not said by the user] check_availability" <> _
+             },
+             %{role: "assistant", content: "Friday has 9 AM and 2 PM open."}
+           ] = history(harness)
   end
 end

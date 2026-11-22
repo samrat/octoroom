@@ -48,11 +48,14 @@ defmodule Octoroom.Agent.Processors.Context do
   alias Octoroom.Agent.Cascaded.AudioTurn
   alias Octoroom.Agent.ConversationEvents
   alias Octoroom.Agent.Frames
+  alias Octoroom.Agent.Restore
+  alias Octoroom.Agent.ToolResult
   alias ReqLLM.Message.ContentPart
 
   @impl true
   def init(opts, ctx) do
-    saved = Map.get(ctx, :saved) || %{}
+    restore = Restore.normalize(Keyword.get(opts, :restore, Map.get(ctx, :restore, true)))
+    saved = if restore.enabled?, do: Map.get(ctx, :saved) || %{}, else: %{}
 
     events =
       case saved do
@@ -63,9 +66,22 @@ defmodule Octoroom.Agent.Processors.Context do
           ConversationEvents.new()
       end
 
+    saved_history = Map.get(saved, :history, [])
+    history = Restore.restore_history(saved_history, restore)
+
+    restore_prompt =
+      if restore.enabled? and saved_history != [] do
+        case restore.prompt do
+          true -> true
+          text when is_binary(text) and text != "" -> text
+          _ -> nil
+        end
+      end
+
     state = %{
       instructions: Keyword.get(opts, :instructions, Map.get(ctx, :instructions)),
       initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      restore_prompt: restore_prompt,
       tools: Keyword.get(opts, :tools, Map.get(ctx, :tools, [])),
       max_tool_rounds: Keyword.get(opts, :max_tool_rounds, 4),
       max_history: Keyword.get(opts, :max_history, 20),
@@ -75,7 +91,7 @@ defmodule Octoroom.Agent.Processors.Context do
       clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
       # Latest video frame per source (`"<participant>/<source>"` => `%{frame, at}`).
       frames: %{},
-      history: Map.get(saved, :history, []),
+      history: history,
       input: [],
       rounds_left: 0,
       audio_turns: %{},
@@ -122,6 +138,11 @@ defmodule Octoroom.Agent.Processors.Context do
   defp frame(%Frames.VideoInactive{source: source}, :downstream, state) do
     {[], %{state | frames: Map.delete(state.frames, source)}}
   end
+
+  defp frame(%Frames.Start{} = frame, :downstream, %{restore_prompt: prompt} = state)
+       when not is_nil(prompt),
+       do:
+         {[{:push, frame, :downstream}, {:timer, :restore_prompt, state.initial_delay_ms}], state}
 
   defp frame(%Frames.Start{} = frame, :downstream, %{initial_text: text} = state)
        when is_binary(text) and text != "",
@@ -176,8 +197,9 @@ defmodule Octoroom.Agent.Processors.Context do
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end
 
-  defp frame(%Frames.ToolResults{messages: messages}, :upstream, state) do
+  defp frame(%Frames.ToolResults{messages: messages, results: results}, :upstream, state) do
     input = state.input ++ messages
+    state = record_tool_results(state, results)
 
     if state.rounds_left > 0 do
       state = %{state | input: input, rounds_left: state.rounds_left - 1}
@@ -246,11 +268,13 @@ defmodule Octoroom.Agent.Processors.Context do
          state
        ) do
     Logger.info("ASYNC_TOOL_RESULT name=#{result.name} scheduling=silent")
+    emit_tool_result(state, ToolResult.summary(result))
     {[], %{state | history: append(state.history, async_result_message(result), state)}}
   end
 
   defp frame(%Frames.AsyncToolResult{result: result}, :upstream, state) do
     Logger.info("ASYNC_TOOL_RESULT name=#{result.name} scheduling=#{result.scheduling} speaking")
+    emit_tool_result(state, ToolResult.summary(result))
     {effects, state} = start_turn(async_result_message(result), state)
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end
@@ -259,6 +283,29 @@ defmodule Octoroom.Agent.Processors.Context do
 
   defp timer(:initial_text, state) do
     {effects, state} = start_turn(%{role: "user", content: state.initial_text}, state)
+    {[{:notify, {:status, "Thinking"}} | effects], state}
+  end
+
+  defp timer(:restore_prompt, %{restore_prompt: nil} = state), do: {[], state}
+
+  defp timer(:restore_prompt, %{restore_prompt: true} = state) do
+    state = %{state | restore_prompt: nil}
+
+    {effects, state} =
+      case List.last(state.history) do
+        %{role: "user"} ->
+          start_reply(state)
+
+        _ ->
+          start_turn(%{role: "user", content: Restore.default_context_notice()}, state)
+      end
+
+    {[{:notify, {:status, "Thinking"}} | effects], state}
+  end
+
+  defp timer(:restore_prompt, %{restore_prompt: text} = state) when is_binary(text) do
+    message = %{role: "user", content: "[From the app, not said by anyone on the call] " <> text}
+    {effects, state} = start_turn(message, %{state | restore_prompt: nil})
     {[{:notify, {:status, "Thinking"}} | effects], state}
   end
 
@@ -288,14 +335,19 @@ defmodule Octoroom.Agent.Processors.Context do
   # `AssistantMessage` comes back. Fresh video frames are attached only to
   # the outgoing turn's `LLMContext` and never stored in `history`.
   defp start_turn(message, state, opts \\ []) do
+    cancel = if state.restore_prompt != nil, do: [{:cancel_timer, :restore_prompt}], else: []
     history = append(state.history, message, state)
+    {effects, state} = start_reply(%{state | history: history, restore_prompt: nil}, opts)
+    {cancel ++ effects, state}
+  end
 
+  defp start_reply(state, opts \\ []) do
     input =
       state.instructions
-      |> prompt_input(history)
+      |> prompt_input(state.history)
       |> attach_frames(state, Keyword.get(opts, :speaker_source))
 
-    history = append(history, @reply_pending, state)
+    history = append(state.history, @reply_pending, state)
     state = %{state | history: history, input: input, rounds_left: state.max_tool_rounds}
     {[context_frame(input, state.tools)], state}
   end
@@ -398,8 +450,8 @@ defmodule Octoroom.Agent.Processors.Context do
   defp prompt_input(instructions, history) when instructions in [nil, ""] do
     Enum.flat_map(history, fn
       %{reply_pending: true, content: nil} -> []
-      %{reply_pending: true} = draft -> [Map.drop(draft, [:reply_pending, :event])]
-      message -> [message]
+      %{reply_pending: true} = draft -> [Map.drop(draft, [:reply_pending, :event, :tool_result])]
+      message -> [Map.drop(message, [:tool_result])]
     end)
   end
 
@@ -407,6 +459,48 @@ defmodule Octoroom.Agent.Processors.Context do
     do: [%{role: "system", content: instructions} | prompt_input(nil, history)]
 
   defp append(history, message, state), do: Enum.take(history ++ [message], -state.max_history)
+
+  defp record_tool_results(state, []), do: state
+
+  defp record_tool_results(state, results) when is_list(results) do
+    Enum.each(results, &emit_tool_result(state, &1))
+
+    message = tool_results_message(results)
+
+    history =
+      case Enum.find_index(state.history, &pending?/1) do
+        nil -> append(state.history, message, state)
+        index -> state.history |> List.insert_at(index, message) |> Enum.take(-state.max_history)
+      end
+
+    %{state | history: history}
+  end
+
+  defp record_tool_results(state, _other), do: state
+
+  defp emit_tool_result(%{events: %{owner: owner}}, entry) when is_pid(owner) do
+    send(owner, {:voice_pipeline, self(), {:tool_result, entry}})
+  end
+
+  defp emit_tool_result(_state, _entry), do: :ok
+
+  defp tool_results_message([single]) do
+    %{
+      role: "user",
+      content: "[Tool result, not said by the user] " <> ToolResult.format(single),
+      tool_result: true
+    }
+  end
+
+  defp tool_results_message(results) do
+    lines = Enum.map_join(results, "\n", &ToolResult.format/1)
+
+    %{
+      role: "user",
+      content: "[Tool results, not said by the user]\n" <> lines,
+      tool_result: true
+    }
+  end
 
   defp update_events(state, fun), do: %{state | events: fun.(state.events)}
 
@@ -420,7 +514,8 @@ defmodule Octoroom.Agent.Processors.Context do
       role: "user",
       content:
         "[Background result, not said by the user] The #{name} tool finished: " <>
-          "#{encode(response)}. #{instruction}"
+          "#{encode(response)}. #{instruction}",
+      tool_result: true
     }
   end
 

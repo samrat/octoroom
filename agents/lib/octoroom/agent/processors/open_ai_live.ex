@@ -51,7 +51,9 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   alias Octoroom.Agent.ConversationEvents
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.OpenAILive.{Protocol, WebRTC, WebSocket}
+  alias Octoroom.Agent.Restore
   alias Octoroom.Agent.ToolExecutor
+  alias Octoroom.Agent.ToolResult
 
   @output_sample_rate 24_000
   @initial_text_delay_ms 1_000
@@ -72,7 +74,8 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   defp start(model, opts, ctx) do
     tools = Keyword.get(opts, :tools, Map.get(ctx, :tools, []))
     instructions = Keyword.get(opts, :instructions, Map.get(ctx, :instructions))
-    resume = Map.get(ctx, :resume) || %{}
+    restore = Restore.normalize(Keyword.get(opts, :restore, Map.get(ctx, :restore, true)))
+    resume = if restore.enabled?, do: Map.get(ctx, :resume) || %{}, else: %{}
     transport = Protocol.transport(Keyword.get(opts, :transport, Protocol.default_transport()))
 
     sample_rate =
@@ -110,7 +113,14 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
         model: model,
         voice: voice,
         sample_rate: sample_rate,
-        instructions: with_transcript(instructions, resume[:items]),
+        instructions:
+          Restore.with_transcript(
+            instructions,
+            resume[:items],
+            resume[:tool_results],
+            restore,
+            resume != %{}
+          ),
         delegation: delegation,
         tools: tools
       ] ++ Keyword.take(opts, [:initial_items, :idle_timeout_s, :wake_policy])
@@ -373,6 +383,10 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
     do: {[], %{state | context: Map.put(state.context, :frames, frames)}}
 
   def handle_info({:octoroom_agent_async_tool_result, %{response: response} = result}, state) do
+    if is_pid(state.owner) do
+      send(state.owner, {:voice_pipeline, self(), {:tool_result, ToolResult.summary(result)}})
+    end
+
     send_openai(state, {:tool_output, result.call_id, response})
     pending = MapSet.delete(state.pending_tool_calls, result.call_id)
     if MapSet.size(pending) == 0, do: send_openai(state, :response_create)
@@ -583,33 +597,6 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
   defp ensure_user_idle_timer(state),
     do: {[{:timer, :user_idle, @user_idle_ms}], %{state | user_idle_timer?: true}}
-
-  # The conversation so far (the agent's saved items), after the instructions,
-  # when restarting mid-call.
-  @transcript_items 50
-  @transcript_chars 8_000
-
-  defp with_transcript(instructions, [_ | _] = items) do
-    lines =
-      items
-      |> Enum.take(-@transcript_items)
-      |> Enum.map_join("\n", fn
-        %{role: "assistant", text: text} -> "You: " <> text
-        %{speaker: speaker, text: text} when is_binary(speaker) -> "[#{speaker}] " <> text
-        %{text: text} -> "[someone] " <> text
-      end)
-
-    lines = String.slice(lines, -@transcript_chars, @transcript_chars)
-
-    prefix =
-      if is_binary(instructions) and instructions != "", do: instructions <> "\n\n", else: ""
-
-    prefix <>
-      "You were restarted in the middle of this call. " <>
-      "What was said before, oldest first:\n" <> lines
-  end
-
-  defp with_transcript(instructions, _none), do: instructions
 
   defp assistant_text(state) do
     case get_in(state, [:conversation_events, :pending, :assistant]) do

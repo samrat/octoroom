@@ -446,11 +446,49 @@ defmodule Octoroom.Agent.WorkerTest do
              "Hello there.",
              "[Alice] My name is Alice.",
              "Hello there.",
+             Octoroom.Agent.Restore.default_context_notice(),
              "[Alice] What's my name?"
            ]
 
     # Saved just after the turn reaches the LLM.
     wait_until(fn -> length(Octoroom.Agent.conversation(ctx.room_id, "assistant")) == 4 end)
+  end
+
+  test "a restarted cascaded agent can automatically prompt a reply on reconnect", ctx do
+    %{alice: alice} =
+      start(ctx, 50, %{
+        restore: [prompt: "Apologize briefly for the disconnect and continue."]
+      })
+
+    say(ctx, alice, {:final, "My name is Alice."})
+    assert_receive {:llm, ["Be brief.", "[Alice] My name is Alice."]}, 1_000
+
+    assert_receive {:octoroom, _,
+                    {:worker_event, "assistant",
+                     {:agent, {:conversation, %{role: "assistant", status: "completed"}}}}},
+                   1_000
+
+    wait_until(fn ->
+      match?(
+        %{history: [_, %{role: "assistant", content: "Hello there."}]},
+        Octoroom.Worker.saved(ctx.room_id, "assistant")
+      )
+    end)
+
+    pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+    Process.exit(pid, :kill)
+    wait_until(fn -> Octoroom.Worker.whereis(ctx.room_id, "assistant") not in [nil, pid] end)
+
+    # Without anyone speaking, the restored agent automatically prompts the LLM.
+    assert_receive {:llm, request}, 2_000
+
+    assert request == [
+             "Be brief.",
+             "[Alice] My name is Alice.",
+             "Hello there.",
+             Octoroom.Agent.Restore.default_context_notice(),
+             "[From the app, not said by anyone on the call] Apologize briefly for the disconnect and continue."
+           ]
   end
 
   test "talking over the agent flushes what it hasn't played yet", ctx do
@@ -792,6 +830,26 @@ defmodule Octoroom.Agent.WorkerTest do
                      1_000
 
       assert_receive {:ingest, ^cf, _}, 1_000
+
+      wait_until(fn ->
+        match?(
+          %{tool_results: [%{call_id: "c1", name: "whoami"}]},
+          Octoroom.Worker.saved(ctx.room_id, "assistant")
+        )
+      end)
+
+      # After a crash, the restored agent still sees the tool result in its LLM history.
+      pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+      Process.exit(pid, :kill)
+      wait_until(fn -> Octoroom.Worker.whereis(ctx.room_id, "assistant") not in [nil, pid] end)
+      hear(ctx, alice)
+
+      saved = Octoroom.Worker.saved(ctx.room_id, "assistant")
+
+      assert Enum.any?(
+               saved.history,
+               &(&1.role == "user" and &1.content =~ "whoami()" and &1.content =~ "Alice")
+             )
     end
 
     test "say/3 speaks word for word, into the conversation", ctx do
@@ -1304,6 +1362,41 @@ defmodule Octoroom.Agent.WorkerTest do
 
       assert_receive {:to_openai, {:connect, connect}}, 2_000
       assert connect[:setup][:instructions] =~ "[Alice] What's up?"
+    end
+
+    test "persists tool call results across OpenAI Live restarts", ctx do
+      start_openai_live(ctx)
+      assert_receive {:to_openai, {:connect, [transport: :webrtc, setup: _]}}
+
+      :ok =
+        Octoroom.Worker.send(
+          ctx.room_id,
+          "assistant",
+          {:octoroom_agent_async_tool_result,
+           %{
+             call_id: "c1",
+             name: "book_appointment",
+             args: %{"time" => "09:00"},
+             response: %{confirmation_code: "EX-1042"},
+             scheduling: :when_idle,
+             event: nil
+           }}
+        )
+
+      wait_until(fn ->
+        match?(
+          %{tool_results: [%{call_id: "c1", name: "book_appointment"}]},
+          Octoroom.Worker.saved(ctx.room_id, "assistant")
+        )
+      end)
+
+      pid = Octoroom.Worker.whereis(ctx.room_id, "assistant")
+      Process.exit(pid, :kill)
+
+      assert_receive {:to_openai, {:connect, connect}}, 2_000
+
+      assert connect[:setup][:instructions] =~
+               ~s|[Tool] book_appointment({"time":"09:00"}) -> {"confirmation_code":"EX-1042"}|
     end
 
     test "a module picks openai_live as its pipeline, and it can't be silent" do

@@ -145,13 +145,23 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
   end
 
   test "tool calls run and their results go back to the model" do
-    harness = live(start(), {:tool_call, [%{id: "c1", name: "add_row", args: %{}}]})
+    harness =
+      live(start(), {:tool_call, [%{id: "c1", name: "add_row", args: %{"sheet" => "Leads"}}]})
 
     assert_receive {:octoroom_agent_async_tool_result, _} = result
     Test.info(harness, :gemini, result)
 
     assert_received {:to_gemini,
                      {:tool_response, [%{id: "c1", name: "add_row", response: %{result: "ok"}}]}}
+
+    assert_received {:voice_pipeline, _,
+                     {:tool_result,
+                      %{
+                        call_id: "c1",
+                        name: "add_row",
+                        args: ~s({"sheet":"Leads"}),
+                        response: ~s({"result":"ok"})
+                      }}}
   end
 
   test "each new resumption handle goes to the agent, to save" do
@@ -181,6 +191,69 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
     instruction = connect[:fallback_setup][:system_instruction]
     assert instruction =~ ~r/^Be brief\./
     assert instruction =~ "[Alice] I'm Alice.\nYou: Hi Alice.\n[someone] hmm"
+  end
+
+  test "interleaves saved tool call results into the fallback transcript in order" do
+    items = [
+      %{role: "user", text: "Book Friday at 9.", speaker: "Alice", at: 1_000},
+      %{role: "assistant", text: "Booked!", at: 3_000}
+    ]
+
+    tool_results = [
+      %{
+        call_id: "c1",
+        name: "book_appointment",
+        args: ~s({"time":"09:00"}),
+        response: ~s({"code":"EX-1042"}),
+        at: 2_000
+      }
+    ]
+
+    processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+      model: "gemini-live-x",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief."
+    )
+    |> Test.start!(ctx: %{resume: %{handle: "h1", items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, connect}}
+    instruction = connect[:fallback_setup][:system_instruction]
+
+    assert instruction =~
+             "[Alice] Book Friday at 9.\n" <>
+               ~s|[Tool] book_appointment({"time":"09:00"}) -> {"code":"EX-1042"}\n| <>
+               "You: Booked!"
+  end
+
+  test "restore option controls session handle, transcript, tool results, and notice" do
+    items = [%{role: "user", text: "Book Friday.", speaker: "Alice", at: 1_000}]
+    tool_results = [%{call_id: "c1", name: "book", response: "ok", at: 2_000}]
+
+    processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+      model: "gemini-live-x",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief.",
+      restore: [session: false, tool_results: false, notice: "Reconnected; earlier chat:"]
+    )
+    |> Test.start!(ctx: %{resume: %{handle: "h1", items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, connect}}
+    assert connect[:handle] == nil
+    instruction = connect[:fallback_setup][:system_instruction]
+    assert instruction == "Be brief.\n\nReconnected; earlier chat:\n[Alice] Book Friday."
+    refute instruction =~ "[Tool]"
+
+    processor(:gemini, Octoroom.Agent.Processors.GeminiLive,
+      model: "gemini-live-x",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief.",
+      restore: false
+    )
+    |> Test.start!(ctx: %{resume: %{handle: "h1", items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, fresh}}
+    assert fresh[:handle] == nil
+    assert fresh[:fallback_setup][:system_instruction] == "Be brief."
   end
 
   test "sends the initial text once set up and started" do

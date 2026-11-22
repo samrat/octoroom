@@ -189,10 +189,12 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
 
     harness = Test.info(harness, :openai, r1)
     assert_received {:to_openai, {:tool_output, ^id1, %{result: "ok"}}}
+    assert_received {:voice_pipeline, _, {:tool_result, %{call_id: ^id1, name: "add_row"}}}
     refute_received {:to_openai, :response_create}
 
     Test.info(harness, :openai, r2)
     assert_received {:to_openai, {:tool_output, ^id2, %{result: "ok"}}}
+    assert_received {:voice_pipeline, _, {:tool_result, %{call_id: ^id2, name: "add_row"}}}
     assert_received {:to_openai, :response_create}
   end
 
@@ -224,6 +226,65 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
     instruction = connect[:setup][:instructions]
     assert instruction =~ ~r/^Be brief\./
     assert instruction =~ "[Alice] I'm Alice.\nYou: Hi Alice.\n[someone] hmm"
+  end
+
+  test "restores saved tool results alongside the transcript in instructions on restart" do
+    items = [
+      %{role: "user", text: "Check slots.", speaker: "Alice", at: 1_000},
+      %{role: "assistant", text: "9 AM is open.", at: 3_000}
+    ]
+
+    tool_results = [
+      %{
+        call_id: "c1",
+        name: "check_availability",
+        args: ~s({"date":"2026-11-27"}),
+        response: ~s({"slots":["09:00"]}),
+        at: 2_000
+      }
+    ]
+
+    processor(:openai, Octoroom.Agent.Processors.OpenAILive,
+      model: "gpt-live-1.1",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief."
+    )
+    |> Test.start!(ctx: %{resume: %{handle: nil, items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, connect}}
+    instruction = connect[:setup][:instructions]
+
+    assert instruction =~
+             "[Alice] Check slots.\n" <>
+               ~s|[Tool] check_availability({"date":"2026-11-27"}) -> {"slots":["09:00"]}\n| <>
+               "You: 9 AM is open."
+  end
+
+  test "restore option controls transcript, tool results, and notice" do
+    items = [%{role: "user", text: "Check slots.", speaker: "Alice", at: 1_000}]
+    tool_results = [%{call_id: "c1", name: "check", response: "open", at: 2_000}]
+
+    processor(:openai, Octoroom.Agent.Processors.OpenAILive,
+      model: "gpt-live-1.1",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief.",
+      restore: [history: false, tool_results: true, notice: false]
+    )
+    |> Test.start!(ctx: %{resume: %{handle: nil, items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, connect}}
+    assert connect[:setup][:instructions] == "Be brief.\n\n[Tool] check() -> open"
+
+    processor(:openai, Octoroom.Agent.Processors.OpenAILive,
+      model: "gpt-live-1.1",
+      send: &send(self(), {:sent, &1}),
+      instructions: "Be brief.",
+      restore: false
+    )
+    |> Test.start!(ctx: %{resume: %{handle: nil, items: items, tool_results: tool_results}})
+
+    assert_received {:sent, {:connect, fresh}}
+    assert fresh[:setup][:instructions] == "Be brief."
   end
 
   test "sends initial_text once session_started and Start have both arrived" do

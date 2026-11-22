@@ -41,6 +41,7 @@ defmodule Octoroom.Agent.ToolExecutor do
            %{
              call_id: Map.get(call, :id),
              name: Map.get(call, :name),
+             args: Map.get(call, :args),
              response: Map.get(response, :response, response),
              scheduling: scheduling,
              event: event

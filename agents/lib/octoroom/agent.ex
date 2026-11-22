@@ -188,7 +188,8 @@ defmodule Octoroom.Agent do
     :gate,
     :thresholds,
     :decisions,
-    :follow_up_ms
+    :follow_up_ms,
+    :restore
   ]
 
   @doc """
@@ -211,6 +212,12 @@ defmodule Octoroom.Agent do
       never speaks (no text-to-speech, no output track: a data output
       named after the id instead, for its presence and transcript).
       Default `true`.
+    * `restore:` - what to restore into the model's context if the agent
+      restarts mid-call: `true` (default), `false`, or a keyword list of
+      `history:`, `tool_results:`, `session:` (Gemini Live resumption handle),
+      `notice:` (`true`, `false`/`nil`, or a custom reconnect string), and
+      `prompt:` (cascaded only: `false` by default, `true` to automatically
+      reply to the restored context, or a custom prompt string).
     * `args:` - passed to the callbacks as `ctx.args`. Changing it
       restarts the agent.
     * `gate:`, `thresholds:`, `decisions:`, `follow_up_ms:` - see

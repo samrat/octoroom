@@ -46,8 +46,10 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   alias Octoroom.Agent.ConversationEvents
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.GeminiLive.{Protocol, WebSocket}
+  alias Octoroom.Agent.Restore
   alias Octoroom.Agent.ToolAdapters.Gemini, as: GeminiTools
   alias Octoroom.Agent.ToolExecutor
+  alias Octoroom.Agent.ToolResult
 
   @initial_text_delay_ms 1_000
   # How long without input audio before the model is told the stream paused
@@ -66,7 +68,9 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     tools = Keyword.get(opts, :tools, Map.get(ctx, :tools, []))
 
     instructions = Keyword.get(opts, :instructions, Map.get(ctx, :instructions))
-    resume = Map.get(ctx, :resume) || %{}
+    restore = Restore.normalize(Keyword.get(opts, :restore, Map.get(ctx, :restore, true)))
+    resume = if restore.enabled?, do: Map.get(ctx, :resume) || %{}, else: %{}
+    handle = if restore.session, do: resume[:handle]
 
     if Keyword.has_key?(opts, :context_window_compression) do
       Protocol.context_window_compression(opts[:context_window_compression])
@@ -88,9 +92,19 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
           :response_modalities
         ])
 
-    # A new session after a restart: the model is told what was said.
+    # A new session after a restart: the model is told what was said and what tools returned.
     fallback_setup =
-      Keyword.put(setup, :system_instruction, with_transcript(instructions, resume[:items]))
+      Keyword.put(
+        setup,
+        :system_instruction,
+        Restore.with_transcript(
+          instructions,
+          resume[:items],
+          resume[:tool_results],
+          restore,
+          resume != %{}
+        )
+      )
 
     state = %{
       send: Keyword.get(opts, :send),
@@ -138,8 +152,8 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
                WebSocket.start_link(
                  api_key: api_key,
                  parent: runner,
-                 handle: resume[:handle],
-                 setup: if(resume[:handle], do: setup, else: fallback_setup),
+                 handle: handle,
+                 setup: if(handle, do: setup, else: fallback_setup),
                  fallback_setup: fallback_setup
                ) do
           {:ok, %{state | socket: socket}}
@@ -147,7 +161,7 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
       _test ->
         # What it would connect with, for tests that pass `send:`.
-        connect = [handle: resume[:handle], fallback_setup: fallback_setup]
+        connect = [handle: handle, fallback_setup: fallback_setup]
         send_gemini(state, {:connect, connect})
         {:ok, state}
     end
@@ -312,6 +326,10 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     do: {[], %{state | context: Map.put(state.context, :frames, frames)}}
 
   def handle_info({:octoroom_agent_async_tool_result, %{response: response} = result}, state) do
+    if is_pid(state.owner) do
+      send(state.owner, {:voice_pipeline, self(), {:tool_result, ToolResult.summary(result)}})
+    end
+
     response =
       %{id: result.call_id, name: result.name, response: response}
       |> Map.reject(fn {_k, v} -> is_nil(v) end)
@@ -461,29 +479,6 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   end
 
   defp event(_event, state), do: {[], state}
-
-  # The conversation so far (the agent's saved items), after the
-  # instructions, for a new session that can't resume the old one.
-  @transcript_items 50
-  @transcript_chars 8_000
-
-  defp with_transcript(instructions, [_ | _] = items) do
-    lines =
-      items
-      |> Enum.take(-@transcript_items)
-      |> Enum.map_join("\n", fn
-        %{role: "assistant", text: text} -> "You: " <> text
-        %{speaker: speaker, text: text} when is_binary(speaker) -> "[#{speaker}] " <> text
-        %{text: text} -> "[someone] " <> text
-      end)
-
-    lines = String.slice(lines, -@transcript_chars, @transcript_chars)
-
-    "#{instructions}\n\nYou were restarted in the middle of this call. " <>
-      "What was said before, oldest first:\n" <> lines
-  end
-
-  defp with_transcript(instructions, _none), do: instructions
 
   # The transcript of the model's audio, or its text if it sent text instead.
   defp assistant_text(state) do

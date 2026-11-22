@@ -103,6 +103,12 @@ defmodule Octoroom.Agent.Processors.CascadedTest do
 
     history = Harness.state(harness, :context).history
     assert List.last(history) == %{role: "assistant", content: "Let me check. It's sunny."}
+
+    assert Enum.any?(
+             history,
+             &(&1.role == "user" and &1.content =~ ~s|get_weather({"city":"Lisbon"})| and
+                 &1.content =~ ~s|"sunny"|)
+           )
   end
 
   test "barge-in before any audio kills the reply, and nothing was said" do

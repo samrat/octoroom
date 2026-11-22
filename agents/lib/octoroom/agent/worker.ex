@@ -228,6 +228,7 @@ defmodule Octoroom.Agent.Worker do
   alias Octoroom.Agent.Audio.Mixer
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.{Core, Host, Spec}
+  alias Octoroom.Agent.Restore
 
   @in_rate 16_000
   @out_rate 24_000
@@ -512,6 +513,13 @@ defmodule Octoroom.Agent.Worker do
   # What the context stage would need to carry on after a restart.
   def handle_info({:voice_pipeline, _from, {:memory, memory}}, state) do
     state = %{state | memory: Map.merge(state.memory, memory)}
+    {:ok, state, save: state.memory}
+  end
+
+  # Compact summaries of completed tool calls, kept with the memory so a
+  # restarted agent knows what tools already returned.
+  def handle_info({:voice_pipeline, _from, {:tool_result, entry}}, state) do
+    state = update_in(state.memory.tool_results, &put_tool_result(&1, entry))
     {:ok, state, save: state.memory}
   end
 
@@ -848,6 +856,8 @@ defmodule Octoroom.Agent.Worker do
   defp voice_for_mixed(_front, _args), do: :ok
 
   defp back_ctx(args, ctx) do
+    restore = Restore.normalize(Map.get(args, :restore, true))
+
     tool_context =
       args
       |> Map.get(:tool_context, %{})
@@ -860,19 +870,24 @@ defmodule Octoroom.Agent.Worker do
       telemetry: %{room_id: ctx.room_id, agent_id: ctx.id},
       instructions: Map.get(args, :instructions),
       # Carrying on a conversation: no greeting.
-      initial_text: if(restored?(ctx), do: nil, else: Map.get(args, :initial_text)),
+      initial_text: if(restored?(ctx, restore), do: nil, else: Map.get(args, :initial_text)),
       tools: Map.get(args, :tools, []),
       context: tool_context,
-      saved: if(restored?(ctx), do: Map.take(ctx.saved, [:history, :conversation])),
-      # For Gemini Live: its session to resume, and what was said, for a
-      # new session if it can't.
-      resume: resume(ctx.saved)
+      restore: restore,
+      saved:
+        if(restore.enabled? and restored?(ctx, restore),
+          do: Map.take(ctx.saved, [:history, :conversation])
+        ),
+      # For Gemini Live / OpenAI Live: session handle (if enabled) and what was
+      # said / returned by tools, for a new session if it can't resume.
+      resume: if(restore.enabled?, do: resume(ctx.saved, restore))
     }
   end
 
   defp session_id(ctx), do: "#{ctx.room_id}/#{ctx.id}"
 
   @max_items 200
+  @max_tool_results 50
 
   # What was saved, with a reply that was playing when the agent stopped
   # marked interrupted: the rest of it was never heard.
@@ -890,34 +905,46 @@ defmodule Octoroom.Agent.Worker do
     Map.merge(Map.take(saved, [:gemini_handle]), %{
       history: history,
       conversation: conversation,
-      items: items
+      items: items,
+      tool_results: Map.get(saved, :tool_results, [])
     })
   end
 
-  defp restored(_nothing), do: %{history: [], conversation: nil, items: []}
+  defp restored(_nothing), do: %{history: [], conversation: nil, items: [], tool_results: []}
 
-  # A cascaded agent's history, or a Gemini Live conversation.
-  defp restored?(ctx),
-    do: match?(%{history: [_ | _]}, ctx.saved) or resume(ctx.saved) != nil
+  # A cascaded agent's history, or a Gemini Live / OpenAI Live conversation.
+  defp restored?(ctx, restore) do
+    restore.enabled? and
+      (match?(%{history: [_ | _]}, ctx.saved) or resume(ctx.saved, restore) != nil)
+  end
 
   # Gemini keeps a session for 2 hours after it ends; a minute's margin.
   @handle_ms :timer.hours(2) - :timer.minutes(1)
 
-  defp resume(%{items: items} = saved) do
-    handle =
-      case saved do
-        %{gemini_handle: %{handle: handle, at: at}} ->
-          if System.system_time(:millisecond) - at < @handle_ms, do: handle
+  defp resume(%{items: items} = saved, restore) do
+    tool_results = Map.get(saved, :tool_results, [])
 
-        _ ->
-          nil
+    handle =
+      if restore.session do
+        case saved do
+          %{gemini_handle: %{handle: handle, at: at}} ->
+            if System.system_time(:millisecond) - at < @handle_ms, do: handle
+
+          _ ->
+            nil
+        end
       end
 
-    if handle || match?(%{gemini_handle: _}, saved) || items != [],
-      do: %{handle: handle, items: items}
+    if handle || match?(%{gemini_handle: _}, saved) || items != [] || tool_results != [],
+      do: %{handle: handle, items: items, tool_results: tool_results}
   end
 
-  defp resume(_nothing), do: nil
+  defp resume(_nothing, _restore), do: nil
+
+  defp put_tool_result(results, entry) do
+    entry = Map.put_new(entry, :at, System.system_time(:millisecond))
+    Enum.take(results ++ [entry], -@max_tool_results)
+  end
 
   # The latest version of each item, in the order they started, with when
   # each was first seen (`at`, unix ms).

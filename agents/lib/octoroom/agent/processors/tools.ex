@@ -34,6 +34,7 @@ defmodule Octoroom.Agent.Processors.Tools do
   alias Octoroom.Agent.Cascaded.LLM
   alias Octoroom.Agent.Tool
   alias Octoroom.Agent.ToolExecutor
+  alias Octoroom.Agent.ToolResult
 
   @async_placeholder %{
     status: "started",
@@ -114,13 +115,18 @@ defmodule Octoroom.Agent.Processors.Tools do
 
   # A blocking round finished.
   def handle_event({:async, {:run, calls}, {:done, {results, context}}}, _state, data) do
-    outputs =
+    sync_outputs =
       Enum.map(results, fn {response, _event} ->
         %{call_id: response.id, name: response.name, response: response.response}
-      end) ++
+      end)
+
+    outputs =
+      sync_outputs ++
         for call <- calls.calls, Tool.non_blocking?(call, data.tools) do
           %{call_id: call.id, name: call.name, response: @async_placeholder}
         end
+
+    summaries = summarize(calls.calls, sync_outputs)
 
     events =
       for {_response, event} <- results, event != nil, do: {:notify, {:control, event}}
@@ -131,7 +137,10 @@ defmodule Octoroom.Agent.Processors.Tools do
 
     {:keep_state, %{data | context: context},
      events ++
-       [cancel_progress(), {:push, %Frames.ToolResults{messages: messages}, :upstream}]}
+       [
+         cancel_progress(),
+         {:push, %Frames.ToolResults{messages: messages, results: summaries}, :upstream}
+       ]}
   end
 
   def handle_event({:async, {:run, calls}, {:failed, reason}}, _state, data) do
@@ -140,11 +149,16 @@ defmodule Octoroom.Agent.Processors.Tools do
     outputs =
       Enum.map(calls.calls, &%{call_id: &1.id, name: &1.name, response: %{error: "Tool failed"}})
 
+    summaries = summarize(calls.calls, outputs)
+
     messages =
       (calls.continuation || []) ++ LLM.tool_result_messages(calls.provider || :google, outputs)
 
     {:keep_state, data,
-     [cancel_progress(), {:push, %Frames.ToolResults{messages: messages}, :upstream}]}
+     [
+       cancel_progress(),
+       {:push, %Frames.ToolResults{messages: messages, results: summaries}, :upstream}
+     ]}
   end
 
   def handle_event({:timer, :progress}, :responding, %{progress_message: message} = data)
@@ -202,5 +216,20 @@ defmodule Octoroom.Agent.Processors.Tools do
     if map_size(by_id) == length(calls),
       do: Enum.map(calls, &Map.fetch!(by_id, &1.id)),
       else: outputs
+  end
+
+  defp summarize(calls, outputs) do
+    calls_by_id = Map.new(calls, &{&1.id, &1})
+    by_id = Map.new(outputs, &{&1.call_id, &1})
+
+    ordered =
+      if map_size(by_id) == length(outputs),
+        do: for(call <- calls, Map.has_key?(by_id, call.id), do: Map.fetch!(by_id, call.id)),
+        else: outputs
+
+    Enum.map(ordered, fn output ->
+      args = calls_by_id |> Map.get(output.call_id, %{}) |> Map.get(:args)
+      ToolResult.summary(Map.put(output, :args, args))
+    end)
   end
 end
