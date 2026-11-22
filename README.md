@@ -1,7 +1,7 @@
 # Octoroom
 
-Programmable voice, video, and AI agent rooms for Phoenix, backed by Cloudflare
-Realtime SFU.
+Programmable voice, video, and AI agent rooms for Phoenix, backed by [Cloudflare
+Realtime SFU](https://developers.cloudflare.com/realtime/sfu/).
 
 Cloudflare carries the media; your Phoenix app owns the room. Your server needs
 no public media endpoint, open inbound ports, or TURN server—each worker opens
@@ -166,5 +166,5 @@ voice/vision agents, and local ONNX VAD/turn-detection/TTS.
 Not built yet: multi-node room clustering, SIP/PSTN telephony, and server-side
 recording/egress.
 
-Building voice/video rooms or AI voice agents in production—or interested in
+Building voice/video rooms or AI voice agents in production? Or interested in
 SIP, recording, or commercial support? Reach out at [mail@samrat.me](mailto:mail@samrat.me).
