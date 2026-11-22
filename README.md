@@ -103,30 +103,30 @@ over PubSub, query Ecto, or enforce app permissions directly.
 
 ## Repository layout
 
-| Path | Description |
-| --- | --- |
-| [`lib/`](lib) | Core `octoroom` package: room server, policy reconciler, Cloudflare Realtime SFU client (plus localhost-only `Octoroom.Cloudflare.Local` for dev), server-side WebRTC workers, and browser client (`priv/static/octoroom.mjs`). |
+| Path                          | Description                                                                                                                                                                                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`lib/`](lib)                 | Core `octoroom` package: room server, policy reconciler, Cloudflare Realtime SFU client (plus localhost-only `Octoroom.Cloudflare.Local` for dev), server-side WebRTC workers, and browser client (`priv/static/octoroom.mjs`).                          |
 | [`agents/`](agents/README.md) | `octoroom_agents`: cascaded voice + vision pipelines (`Silero` VAD, `SmartTurn`, Soniox/AssemblyAI/Reson8 STT, ReqLLM, Inworld/AssemblyAI/OpenAI/local `TinyVoca` ONNX TTS), Gemini Live, OpenAI Live (WebRTC + sideband WS), and `octoroom_agents.mjs`. |
-| [`swift/`](swift/README.md) | Native iOS 17+ and macOS 14+ SwiftPM SDK (`OctoroomCore`, `Octoroom`, `OctoroomAgents`). |
-| [`examples/`](examples) | Standalone Phoenix and iOS apps demonstrating each capability. |
+| [`swift/`](swift/README.md)   | Native iOS 17+ and macOS 14+ SwiftPM SDK (`OctoroomCore`, `Octoroom`, `OctoroomAgents`).                                                                                                                                                                 |
+| [`examples/`](examples)       | Standalone Phoenix and iOS apps demonstrating each capability.                                                                                                                                                                                           |
 
 ## Try it
 
 Building needs the system `libsrtp` library (see [Requirements](#requirements)).
 
-1. **[`examples/call`](examples/call)** *(zero accounts or keys needed)*: LiveView group video call with echo, metronome, and recording workers. Runs against `Octoroom.Cloudflare.Local` by default on localhost, or against real Cloudflare Realtime SFU when credentials are set.
-2. **[`examples/vision`](examples/vision)** *(Cloudflare + `GOOGLE_API_KEY` in Gemini Live mode)*: talk to an agent that sees your camera and shared screen, switching between Cascaded (`TinyVoca` local TTS) and Gemini Live mid-call.
+1. **[`examples/call`](examples/call)** _(zero accounts or keys needed)_: LiveView group video call with echo, metronome, and recording workers. Runs against `Octoroom.Cloudflare.Local` by default on localhost, or against real Cloudflare Realtime SFU when credentials are set.
+2. **[`examples/vision`](examples/vision)** _(Cloudflare + `GOOGLE_API_KEY` in Gemini Live mode)_: talk to an agent that sees your camera and shared screen, switching between Cascaded (`TinyVoca` local TTS) and Gemini Live mid-call.
 3. **[`examples/agent`](examples/agent)**: 1-on-1 voice agent that times each turn end-to-end as heard in the browser, plus a deterministic scripted booking agent (`Hello.Booking`).
 4. **[`examples/meet`](examples/meet)**: group video call with multiple AI assistants, decision-model routing, and the live Voice Timeline latency waterfall.
 5. **[`examples/ios`](examples/ios)**: native iOS app joining the same rooms.
 
 ## How it compares
 
-| Alternative | Difference |
-| --- | --- |
-| **LiveKit / Daily / Stream** | No hosted video/chat SaaS lock-in or per-minute SFU billing; room state, auth, and routing stay in your Phoenix app while Cloudflare carries the media. Tradeoff: you host your own app server, and SIP/server-side recording aren't built in yet. |
-| **Pipecat / LiveKit Agents / Vision Agents** | Built for multi-party, multi-agent rooms inside your web app rather than spawning a separate Python worker process per 1-on-1 call. Vision is lightweight client-captured frames (`sees:`) for VLM context, not high-FPS server-side YOLO/CV pipelines. |
-| **Membrane / Fishjam** | Offloads SFU fan-out to Cloudflare so you write room policies and agents instead of operating media-server pipelines. |
+| Alternative                  | How Octoroom differs                                                                                                                                                                                                                                                             |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LiveKit / Daily**          | Octoroom avoids hosted video/chat SaaS lock-in and per-minute SFU billing—room state, auth, and routing stay in your Phoenix app while Cloudflare carries the media. Tradeoff: you host your own app server, and SIP/server-side recording aren't built in yet.                  |
+| **Pipecat / LiveKit Agents** | Octoroom is built for multi-party, multi-agent rooms inside your web app rather than spawning a separate Python worker process per 1-on-1 call. Octoroom's vision uses lightweight client-captured frames (`sees:`) for VLM context, not high-FPS server-side YOLO/CV pipelines. |
+| **Membrane / Fishjam**       | Octoroom offloads SFU fan-out to Cloudflare so you write room policies and agents instead of operating media-server pipelines.                                                                                                                                                   |
 
 ## Requirements
 
