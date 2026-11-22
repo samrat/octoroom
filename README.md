@@ -165,3 +165,6 @@ voice/vision agents, and local ONNX VAD/turn-detection/TTS.
 
 Not built yet: multi-node room clustering, SIP/PSTN telephony, and server-side
 recording/egress.
+
+Building voice/video rooms or AI voice agents in production—or interested in
+SIP, recording, or commercial support? Reach out at [mail@samrat.me](mailto:mail@samrat.me).
