@@ -46,18 +46,6 @@ end
 # SONIOX_API_KEY: for live captions (optional).
 config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
 
-# SONIOX_API_KEY, GOOGLE_API_KEY and INWORLD_API_KEY: for the voice
-# assistant (optional; all three). Its STT, LLM and TTS read them from the
-# environment, so values from `.env` are put there.
-assistant_keys = ~w(SONIOX_API_KEY GOOGLE_API_KEY INWORLD_API_KEY)
-
-for key <- assistant_keys ++ ["OPENAI_API_KEY"],
-    value = fetch.(key),
-    value not in [nil, ""],
-    do: System.put_env(key, value)
-
-config :call, assistant?: Enum.all?(assistant_keys, &(fetch.(&1) not in [nil, ""]))
-
 # OCTOROOM_STORE: where the room store's snapshot lives, so rooms survive a
 # restart of this app (defaults to the system temp directory).
 if path = fetch.("OCTOROOM_STORE"), do: config(:octoroom, store: {Octoroom.Store.ETS, path: path})

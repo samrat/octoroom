@@ -38,31 +38,8 @@ adds:
   speech-to-text and `emit`s captions, which the page shows as they arrive.
   Needs `SONIOX_API_KEY`; without it the button is hidden.
 
-The **agent lab** at `/lab` (or `/lab/<room>`, the same room as
-`/r/<room>`) tries out the call assistant from `octoroom_agents`
-([agents/](../../agents)): one voice agent that hears every mic, each
-through its own front end, and that everyone hears. Join from the lab,
-turn the assistant on, and:
-
-- **Pipeline:** cascaded (Soniox transcribes each person, the LLM reads
-  text) or half-cascaded (each turn is recorded, Smart Turn decides when it
-  ends, and the LLM hears the audio; a transcript follows).
-- **Deciding to answer:** its name ("Assistant"), or a follow-up from the
-  person it just answered; or the decision model, which also asks
-  `gemini-decision-1` who each turn is for and whether it can answer. Above
-  a threshold it replies; in between it waits a couple of seconds and
-  replies only if nobody else speaks. The thresholds, the wait and the
-  follow-up window are sliders. Changing a setting restarts the assistant.
-- **What it heard and decided:** every turn with its outcome (reply, wait,
-  listen), why, and the model's numbers; every reply with its latency. Pills
-  show when it's waiting for someone else to answer, and when the last
-  person it answered can carry on without its name.
-- Use headphones: with speakers, its voice leaks into your mic. Needs
-  `SONIOX_API_KEY`, `GOOGLE_API_KEY` and `INWORLD_API_KEY` in `.env` or the
-  environment.
-
-The call page links to the lab and keeps the echo, metronome, recording,
-captions and the workers table under **Testing tools**.
+The echo, metronome, recording, captions and the workers/routing tables live
+under **Room inspector & server workers**.
 
 "Here now" uses Phoenix Presence: how many pages have the room open, and
 who of them is in the call.
@@ -79,17 +56,15 @@ mix run --no-halt
 ```
 
 To run against Cloudflare Realtime SFU instead (dashboard: Realtime → SFU), or
-to enable captions and the voice assistant, put credentials in `.env` here
-(gitignored) or the environment:
+to enable live captions, put credentials in `.env` here (gitignored) or the
+environment:
 
 ```sh
 # Optional: use real Cloudflare Realtime SFU instead of the local dev SFU.
 OCTOROOM_CLOUDFLARE_APP_ID=...
 OCTOROOM_CLOUDFLARE_APP_SECRET=...
-# Optional: captions (Soniox), and the assistant (all three).
+# Optional: live captions (Soniox).
 SONIOX_API_KEY=...
-GOOGLE_API_KEY=...
-INWORLD_API_KEY=...
 ```
 
 Open <http://localhost:4300> in two tabs or browsers, and join in both.

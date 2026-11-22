@@ -89,12 +89,11 @@ agent carries on with its Gemini session handle or saved transcript. The
 keys are `GOOGLE_API_KEY` (Gemini Live) and `OPENAI_API_KEY` (OpenAI Live).
 `Octoroom.Agent.Worker`'s moduledoc has what's different.
 
-`examples/call` has an agent lab at `/lab/<room>` for trying it: switch
-between the cascaded, half-cascaded, Gemini Live and OpenAI Live pipelines and between the name gate
-and a decision model (`gate: :decision`), and watch each turn's decision. Keys come from the
-environment: `SONIOX_API_KEY`, `GOOGLE_API_KEY` (Gemini, its LLM)
-and `INWORLD_API_KEY`. See `Octoroom.Agent.Worker` for the args, what it
-emits, and how it reports latency.
+See [`examples/meet`](../examples/meet) for a multi-agent call combining
+cascaded, Gemini Live and OpenAI Live assistants with decision gating, and
+[`examples/agent`](../examples/agent) for a single-agent pipeline switcher.
+See `Octoroom.Agent.Worker` for the args, what it emits, and how it reports
+latency.
 
 ## Clients
 

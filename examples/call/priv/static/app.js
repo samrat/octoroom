@@ -56,63 +56,6 @@ function testPattern(label) {
   return track
 }
 
-// Times the assistant in this tab: from your mic going quiet to the
-// assistant's audio arriving, with a WebAudio analyser on each, every 10 ms.
-// Speech "ends" after 400 ms below the threshold, and is dated to the last
-// loud sample. Use headphones: the assistant leaking into your mic looks
-// like you talking.
-class LatencyProbe {
-  constructor(ctx, onLatency) {
-    this.ctx = ctx
-    this.onLatency = onLatency
-    this.sources = new Map() // track id => analyser
-    this.state = "idle" // "speaking" | "waiting"
-    this.lastVoice = 0
-  }
-
-  analyser(track) {
-    if (!this.sources.has(track.id)) {
-      const analyser = this.ctx.createAnalyser()
-      analyser.fftSize = 512
-      this.ctx.createMediaStreamSource(new MediaStream([track])).connect(analyser)
-      this.sources.set(track.id, analyser)
-    }
-    return this.sources.get(track.id)
-  }
-
-  rms(analyser) {
-    const data = new Float32Array(analyser.fftSize)
-    analyser.getFloatTimeDomainData(data)
-    let sum = 0
-    for (const x of data) sum += x * x
-    return Math.sqrt(sum / data.length)
-  }
-
-  // `mic` and `assistant` are MediaStreamTracks (or null).
-  tick(mic, assistant) {
-    if (!mic || !assistant) return
-    const now = performance.now()
-    const local = this.rms(this.analyser(mic))
-    const remote = this.rms(this.analyser(assistant))
-
-    if (this.state === "waiting" && remote > 0.01) {
-      this.onLatency(now - this.lastVoice)
-      this.state = "idle"
-    } else if (local > 0.02 && remote < 0.01) {
-      this.state = "speaking"
-      this.lastVoice = now
-    } else if (this.state === "speaking" && now - this.lastVoice > 400) {
-      this.state = "waiting"
-    } else if (this.state === "waiting" && now - this.lastVoice > 15_000) {
-      this.state = "idle"
-    }
-  }
-
-  close() {
-    this.ctx.close()
-  }
-}
-
 const Call = {
   mounted() {
     window.octoroomCall = this
@@ -212,22 +155,9 @@ const Call = {
       await room.join()
       this.status(`In the call (joined in ${Math.round(performance.now() - started)} ms).`)
       this.meters = setInterval(() => this.updateMeters(), 150)
-      this.startProbe()
     } catch (error) {
       this.status(`Couldn't join: ${error.message}`)
     }
-  },
-
-  startProbe() {
-    const ctx = new AudioContext()
-    ctx.resume().catch(() => {})
-    this.probe = new LatencyProbe(ctx, (ms) => this.pushEvent("heard_latency", {ms}))
-    this.probeTimer = setInterval(() => {
-      const room = this.room
-      if (!room || room.state !== "joined" || room.muted) return
-      const assistant = room.tracks().find((t) => t.kind === "audio" && t.track === "assistant")
-      this.probe.tick(room.localTracks().mic?.track, assistant?.stream.getAudioTracks()[0])
-    }, 10)
   },
 
   async leave() {
@@ -387,9 +317,6 @@ const Call = {
 
   cleanup() {
     clearInterval(this.meters)
-    clearInterval(this.probeTimer)
-    this.probe?.close()
-    this.probe = null
     this.tone?.stop()
     this.tone = null
     this.pattern?.stop()

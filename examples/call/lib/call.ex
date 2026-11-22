@@ -31,11 +31,7 @@ defmodule Call.Room do
     * a room-wide metronome, when the room's `:metronome` assign is set;
     * a recorder hearing every mic, when the room's `:recording` assign is set;
     * live captions of every mic, when the room's `:captions` assign is set
-      (needs `SONIOX_API_KEY`);
-    * a call assistant, when the room's `:assistant` assign is set: one
-      voice agent that hears every mic and everyone hears, configured from
-      the agent lab at `/lab/<room>` (needs `SONIOX_API_KEY`,
-      `GOOGLE_API_KEY` and `INWORLD_API_KEY`).
+      (needs `SONIOX_API_KEY`).
   """
   use Octoroom.Room
 
@@ -74,25 +70,10 @@ defmodule Call.Room do
         do: [worker("captioner", Call.Captioner, inputs: Enum.map(room.participants, &mic/1))],
         else: []
 
-    assistant =
-      if room.assigns[:assistant] && room.participants != [] && assistant_available?(),
-        do: [
-          # Settings come from the agent lab (`Call.LabLive`); changing them
-          # changes the args, which restarts the assistant.
-          Octoroom.Agent.agent(
-            "assistant",
-            Call.Assistant,
-            [hears: Enum.map(room.participants, &mic/1)] ++
-              (room.assigns |> Call.Agent.config() |> Call.Agent.opts())
-          )
-        ],
-        else: []
-
-    metronome ++ echoes ++ recorder ++ captioner ++ assistant
+    metronome ++ echoes ++ recorder ++ captioner
   end
 
   def captions_available?, do: Application.get_env(:call, :soniox_api_key) not in [nil, ""]
-  def assistant_available?, do: Application.get_env(:call, :assistant?, false)
 
   @impl true
   def subscriptions(listener, room) do
@@ -105,9 +86,8 @@ defmodule Call.Room do
 
     mics = for p <- others(room, listener), source <- sources, do: source.(p)
     own_echo = if listener.meta.echo, do: [track(echo(listener))], else: []
-    assistant = if room.assigns[:assistant], do: [track("assistant")], else: []
     metronome = if room.assigns[:metronome], do: [track("metronome")], else: []
-    mics ++ own_echo ++ assistant ++ metronome
+    mics ++ own_echo ++ metronome
   end
 
   def echo(participant), do: "#{participant.id}/echo"
@@ -277,27 +257,6 @@ defmodule Call.Layouts do
           .tool-row button.active { background: var(--fg); border-color: var(--fg); color: #fff; }
           a { color: var(--accent); text-decoration: none; font-weight: 500; }
           a:hover { text-decoration: underline; }
-          .lab { display: grid; grid-template-columns: 300px 1fr; gap: 16px; margin-top: 16px; align-items: start; }
-          @media (max-width: 760px) { .lab { grid-template-columns: 1fr; } }
-          .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
-          .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin: 0 0 8px; }
-          .panel fieldset { border: 0; padding: 0; margin: 0 0 14px; }
-          .panel legend { font-weight: 600; margin-bottom: 4px; }
-          .panel label.opt { display: block; margin: 4px 0; }
-          .panel label.opt small, .panel .note { display: block; color: var(--faint); font-size: 12px; margin-left: 22px; }
-          .panel .note { margin-left: 0; }
-          .panel .range { display: grid; grid-template-columns: 1fr 52px; gap: 6px; align-items: center; font-size: 13px; margin: 6px 0; }
-          .panel .range span { grid-column: 1 / -1; }
-          .panel .range output { font-family: ui-monospace, monospace; text-align: right; }
-          .feed .entry { padding: 8px 0; border-bottom: 1px solid var(--subtle); }
-          .feed .entry:last-child { border-bottom: 0; }
-          .feed .who { font-weight: 600; }
-          .feed .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 12px; }
-          .chip { padding: 2px 8px; border-radius: 6px; background: var(--subtle); border: 1px solid var(--border); font-family: ui-monospace, monospace; }
-          .chip.reply { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-fg); }
-          .chip.wait { background: #fff7ed; border-color: #fed7aa; color: var(--accent-hover); }
-          .feed .latency { color: var(--faint); font-size: 12px; font-family: ui-monospace, monospace; margin-top: 2px; }
-          .status-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
           .videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px; }
           .videos:empty { display: none; }
           .tile {
@@ -403,11 +362,9 @@ defmodule Call.Components do
     """
   end
 
-  @doc "The page for `room`: `path(\"lobby\", \"\")` is `/`, others `/r/<room>`."
-  def path("lobby", ""), do: "/"
-  def path(room, ""), do: "/r/#{room}"
-  def path("lobby", "lab"), do: "/lab"
-  def path(room, "lab"), do: "/lab/#{room}"
+  @doc "The page for `room`: `path(\"lobby\")` is `/`, others `/r/<room>`."
+  def path("lobby"), do: "/"
+  def path(room), do: "/r/#{room}"
 end
 
 defmodule Call.CallLive do
@@ -438,7 +395,6 @@ defmodule Call.CallLive do
         recorded: %{},
         recording_dir: nil,
         captions?: Call.Room.captions_available?(),
-        assistant?: Call.Room.assistant_available?(),
         local_sfu?: Octoroom.Cloudflare.config().client == Octoroom.Cloudflare.Local,
         tools_open: false
       )
@@ -458,10 +414,6 @@ defmodule Call.CallLive do
         socket
       ),
       do: {:noreply, assign(socket, captions: caption(socket.assigns.captions, track, line))}
-
-  # The assistant's events are for the agent lab; they don't change this page.
-  def handle_info({:octoroom, _room, {:worker_event, "assistant", _event}}, socket),
-    do: {:noreply, socket}
 
   def handle_info(%Phoenix.Socket.Broadcast{event: "presence_diff"}, socket),
     do: {:noreply, assign(socket, viewers: viewers(socket.assigns.room))}
@@ -532,7 +484,6 @@ defmodule Call.CallLive do
         {"#{p.id}/#{track}", p.meta.name <> suffix}
       end
       |> Map.put("metronome", "metronome")
-      |> Map.put("assistant", "the assistant")
 
     stats = Map.new(outputs, fn {name, _} -> {name, Octoroom.Outlet.stats(room, name)} end)
     me = Enum.find(participants, &(&1.id == socket.assigns.me))
@@ -615,7 +566,6 @@ defmodule Call.CallLive do
           <span :if={@participants != []} class="pill live">
             {length(@participants)} IN CALL
           </span>
-          <a :if={@assistant?} href={path(@room, "lab")}>Agent lab →</a>
         </div>
       </div>
 
@@ -812,8 +762,6 @@ defmodule Call.Router do
     pipe_through :browser
     live "/", Call.CallLive
     live "/r/:room", Call.CallLive
-    live "/lab", Call.LabLive
-    live "/lab/:room", Call.LabLive
   end
 end
 
