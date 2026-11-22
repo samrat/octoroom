@@ -102,12 +102,22 @@ defmodule Octoroom.Worker do
         ]
   @type result :: {:ok, state} | {:ok, state, actions}
 
+  @type video_frame :: %{
+          data: binary,
+          mime_type: String.t(),
+          width: pos_integer | nil,
+          height: pos_integer | nil,
+          source: String.t(),
+          participant_id: String.t()
+        }
+
   @callback init(args :: term, ctx :: Context.t()) :: result | {:stop, reason :: term}
   @callback handle_audio(input :: String.t(), pcm :: binary, state) :: result
+  @callback handle_video(input :: String.t(), frame :: video_frame, state) :: result
   @callback handle_info(message :: term, state) :: result
   @callback terminate(reason :: term, state) :: term
 
-  @optional_callbacks handle_info: 2, terminate: 2
+  @optional_callbacks handle_audio: 3, handle_video: 3, handle_info: 2, terminate: 2
 
   defmacro __using__(opts) do
     audio = Keyword.get(opts, :audio, [])
@@ -118,6 +128,7 @@ defmodule Octoroom.Worker do
     out_rate = Keyword.get(output, :rate, rate)
     out_channels = Keyword.get(output, :channels, channels)
     Octoroom.Audio.validate!(out_rate, out_channels)
+    video = Octoroom.Worker.normalize_video!(Keyword.get(opts, :video))
 
     quote do
       @behaviour Octoroom.Worker
@@ -128,14 +139,103 @@ defmodule Octoroom.Worker do
       @doc false
       def __octoroom_audio_output__, do: {unquote(out_rate), unquote(out_channels)}
 
+      @doc false
+      def __octoroom_video__, do: unquote(Macro.escape(video))
+
+      @impl true
+      def handle_audio(_input, _pcm, state), do: {:ok, state}
+
+      @impl true
+      def handle_video(_input, _frame, state), do: {:ok, state}
+
       @impl true
       def handle_info(_message, state), do: {:ok, state}
 
       @impl true
       def terminate(_reason, _state), do: :ok
 
-      defoverridable handle_info: 2, terminate: 2
+      defoverridable handle_audio: 3, handle_video: 3, handle_info: 2, terminate: 2
     end
+  end
+
+  @default_video %{fps: 1.0, max_dimension: 1024, quality: 0.75}
+
+  @doc false
+  def normalize_video!(nil), do: nil
+  def normalize_video!(false), do: nil
+
+  def normalize_video!(opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:source, :fps, :max_dimension, :quality, :camera, :screen])
+
+    source =
+      case Keyword.fetch(opts, :source) do
+        {:ok, :client} ->
+          :client
+
+        {:ok, other} ->
+          raise ArgumentError, "worker video :source must be :client, got: #{inspect(other)}"
+
+        :error ->
+          raise ArgumentError, "worker video: requires source: :client"
+      end
+
+    base = validate_video_params!(opts, @default_video)
+
+    sources =
+      for {key, name} <- [camera: "camera", screen: "screen"],
+          Keyword.has_key?(opts, key),
+          into: %{} do
+        sub = Keyword.get(opts, key)
+
+        unless is_list(sub) do
+          raise ArgumentError, "worker video :#{key} must be a keyword list, got: #{inspect(sub)}"
+        end
+
+        {name,
+         validate_video_params!(Keyword.validate!(sub, [:fps, :max_dimension, :quality]), base)}
+      end
+
+    Map.merge(base, %{source: source, sources: sources})
+  end
+
+  def normalize_video!(other) do
+    raise ArgumentError, "worker video: expects a keyword list or nil, got: #{inspect(other)}"
+  end
+
+  defp validate_video_params!(opts, defaults) do
+    fps = Keyword.get(opts, :fps, defaults.fps)
+    max_dimension = Keyword.get(opts, :max_dimension, defaults.max_dimension)
+    quality = Keyword.get(opts, :quality, defaults.quality)
+
+    unless is_number(fps) and fps > 0 and fps <= 5 do
+      raise ArgumentError, "worker video :fps must be a number in (0, 5], got: #{inspect(fps)}"
+    end
+
+    unless is_integer(max_dimension) and max_dimension >= 64 and max_dimension <= 2048 do
+      raise ArgumentError,
+            "worker video :max_dimension must be an integer in 64..2048, got: #{inspect(max_dimension)}"
+    end
+
+    unless is_number(quality) and quality > 0 and quality <= 1 do
+      raise ArgumentError,
+            "worker video :quality must be a number in (0, 1], got: #{inspect(quality)}"
+    end
+
+    %{fps: fps / 1, max_dimension: max_dimension, quality: quality / 1}
+  end
+
+  @doc false
+  # Returns the worker's video configuration, or nil if it doesn't accept video.
+  def video_config(module) when is_atom(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :__octoroom_video__, 0),
+      do: module.__octoroom_video__(),
+      else: nil
+  end
+
+  @doc false
+  # Effective capture params for a given video source ("camera" or "screen").
+  def video_params(%{sources: sources} = config, source) when is_binary(source) do
+    Map.get(sources, source, Map.take(config, [:fps, :max_dimension, :quality]))
   end
 
   @doc "The pid of worker `id` in room `room_id`, or nil."

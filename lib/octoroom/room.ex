@@ -192,8 +192,11 @@ defmodule Octoroom.Room do
 
     video = Enum.find(inputs, &(Track.new(&1).kind == :video))
 
-    if video,
-      do: raise(ArgumentError, "worker #{id}: #{video} is video, and workers take audio inputs")
+    if video && Octoroom.Worker.video_config(module) == nil do
+      raise ArgumentError,
+            "worker #{id}: #{video} is video, and #{inspect(module)} doesn't accept video inputs " <>
+              "(opt in with `use Octoroom.Worker, video: [source: :client]`)"
+    end
 
     outputs = opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
     data = opts |> Keyword.get(:data, []) |> Enum.uniq()

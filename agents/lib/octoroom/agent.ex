@@ -197,6 +197,10 @@ defmodule Octoroom.Agent do
     * `hears:` (required) - the audio tracks it hears, usually
       `Enum.map(room.participants, &mic/1)`. People joining and leaving
       change it without restarting the agent.
+    * `sees:` - optional video tracks it sees, such as
+      `Enum.flat_map(room.participants, &[camera(&1), screen(&1)])`. Clients
+      capture low-FPS JPEG snapshots of live, unmuted tracks and upload them
+      through the room channel. Default `[]`.
     * `respond:` - `:always`, `:addressed` or `:never`: which turns start a
       reply. Default `:always` with one input, `:addressed` with more.
     * `name:` - what people call it, which `:addressed` listens for.
@@ -228,6 +232,7 @@ defmodule Octoroom.Agent do
         found -> found
       end
 
+    {sees, opts} = Keyword.pop(opts, :sees, [])
     {voice?, opts} = Keyword.pop(opts, :voice, true)
     {args, opts} = Keyword.pop(opts, :args, %{})
 
@@ -243,7 +248,7 @@ defmodule Octoroom.Agent do
       |> Map.merge(%{agent: module, args: args, voice: voice?})
 
     Octoroom.Room.worker(id, Octoroom.Agent.Worker,
-      inputs: hears,
+      inputs: hears ++ sees,
       outputs: if(voice?, do: [id], else: []),
       data: if(voice?, do: [], else: [id]),
       args: worker_args

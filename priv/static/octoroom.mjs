@@ -74,16 +74,30 @@ export class RoomClient {
    * @param {MediaTrackConstraints|boolean} [options.audio] getUserMedia audio constraints
    * @param {MediaTrackConstraints|boolean} [options.video] also publish the camera on join
    */
-  constructor({socket, topic, params = {}, stream = null, audio = true, video = false}) {
+  constructor({
+    socket,
+    topic,
+    params = {},
+    stream = null,
+    audio = true,
+    video = false,
+    capture = true,
+    captureFrame = null,
+  }) {
     this.socket = socket
     this.topic = topic
     this.params = params
     this.providedStream = stream
     this.audioConstraints = audio
     this.videoConstraints = video
+    this.captureEnabled = capture !== false
+    this.captureFrameFn = captureFrame
     this.listeners = {}
     this.participants = []
     this.workers = []
+    this.captureDirectives = {}
+    this.captures = new Map() // source => {timer, inFlight, config, track, cleanup}
+    this.capturing = []
     this.participantId = null
     this.remote = new Map() // mid => {mid, track, kind, source, participant_id, gain, stream, element}
     // What this client publishes: source => {track, owned, muted, transceiver, ready}.
@@ -142,6 +156,7 @@ export class RoomClient {
       channel.on("room_event", (event) => this.onRoomEvent(event))
       channel.on("worker", (event) => this.onWorker(event))
       channel.on("worker_event", (event) => this.emit("worker_event", event))
+      channel.on("capture", (payload) => this.onCapture(payload))
       channel.on("resume_token", ({token}) => (this.resumeToken = token))
       channel.on("republish", () => this.serially(() => this.restartMedia()))
       channel.onError(() => this.state === "joined" && this.emit("reconnecting"))
@@ -175,6 +190,7 @@ export class RoomClient {
       window.addEventListener("beforeunload", this.onPageHide)
       window.addEventListener("pagehide", this.onPageHide)
       this.setState("joined")
+      this.syncCapture()
       return reply
     } catch (error) {
       if (this.generation === generation) this.teardown("failed")
@@ -188,8 +204,10 @@ export class RoomClient {
     this.iceServers = reply.ice_servers
     this.resumeToken = reply.resume_token
     this.workers = reply.workers || []
+    this.captureDirectives = reply.capture?.sources || {}
     this.emit("participants", this.participants)
     this.emit("workers", this.workers)
+    this.syncCapture()
   }
 
   // The mic (and the camera, with `video`) from the provided stream or
@@ -285,6 +303,7 @@ export class RoomClient {
     this.pc?.close()
     this.pc = null
     await this.connectMedia()
+    this.syncCapture()
   }
 
   clearRemote() {
@@ -318,6 +337,7 @@ export class RoomClient {
     if (source === "mic") this.muted = muted
     if (this.state === "joined") this.push("mute", {source, muted}).catch(() => {})
     this.emit("local", this.localTracks())
+    this.syncCapture()
   }
 
   /** Turns the camera on: a track you give, or one from getUserMedia with these constraints. */
@@ -362,6 +382,7 @@ export class RoomClient {
 
     try {
       await request
+      this.syncCapture()
     } catch (error) {
       // The session is being published again from scratch, these included.
       if (error.message === "republishing") return
@@ -388,6 +409,7 @@ export class RoomClient {
     if (entry.owned) entry.track.stop()
     this.local.delete(source)
     this.emit("local", this.localTracks())
+    this.syncCapture()
     if (this.state === "joined") await this.push("unpublish", {source}).catch(() => {})
   }
 
@@ -465,6 +487,7 @@ export class RoomClient {
     }
     // The server pulls them for others once they flow.
     await this.push("connected", {})
+    this.syncCapture()
   }
 
   async onClose({op_id, mids}) {
@@ -561,6 +584,116 @@ export class RoomClient {
     return this.push("worker_message", {worker: workerId, payload})
   }
 
+  /**
+   * Enables or pauses client-side video frame capture for workers.
+   * @param {boolean} enabled
+   */
+  setCaptureEnabled(enabled) {
+    const next = Boolean(enabled)
+    if (this.captureEnabled === next) return
+    this.captureEnabled = next
+    this.syncCapture()
+  }
+
+  /** Video sources currently being captured for workers, e.g. ["camera", "screen"]. */
+  capturingSources() {
+    return [...this.capturing]
+  }
+
+  onCapture({sources} = {}) {
+    this.captureDirectives = sources && typeof sources === "object" ? sources : {}
+    this.syncCapture()
+  }
+
+  syncCapture() {
+    const desired = new Map()
+    if (this.state === "joined" && this.captureEnabled) {
+      for (const [source, config] of Object.entries(this.captureDirectives || {})) {
+        const entry = this.local.get(source)
+        if (!entry || entry.muted || entry.track.readyState !== "live") continue
+        if (!config || typeof config.fps !== "number" || config.fps <= 0) continue
+        desired.set(source, {config, track: entry.track})
+      }
+    }
+
+    for (const source of [...this.captures.keys()]) {
+      const want = desired.get(source)
+      const current = this.captures.get(source)
+      if (!want || want.track !== current.track || !sameCaptureConfig(want.config, current.config)) {
+        this.stopCaptureSource(source)
+      }
+    }
+
+    for (const [source, {config, track}] of desired) {
+      if (!this.captures.has(source)) this.startCaptureSource(source, track, config)
+    }
+
+    const next = [...this.captures.keys()].sort()
+    if (!sameStringList(next, this.capturing)) {
+      this.capturing = next
+      this.emit("capture", {
+        sources: [...next],
+        directives: {...this.captureDirectives},
+        enabled: this.captureEnabled,
+      })
+    }
+  }
+
+  startCaptureSource(source, track, config) {
+    const intervalMs = Math.max(200, Math.round(1000 / config.fps))
+    const session = {config, track, inFlight: false, stopped: false, helper: null, timer: null}
+    const generation = this.generation
+
+    const tick = async () => {
+      if (session.stopped || session.inFlight || this.generation !== generation) return
+      const entry = this.local.get(source)
+      if (!entry || entry.muted || entry.track !== track || track.readyState !== "live") return
+      session.inFlight = true
+      try {
+        const frame = this.captureFrameFn
+          ? await this.captureFrameFn(track, config, source)
+          : await captureBrowserFrame(track, config, session)
+        if (!frame || session.stopped || this.generation !== generation) return
+        await this.push("video_frame", {
+          source,
+          mime_type: frame.mime_type || "image/jpeg",
+          width: frame.width ?? null,
+          height: frame.height ?? null,
+          data: frame.data,
+        }).catch(() => {})
+      } catch {
+        // Ignore transient capture errors; try again on next interval.
+      } finally {
+        session.inFlight = false
+      }
+    }
+
+    session.timer = setInterval(tick, intervalMs)
+    this.captures.set(source, session)
+    // Capture an initial frame promptly once the track has pixels.
+    Promise.resolve().then(tick)
+  }
+
+  stopCaptureSource(source) {
+    const session = this.captures.get(source)
+    if (!session) return
+    session.stopped = true
+    if (session.timer) clearInterval(session.timer)
+    if (session.helper) {
+      session.helper.video.srcObject = null
+      session.helper = null
+    }
+    this.captures.delete(source)
+  }
+
+  stopAllCaptures() {
+    for (const source of [...this.captures.keys()]) this.stopCaptureSource(source)
+    if (this.capturing.length > 0) {
+      this.capturing = []
+      this.emit("capture", {sources: [], directives: {}, enabled: this.captureEnabled})
+    }
+  }
+
   push(event, payload) {
     if (!this.channel) return Promise.reject(new Error(`${event}: not in a room`))
     return new Promise((resolve, reject) => {
@@ -582,6 +715,8 @@ export class RoomClient {
     }
     this.onPageHide = null
     this.clearRemote()
+    this.captureDirectives = {}
+    this.stopAllCaptures()
     this.pc?.close()
     this.pc = null
     for (const entry of this.local.values()) if (entry.owned) entry.track.stop()
@@ -607,6 +742,41 @@ export class RoomClient {
 
 function addSender(pc, track) {
   return pc.addTransceiver(track, {direction: "sendonly", streams: [new MediaStream([track])]})
+}
+
+function sameCaptureConfig(a, b) {
+  return a?.fps === b?.fps && a?.max_dimension === b?.max_dimension && a?.quality === b?.quality
+}
+
+function sameStringList(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+async function captureBrowserFrame(track, {max_dimension = 1024, quality = 0.75}, session) {
+  if (typeof document === "undefined") return null
+  if (!session.helper) {
+    const video = document.createElement("video")
+    video.muted = true
+    video.playsInline = true
+    video.srcObject = new MediaStream([track])
+    await video.play().catch(() => {})
+    const canvas = document.createElement("canvas")
+    session.helper = {video, canvas, ctx: canvas.getContext?.("2d")}
+  }
+  const {video, canvas, ctx} = session.helper
+  if (!ctx || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return null
+  const scale = Math.min(1, max_dimension / Math.max(video.videoWidth, video.videoHeight))
+  const width = Math.max(1, Math.round(video.videoWidth * scale))
+  const height = Math.max(1, Math.round(video.videoHeight * scale))
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width
+    canvas.height = height
+  }
+  ctx.drawImage(video, 0, 0, width, height)
+  const url = canvas.toDataURL("image/jpeg", quality)
+  const comma = url.indexOf(",")
+  if (comma === -1) return null
+  return {data: url.slice(comma + 1), mime_type: "image/jpeg", width, height}
 }
 
 function removeElement(element) {

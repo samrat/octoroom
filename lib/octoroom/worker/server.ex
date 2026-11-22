@@ -80,6 +80,9 @@ defmodule Octoroom.Worker.Server do
   # told the inlet the new format, and the next frames will be in it.
   def handle_info({:octoroom_input, _input, _pcm, _format}, state), do: {:noreply, state}
 
+  def handle_info({:octoroom_video, input, frame}, state),
+    do: {:noreply, state.module.handle_video(input, frame, state.user) |> handle_result(state)}
+
   def handle_info({:octoroom_io, inputs, outputs, data}, state) do
     old = state
     state = %{state | inputs: inputs, outputs: outputs, data: data}

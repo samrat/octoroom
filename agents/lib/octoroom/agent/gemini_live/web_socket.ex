@@ -46,6 +46,9 @@ defmodule Octoroom.Agent.GeminiLive.WebSocket do
   def send_audio(pid, audio, opts \\ []) when is_binary(audio),
     do: send_json(pid, Protocol.audio_input_frame(audio, opts))
 
+  def send_video(pid, data, opts \\ []) when is_binary(data),
+    do: send_json(pid, Protocol.video_input_frame(data, opts))
+
   def send_audio_end(pid), do: send_json(pid, Protocol.audio_stream_end_frame())
 
   def send_text(pid, text) when is_binary(text),

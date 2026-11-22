@@ -48,6 +48,7 @@ defmodule Octoroom.Agent.Processors.Context do
   alias Octoroom.Agent.Cascaded.AudioTurn
   alias Octoroom.Agent.ConversationEvents
   alias Octoroom.Agent.Frames
+  alias ReqLLM.Message.ContentPart
 
   @impl true
   def init(opts, ctx) do
@@ -69,6 +70,11 @@ defmodule Octoroom.Agent.Processors.Context do
       max_tool_rounds: Keyword.get(opts, :max_tool_rounds, 4),
       max_history: Keyword.get(opts, :max_history, 20),
       initial_delay_ms: Keyword.get(opts, :initial_delay_ms, 100),
+      frame_ttl_ms: Keyword.get(opts, :frame_ttl_ms, 10_000),
+      max_frames: Keyword.get(opts, :max_frames, 4),
+      clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
+      # Latest video frame per source (`"<participant>/<source>"` => `%{frame, at}`).
+      frames: %{},
       history: Map.get(saved, :history, []),
       input: [],
       rounds_left: 0,
@@ -109,6 +115,14 @@ defmodule Octoroom.Agent.Processors.Context do
     }
   end
 
+  defp frame(%Frames.InputImage{source: source} = image, :downstream, state) do
+    {[], put_in(state.frames[source], %{frame: image, at: state.clock.()})}
+  end
+
+  defp frame(%Frames.VideoInactive{source: source}, :downstream, state) do
+    {[], %{state | frames: Map.delete(state.frames, source)}}
+  end
+
   defp frame(%Frames.Start{} = frame, :downstream, %{initial_text: text} = state)
        when is_binary(text) and text != "",
        do: {[{:push, frame, :downstream}, {:timer, :initial_text, state.initial_delay_ms}], state}
@@ -135,7 +149,7 @@ defmodule Octoroom.Agent.Processors.Context do
     message = %{role: "user", content: user_content(frame)}
 
     if frame.respond,
-      do: start_turn(message, state),
+      do: start_turn(message, state, speaker_source: frame.source),
       else: {[], %{state | history: append(state.history, message, state)}}
   end
 
@@ -152,7 +166,7 @@ defmodule Octoroom.Agent.Processors.Context do
     message = AudioTurn.message(frame.audio, frame.sample_rate, frame.turn_id, frame.speaker)
 
     if frame.respond,
-      do: start_turn(message, state),
+      do: start_turn(message, state, speaker_source: frame.source),
       else: {[], %{state | history: append(state.history, message, state)}}
   end
 
@@ -271,14 +285,96 @@ defmodule Octoroom.Agent.Processors.Context do
   defp user_content(%Frames.Transcription{text: text}), do: text
 
   # The reply's place in the history is reserved now, and filled when its
-  # `AssistantMessage` comes back.
-  defp start_turn(message, state) do
+  # `AssistantMessage` comes back. Fresh video frames are attached only to
+  # the outgoing turn's `LLMContext` and never stored in `history`.
+  defp start_turn(message, state, opts \\ []) do
     history = append(state.history, message, state)
-    input = prompt_input(state.instructions, history)
+
+    input =
+      state.instructions
+      |> prompt_input(history)
+      |> attach_frames(state, Keyword.get(opts, :speaker_source))
+
     history = append(history, @reply_pending, state)
     state = %{state | history: history, input: input, rounds_left: state.max_tool_rounds}
     {[context_frame(input, state.tools)], state}
   end
+
+  defp attach_frames(input, %{frames: frames}, _speaker_source) when map_size(frames) == 0,
+    do: input
+
+  defp attach_frames(input, state, speaker_source) do
+    selected = select_frames(state, speaker_source)
+
+    if selected == [] do
+      input
+    else
+      image_parts =
+        Enum.flat_map(selected, fn frame ->
+          [
+            ContentPart.text(frame_label(frame)),
+            ContentPart.image(frame.image, frame.mime_type || "image/jpeg")
+          ]
+        end)
+
+      List.update_at(input, -1, fn
+        %{role: "user", content: text} = msg when is_binary(text) ->
+          %{msg | content: image_parts ++ [ContentPart.text(text)]}
+
+        %{role: "user", content: parts} = msg when is_list(parts) ->
+          %{msg | content: image_parts ++ parts}
+
+        other ->
+          other
+      end)
+    end
+  end
+
+  # Fresh frames ordered by: screen shares first, then the current speaker's
+  # camera, then other cameras (newest first within each tier).
+  defp select_frames(state, speaker_source) do
+    now = state.clock.()
+    speaker_id = participant_id(speaker_source)
+
+    state.frames
+    |> Map.values()
+    |> Enum.filter(&(now - &1.at <= state.frame_ttl_ms))
+    |> Enum.sort_by(fn %{frame: f, at: at} ->
+      tier =
+        cond do
+          frame_track_source(f) == "screen" -> 0
+          speaker_id != nil and participant_id(f.source) == speaker_id -> 1
+          true -> 2
+        end
+
+      {tier, -at}
+    end)
+    |> Enum.take(state.max_frames)
+    |> Enum.map(& &1.frame)
+  end
+
+  defp frame_label(frame) do
+    kind = frame_track_source(frame) || "video"
+
+    case frame.speaker do
+      name when is_binary(name) and name != "" -> "[#{name}'s #{kind}]"
+      _ -> "[#{kind}]"
+    end
+  end
+
+  defp frame_track_source(%{track_source: src}) when is_binary(src) and src != "", do: src
+
+  defp frame_track_source(%{source: source}) when is_binary(source) do
+    case String.split(source, "/", parts: 2) do
+      [_id, kind] -> kind
+      _ -> nil
+    end
+  end
+
+  defp frame_track_source(_), do: nil
+
+  defp participant_id(source) when is_binary(source), do: source |> String.split("/") |> hd()
+  defp participant_id(_), do: nil
 
   # Into the oldest reserved place (replies come back in order), or at the
   # end if there's none; an empty reply just frees its place.

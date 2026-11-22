@@ -1,4 +1,6 @@
 import AVFoundation
+import CoreImage
+import ImageIO
 @_exported import OctoroomCore
 @preconcurrency import WebRTC
 
@@ -411,11 +413,13 @@ public final class CameraTrack: LocalMediaTrack, WebRTCTrackProviding {
   public let position: AVCaptureDevice.Position
   public private(set) var isLive = true
   public var rtcTrack: RTCMediaStreamTrack { track }
+  private let snapshotter = VideoSnapshotter()
 
   init(track: RTCVideoTrack, capturer: RTCCameraVideoCapturer, position: AVCaptureDevice.Position) {
     self.track = track
     self.capturer = capturer
     self.position = position
+    track.add(snapshotter)
   }
 
   public var id: String { track.trackId }
@@ -448,9 +452,16 @@ public final class CameraTrack: LocalMediaTrack, WebRTCTrackProviding {
     return abs(d.width - width) + abs(d.height - height)
   }
 
+  public func snapshot(maxDimension: Int, quality: Double) async -> CapturedFrame? {
+    guard isLive, isEnabled else { return nil }
+    return snapshotter.snapshot(maxDimension: maxDimension, quality: quality)
+  }
+
   public func stop() {
     guard isLive else { return }
     isLive = false
+    track.remove(snapshotter)
+    snapshotter.clear()
     capturer.stopCapture()
   }
 }
@@ -464,10 +475,12 @@ public final class FrameTrack: LocalMediaTrack, WebRTCTrackProviding {
   /// Called once when the track stops, by `stop()` or by its capture ending.
   public var onStop: (() -> Void)?
   public var rtcTrack: RTCMediaStreamTrack { track }
+  private let snapshotter = VideoSnapshotter()
 
   init(track: RTCVideoTrack, source: RTCVideoSource) {
     self.track = track
     self.sink = FrameSink(source: source)
+    track.add(snapshotter)
   }
 
   public var id: String { track.trackId }
@@ -481,12 +494,78 @@ public final class FrameTrack: LocalMediaTrack, WebRTCTrackProviding {
     sink.push(pixelBuffer, rotation: rotation, timestampNs: timestampNs)
   }
 
+  public func snapshot(maxDimension: Int, quality: Double) async -> CapturedFrame? {
+    guard isLive, isEnabled else { return nil }
+    return snapshotter.snapshot(maxDimension: maxDimension, quality: quality)
+  }
+
   public func stop() {
     guard isLive else { return }
     isLive = false
+    track.remove(snapshotter)
+    snapshotter.clear()
     let onStop = self.onStop
     self.onStop = nil
     onStop?()
+  }
+}
+
+/// Keeps a reference to the latest WebRTC video frame and encodes a scaled JPEG
+/// only when `snapshot` is called (zero per-frame encoding overhead while idle).
+final class VideoSnapshotter: NSObject, RTCVideoRenderer, @unchecked Sendable {
+  private let lock = NSLock()
+  private var latest: RTCVideoFrame?
+  private static let ciContext = CIContext()
+
+  func setSize(_ size: CGSize) {}
+
+  func renderFrame(_ frame: RTCVideoFrame?) {
+    lock.lock()
+    latest = frame
+    lock.unlock()
+  }
+
+  func clear() {
+    lock.lock()
+    latest = nil
+    lock.unlock()
+  }
+
+  func snapshot(maxDimension: Int, quality: Double) -> CapturedFrame? {
+    lock.lock()
+    let frame = latest
+    lock.unlock()
+    guard let frame, let cvBuffer = frame.buffer as? RTCCVPixelBuffer else { return nil }
+
+    var image = CIImage(cvPixelBuffer: cvBuffer.pixelBuffer)
+    switch frame.rotation {
+    case ._90: image = image.oriented(.right)
+    case ._180: image = image.oriented(.down)
+    case ._270: image = image.oriented(.left)
+    default: break
+    }
+
+    let extent = image.extent
+    guard extent.width > 0, extent.height > 0 else { return nil }
+    let longest = max(extent.width, extent.height)
+    if longest > CGFloat(maxDimension) {
+      let scale = CGFloat(maxDimension) / longest
+      image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    }
+
+    let outExtent = image.extent
+    let width = max(1, Int(outExtent.width.rounded()))
+    let height = max(1, Int(outExtent.height.rounded()))
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let options: [CIImageRepresentationOption: Any] = [
+      CIImageRepresentationOption(
+        rawValue: kCGImageDestinationLossyCompressionQuality as String): max(0.1, min(1.0, quality))
+    ]
+    guard let jpeg = Self.ciContext.jpegRepresentation(
+      of: image, colorSpace: colorSpace, options: options)
+    else { return nil }
+
+    return CapturedFrame(data: jpeg, mimeType: "image/jpeg", width: width, height: height)
   }
 }
 
@@ -521,8 +600,10 @@ extension RoomClient {
   /// A room client on the WebRTC engine.
   public convenience init(
     socket: PhoenixSocket, topic: String, params: JSONValue = [:], audio: Bool = true,
-    video: Bool = false, engine: WebRTCEngine = WebRTCEngine()
+    video: Bool = false, capture: Bool = true, engine: WebRTCEngine = WebRTCEngine()
   ) {
-    self.init(socket: socket, topic: topic, params: params, engine: engine, audio: audio, video: video)
+    self.init(
+      socket: socket, topic: topic, params: params, engine: engine, audio: audio, video: video,
+      capture: capture)
   }
 }

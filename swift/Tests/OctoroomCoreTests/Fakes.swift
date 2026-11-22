@@ -142,9 +142,11 @@ final class FakeLocalTrack: LocalMediaTrack {
   let kind: MediaKind
   var isEnabled = true
   var isLive = true
+  var snapshotFrame: CapturedFrame?
 
   init(kind: MediaKind) { self.kind = kind }
   func stop() { isLive = false }
+  func snapshot(maxDimension: Int, quality: Double) async -> CapturedFrame? { snapshotFrame }
 }
 
 @MainActor

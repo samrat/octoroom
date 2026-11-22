@@ -93,6 +93,12 @@ public protocol LocalMediaTrack: AnyObject {
   var isLive: Bool { get }
   /// Stops capturing (and turns the camera light off).
   func stop()
+  /// Grabs a JPEG snapshot of the latest video frame, scaled to `maxDimension`.
+  func snapshot(maxDimension: Int, quality: Double) async -> CapturedFrame?
+}
+
+extension LocalMediaTrack {
+  public func snapshot(maxDimension: Int, quality: Double) async -> CapturedFrame? { nil }
 }
 
 /// A track this client receives.

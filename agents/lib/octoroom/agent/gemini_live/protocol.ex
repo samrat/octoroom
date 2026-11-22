@@ -101,6 +101,16 @@ defmodule Octoroom.Agent.GeminiLive.Protocol do
     }
   end
 
+  def video_input_frame(data, opts \\ []) when is_binary(data) do
+    mime_type = Keyword.get(opts, :mime_type, "image/jpeg")
+
+    %{
+      realtimeInput: %{
+        video: %{mimeType: mime_type, data: Base.encode64(data)}
+      }
+    }
+  end
+
   @doc "Tells the model the audio stopped for a while, so it doesn't wait for more."
   def audio_stream_end_frame, do: %{realtimeInput: %{audioStreamEnd: true}}
 

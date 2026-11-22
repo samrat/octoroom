@@ -158,6 +158,9 @@ defmodule Octoroom.Agent.Processors.Tools do
   def handle_event({:info, {:octoroom_agent_speaker, speaker}}, _state, data),
     do: {:keep_state, %{data | context: Map.put(data.context, :speaker, speaker)}}
 
+  def handle_event({:info, {:octoroom_agent_frames, frames}}, _state, data),
+    do: {:keep_state, %{data | context: Map.put(data.context, :frames, frames)}}
+
   def handle_event({:info, {:octoroom_agent_async_tool_result, result}}, state, data) do
     event = if result[:event], do: [{:notify, {:control, result.event}}], else: []
     frame = {:push, %Frames.AsyncToolResult{result: result}, :upstream}

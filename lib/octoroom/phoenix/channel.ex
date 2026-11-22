@@ -79,7 +79,7 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     end
 
     @salt "octoroom resume"
-    @events ~w(publish publish_tracks push_offer unpublish mute connected answer close_offer worker_message)
+    @events ~w(publish publish_tracks push_offer unpublish mute connected answer close_offer worker_message video_frame)
 
     @doc false
     def __join__(module, topic, params, socket) do
@@ -215,6 +215,45 @@ if Code.ensure_loaded?(Phoenix.Channel) do
       end
     end
 
+    def __handle_in__("video_frame", %{"source" => source, "data" => data} = payload, socket)
+        when is_binary(source) and is_binary(data) do
+      %{max_bytes: max} = Octoroom.video_frame_limits()
+      mime_type = Map.get(payload, "mime_type", "image/jpeg")
+      width = Map.get(payload, "width")
+      height = Map.get(payload, "height")
+
+      cond do
+        mime_type != "image/jpeg" or not dim?(width) or not dim?(height) ->
+          bad_payload(socket)
+
+        # Reject oversized base64 before decoding to avoid allocating large binaries.
+        byte_size(data) > div(max * 4, 3) + 4 ->
+          {:reply, {:error, %{reason: "too_large"}}, socket}
+
+        true ->
+          case Base.decode64(data) do
+            {:ok, raw} when byte_size(raw) > max ->
+              {:reply, {:error, %{reason: "too_large"}}, socket}
+
+            {:ok, <<0xFF, 0xD8, 0xFF, _::binary>> = raw} ->
+              %{server: server, participant_id: id} = socket.assigns.octoroom
+
+              frame = %{
+                data: raw,
+                mime_type: mime_type,
+                width: width,
+                height: height
+              }
+
+              Server.video_frame(server, id, source, frame, socket_ref(socket))
+              {:noreply, socket}
+
+            _ ->
+              bad_payload(socket)
+          end
+      end
+    end
+
     def __handle_in__(event, _payload, socket) when event in @events, do: bad_payload(socket)
 
     def __handle_in__(_event, _payload, socket),
@@ -249,6 +288,10 @@ if Code.ensure_loaded?(Phoenix.Channel) do
     defp mids?(mids),
       do: Enum.all?(mids, fn {source, mid} -> is_binary(source) and is_binary(mid) end)
 
+    defp dim?(nil), do: true
+    defp dim?(n) when is_integer(n) and n > 0 and n <= 8192, do: true
+    defp dim?(_), do: false
+
     defp bad_payload(socket), do: {:reply, {:error, %{reason: "bad_payload"}}, socket}
 
     @doc false
@@ -281,7 +324,8 @@ if Code.ensure_loaded?(Phoenix.Channel) do
                :gain,
                :republish,
                :worker,
-               :worker_event
+               :worker_event,
+               :capture
              ] do
       push(socket, Atom.to_string(kind), payload)
       {:noreply, socket}

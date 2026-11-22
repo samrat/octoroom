@@ -292,7 +292,12 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   end
 
   def handle_frame(%module{}, :downstream, state)
-      when module in [Frames.LLMResponseStart, Frames.LLMResponseEnd],
+      when module in [
+             Frames.LLMResponseStart,
+             Frames.LLMResponseEnd,
+             Frames.InputImage,
+             Frames.VideoInactive
+           ],
       do: {[], state}
 
   def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
@@ -363,6 +368,9 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
   def handle_info({:octoroom_agent_speaker, speaker}, state),
     do: {[], %{state | context: Map.put(state.context, :speaker, speaker)}}
+
+  def handle_info({:octoroom_agent_frames, frames}, state),
+    do: {[], %{state | context: Map.put(state.context, :frames, frames)}}
 
   def handle_info({:octoroom_agent_async_tool_result, %{response: response} = result}, state) do
     send_openai(state, {:tool_output, result.call_id, response})

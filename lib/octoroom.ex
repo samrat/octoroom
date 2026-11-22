@@ -102,6 +102,18 @@ defmodule Octoroom do
   end
 
   @doc false
+  # Limits on client-supplied video frames, from `config :octoroom,
+  # video_frames: [...]` and then `overrides`: `max_bytes` per decoded JPEG
+  # frame, and a bucket per participant per source that refills at
+  # `per_second` up to `burst`.
+  def video_frame_limits(overrides \\ []) do
+    [max_bytes: 512_000, per_second: 4, burst: 6]
+    |> Keyword.merge(Application.get_env(:octoroom, :video_frames, []))
+    |> Keyword.merge(overrides)
+    |> Map.new()
+  end
+
+  @doc false
   def ice_servers,
     do: Application.get_env(:octoroom, :ice_servers, [%{urls: "stun:stun.cloudflare.com:3478"}])
 end

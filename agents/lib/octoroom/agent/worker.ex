@@ -212,7 +212,16 @@ defmodule Octoroom.Agent.Worker do
   would. Other payloads are ignored.
   """
 
-  use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]
+  use Octoroom.Worker,
+    audio: [rate: 16_000, channels: 1, output: [rate: 24_000]],
+    video: [
+      source: :client,
+      fps: 1,
+      max_dimension: 1024,
+      quality: 0.75,
+      camera: [max_dimension: 768],
+      screen: [max_dimension: 1280]
+    ]
 
   require Logger
 
@@ -236,6 +245,8 @@ defmodule Octoroom.Agent.Worker do
          {:ok, back_core} <- Core.new(back_spec, back_ctx(args, ctx)) do
       name = Map.get(args, :name, "Assistant")
 
+      {audio_inputs, video_inputs} = partition_inputs(ctx.inputs)
+
       state = %{
         id: ctx.id,
         room_id: ctx.room_id,
@@ -246,6 +257,9 @@ defmodule Octoroom.Agent.Worker do
         fronts: %{},
         front_spec: front_spec,
         stt: stt_info(front_spec),
+        video_inputs: MapSet.new(video_inputs),
+        video_frames: %{},
+        active_speaker_id: nil,
         # Options the back end set on front-end stages with `UpdateStage`,
         # by stage name, for front ends started later.
         front_updates: %{},
@@ -308,7 +322,7 @@ defmodule Octoroom.Agent.Worker do
       {state, actions} =
         if state.mixer,
           do: {schedule_mix(%{state | mix_at: now()}), actions},
-          else: Enum.reduce(ctx.inputs, {state, actions}, &add_front/2)
+          else: Enum.reduce(audio_inputs, {state, actions}, &add_front/2)
 
       result(state, actions)
     else
@@ -317,8 +331,11 @@ defmodule Octoroom.Agent.Worker do
   end
 
   @impl true
-  def handle_audio(input, pcm, %{mixer: %Mixer{} = mixer} = state),
-    do: {:ok, %{state | mixer: Mixer.push(mixer, input, pcm)}}
+  def handle_audio(input, pcm, %{mixer: %Mixer{} = mixer} = state) do
+    state = %{state | mixer: Mixer.push(mixer, input, pcm)}
+    {state, actions} = maybe_active_speaker(input, pcm, state)
+    result(state, actions)
+  end
 
   def handle_audio(input, pcm, state) do
     {state, actions} =
@@ -338,14 +355,73 @@ defmodule Octoroom.Agent.Worker do
   end
 
   @impl true
+  def handle_video(input, frame, state) do
+    {name, state} = speaker(input, state)
+    track_source = frame[:source] || track_source(input)
+    mime_type = Map.get(frame, :mime_type, "image/jpeg")
+
+    stored = %{
+      data: frame.data,
+      mime_type: mime_type,
+      width: Map.get(frame, :width),
+      height: Map.get(frame, :height),
+      source: track_source,
+      speaker: name
+    }
+
+    state = put_in(state.video_frames[input], stored)
+
+    image_frame = %Frames.InputImage{
+      image: frame.data,
+      mime_type: mime_type,
+      width: stored.width,
+      height: stored.height,
+      source: input,
+      track_source: track_source,
+      speaker: name
+    }
+
+    event =
+      {:agent,
+       {:video_frame,
+        %{
+          source: input,
+          track_source: track_source,
+          speaker: name,
+          mime_type: mime_type,
+          width: stored.width,
+          height: stored.height,
+          bytes: byte_size(frame.data),
+          data: frame.data
+        }}}
+
+    {state, actions} = tell_back(state, {:octoroom_agent_frames, state.video_frames}, emit: event)
+    {state, actions} = push_back(state, image_frame, actions)
+    result(state, actions)
+  end
+
+  @impl true
   def handle_info({:octoroom, :inputs, inputs}, %{mixer: %Mixer{} = mixer} = state) do
-    gone = Map.keys(mixer.inputs) -- inputs
-    {:ok, %{state | mixer: Enum.reduce(gone, mixer, &Mixer.drop(&2, &1))}}
+    {audio_inputs, video_inputs} = partition_inputs(inputs)
+    gone = Map.keys(mixer.inputs) -- audio_inputs
+    state = %{state | mixer: Enum.reduce(gone, mixer, &Mixer.drop(&2, &1))}
+    {state, actions} = sync_video_inputs(video_inputs, state, [])
+    result(state, actions)
   end
 
   def handle_info({:octoroom, :inputs, inputs}, state) do
-    {state, actions} = Enum.reduce(inputs -- Map.keys(state.fronts), {state, []}, &add_front/2)
-    state = Enum.reduce(Map.keys(state.fronts) -- inputs, state, &drop_front/2)
+    {audio_inputs, video_inputs} = partition_inputs(inputs)
+
+    {state, actions} =
+      Enum.reduce(audio_inputs -- Map.keys(state.fronts), {state, []}, &add_front/2)
+
+    state = Enum.reduce(Map.keys(state.fronts) -- audio_inputs, state, &drop_front/2)
+    {state, actions} = sync_video_inputs(video_inputs, state, actions)
+    result(state, actions)
+  end
+
+  def handle_info({:octoroom, :video_inactive, input}, state) do
+    {state, actions} = drop_video_frame(input, state, [])
     result(state, actions)
   end
 
@@ -1198,6 +1274,62 @@ defmodule Octoroom.Agent.Worker do
 
   # Inputs are `<participant id>/<source>`.
   defp participant_id(input), do: input |> String.split("/") |> hd()
+
+  defp track_source(input) do
+    case Octoroom.Track.parse(input) do
+      {_id, source} -> source
+      nil -> nil
+    end
+  end
+
+  defp partition_inputs(inputs),
+    do: Enum.split_with(inputs, &(Octoroom.Track.new(&1).kind == :audio))
+
+  defp sync_video_inputs(video_inputs, state, actions) do
+    now = MapSet.new(video_inputs)
+    removed = MapSet.difference(state.video_inputs, now)
+    state = %{state | video_inputs: now}
+    Enum.reduce(removed, {state, actions}, fn input, {s, a} -> drop_video_frame(input, s, a) end)
+  end
+
+  defp drop_video_frame(input, state, actions) do
+    state = %{state | video_frames: Map.delete(state.video_frames, input)}
+    actions = actions ++ [emit: {:agent, {:video_inactive, %{source: input}}}]
+    {state, actions} = tell_back(state, {:octoroom_agent_frames, state.video_frames}, actions)
+    push_back(state, %Frames.VideoInactive{source: input}, actions)
+  end
+
+  # Lightweight speech-energy hint for mixed backends (e.g. Gemini Live) so
+  # multi-camera rooms can follow the active speaker when no screen is shared.
+  @active_speech_threshold 1_200
+
+  defp maybe_active_speaker(input, pcm, state) do
+    id = participant_id(input)
+
+    if id != state.active_speaker_id and loud?(pcm) do
+      tell_back(%{state | active_speaker_id: id}, {:octoroom_agent_active_speaker, id}, [])
+    else
+      {state, []}
+    end
+  end
+
+  defp loud?(pcm) when byte_size(pcm) < 2, do: false
+
+  defp loud?(pcm) do
+    # Sample up to 32 points evenly across the chunk to stay O(1).
+    samples = div(byte_size(pcm), 2)
+    step = max(div(samples, 32), 1)
+    loud_loop(pcm, 0, samples, step, 0, 0)
+  end
+
+  defp loud_loop(_pcm, i, samples, _step, sum, count) when i >= samples or count == 32 do
+    count > 0 and div(sum, count) >= @active_speech_threshold
+  end
+
+  defp loud_loop(pcm, i, samples, step, sum, count) do
+    <<sample::little-signed-16>> = binary_part(pcm, i * 2, 2)
+    loud_loop(pcm, i + step, samples, step, sum + abs(sample), count + 1)
+  end
 
   # A participant who joined after the agent started is looked up in the
   # room once.

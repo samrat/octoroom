@@ -47,6 +47,8 @@ public final class RoomClient {
     case tracks
     /// What this client publishes changed: read `localTracks`.
     case local
+    /// The video sources being captured for workers changed.
+    case capture(Set<Source>)
     case connection(PeerConnectionState)
     case reconnecting
     case reconnected(resumed: Bool)
@@ -72,6 +74,12 @@ public final class RoomClient {
   public private(set) var localTracks: [Source: LocalTrack] = [:]
   public private(set) var connectionState: PeerConnectionState = .new
   public private(set) var isMuted = false
+  /// Server-requested capture directives per video source.
+  public private(set) var captureDirectives: [Source: CaptureConfig] = [:]
+  /// Video sources currently being captured for workers.
+  public private(set) var capturing: Set<Source> = []
+  /// Whether this client honors server video capture directives.
+  public private(set) var captureEnabled: Bool
 
   // MARK: configuration
 
@@ -90,6 +98,7 @@ public final class RoomClient {
   @ObservationIgnored private var iceServers: [IceServer] = []
   @ObservationIgnored public private(set) var resumeToken: String?
   @ObservationIgnored private var local: [Source: LocalEntry] = [:]
+  @ObservationIgnored private var captureTasks: [Source: (config: CaptureConfig, trackId: String, task: Task<Void, Never>)] = [:]
   @ObservationIgnored private var queueTail: Task<Void, Never>?
   @ObservationIgnored private var generation = 0
   @ObservationIgnored private var joinWaiter: JoinWaiter?
@@ -125,7 +134,8 @@ public final class RoomClient {
   ///   - video: also open and publish the camera on join.
   public init(
     socket: PhoenixSocket, topic: String, params: JSONValue = [:], engine: any MediaEngine,
-    media: [Source: any LocalMediaTrack]? = nil, audio: Bool = true, video: Bool = false
+    media: [Source: any LocalMediaTrack]? = nil, audio: Bool = true, video: Bool = false,
+    capture: Bool = true
   ) {
     self.socket = socket
     self.topic = topic
@@ -134,6 +144,7 @@ public final class RoomClient {
     self.providedMedia = media
     self.audio = audio
     self.video = video
+    self.captureEnabled = capture
   }
 
   /// A new stream of this client's events. Each call gets its own stream.
@@ -205,6 +216,7 @@ public final class RoomClient {
       try await connectMedia()
       try checkCurrent(generation)
       setState(.joined)
+      syncCapture()
       return reply
     } catch {
       if self.generation == generation { teardown(.failed) }
@@ -245,6 +257,7 @@ public final class RoomClient {
         worker: worker, output: p["output"]?.stringValue ?? "", type: type, data: p["data"] ?? [:])
       self?.emit(.workerEvent(event))
     }
+    channel.on("capture") { [weak self] p in self?.onCapture(p) }
     channel.on("resume_token") { [weak self] p in
       if let token = p["token"]?.stringValue { self?.resumeToken = token }
     }
@@ -264,8 +277,10 @@ public final class RoomClient {
     iceServers = (try? reply["ice_servers"]?.decode([IceServer].self)) ?? []
     resumeToken = reply["resume_token"]?.stringValue
     workers = (try? reply["workers"]?.decode([Worker].self)) ?? []
+    captureDirectives = parseCaptureDirectives(reply["capture"])
     emit(.participants(participants))
     emit(.workers(workers))
+    syncCapture()
   }
 
   private func onRejoined(_ reply: JSONValue) {
@@ -344,6 +359,7 @@ public final class RoomClient {
     pc?.close()
     pc = nil
     try await connectMedia()
+    syncCapture()
   }
 
   private func peerConnected(_ pc: any PeerConnection, timeout: Duration) async throws {
@@ -390,6 +406,8 @@ public final class RoomClient {
     for waiter in waiters.values { _ = waiter(nil) }
 
     clearRemote()
+    captureDirectives = [:]
+    stopAllCaptures()
     pc?.close()
     pc = nil
     connectionState = .closed
@@ -431,6 +449,7 @@ public final class RoomClient {
       Task { _ = try? await self.push("mute", ["source": .string(source.rawValue), "muted": .bool(muted)]) }
     }
     emitLocal()
+    syncCapture()
   }
 
   /// Turns the camera on: a track you give, or one the engine opens.
@@ -457,6 +476,7 @@ public final class RoomClient {
 
     do {
       _ = try await request.value
+      syncCapture()
     } catch {
       // The session is being published again from scratch, these included.
       if case .rejected("republishing") = error as? OctoroomError { return }
@@ -481,6 +501,7 @@ public final class RoomClient {
     if entry.owned { entry.media.stop() }
     local[source] = nil
     emitLocal()
+    syncCapture()
     if state == .joined { _ = try? await push("unpublish", ["source": .string(source.rawValue)]) }
   }
 
@@ -574,6 +595,7 @@ public final class RoomClient {
     }
     // The server pulls them for others once they flow.
     _ = try await push("connected")
+    syncCapture()
   }
 
   private func onClose(_ p: JSONValue) async throws {
@@ -660,6 +682,94 @@ public final class RoomClient {
   @discardableResult
   public func send(to workerId: String, _ payload: JSONValue) async throws -> JSONValue {
     try await push("worker_message", ["worker": .string(workerId), "payload": payload])
+  }
+
+  /// Enables or pauses client-side video frame capture for workers.
+  public func setCaptureEnabled(_ enabled: Bool) {
+    guard captureEnabled != enabled else { return }
+    captureEnabled = enabled
+    syncCapture()
+  }
+
+  private func onCapture(_ p: JSONValue) {
+    captureDirectives = parseCaptureDirectives(p)
+    syncCapture()
+  }
+
+  private func parseCaptureDirectives(_ payload: JSONValue?) -> [Source: CaptureConfig] {
+    guard case .object(let raw) = payload?["sources"] else { return [:] }
+    var result: [Source: CaptureConfig] = [:]
+    for (key, value) in raw {
+      guard let source = Source(rawValue: key), source.kind == .video,
+        let config = try? value.decode(CaptureConfig.self), config.fps > 0
+      else { continue }
+      result[source] = config
+    }
+    return result
+  }
+
+  private func syncCapture() {
+    var desired: [Source: (config: CaptureConfig, entry: LocalEntry)] = [:]
+    if state == .joined && captureEnabled {
+      for (source, config) in captureDirectives {
+        guard let entry = local[source], !entry.muted, entry.media.isLive else { continue }
+        desired[source] = (config, entry)
+      }
+    }
+
+    for (source, current) in captureTasks {
+      if let want = desired[source],
+        want.config == current.config,
+        want.entry.media.id == current.trackId
+      {
+        continue
+      }
+      current.task.cancel()
+      captureTasks[source] = nil
+    }
+
+    for (source, want) in desired where captureTasks[source] == nil {
+      let config = want.config
+      let track = want.entry.media
+      let generation = self.generation
+      let intervalMs = max(200, Int((1000.0 / config.fps).rounded()))
+      let task = Task { [weak self] in
+        while !Task.isCancelled {
+          guard let self, self.generation == generation else { return }
+          if let entry = self.local[source], !entry.muted, entry.media.isLive,
+            let frame = await track.snapshot(
+              maxDimension: config.maxDimension, quality: config.quality)
+          {
+            guard !Task.isCancelled, self.generation == generation else { return }
+            var body: [String: JSONValue] = [
+              "source": .string(source.rawValue),
+              "mime_type": .string(frame.mimeType),
+              "data": .string(frame.data.base64EncodedString()),
+            ]
+            if let w = frame.width { body["width"] = .number(Double(w)) }
+            if let h = frame.height { body["height"] = .number(Double(h)) }
+            _ = try? await self.push("video_frame", .object(body))
+          }
+          try? await Task.sleep(for: .milliseconds(intervalMs))
+        }
+      }
+      captureTasks[source] = (config, track.id, task)
+    }
+
+    let next = Set(captureTasks.keys)
+    if next != capturing {
+      capturing = next
+      emit(.capture(next))
+    }
+  }
+
+  private func stopAllCaptures() {
+    for (_, current) in captureTasks { current.task.cancel() }
+    captureTasks = [:]
+    if !capturing.isEmpty {
+      capturing = []
+      emit(.capture([]))
+    }
   }
 
   private func push(_ event: String, _ payload: JSONValue = [:]) async throws -> JSONValue {

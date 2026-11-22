@@ -125,7 +125,11 @@ defmodule Octoroom.Reconciler do
       |> Enum.uniq_by(&elem(&1, 0))
 
     wanted_inlets =
-      for s <- specs, input <- s.inputs, Map.get(tracks, input) == :live, into: MapSet.new() do
+      for s <- specs,
+          input <- s.inputs,
+          Track.new(input).kind == :audio,
+          Map.get(tracks, input) == :live,
+          into: MapSet.new() do
         {s.id, input}
       end
 

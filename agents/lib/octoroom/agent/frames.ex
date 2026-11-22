@@ -15,6 +15,20 @@ defmodule Octoroom.Agent.Frames do
   defframe(Interruption, :system)
   defframe(Error, :system, fields: [:reason, :processor, fatal?: false])
   defframe(InputAudio, :system, fields: [:audio, :source, sample_rate: 16_000])
+
+  defframe(InputImage, :system,
+    fields: [
+      :image,
+      :source,
+      mime_type: "image/jpeg",
+      width: nil,
+      height: nil,
+      speaker: nil,
+      track_source: nil
+    ]
+  )
+
+  defframe(VideoInactive, :system, fields: [:source])
   defframe(VADUserStartedSpeaking, :system, fields: [:source])
   defframe(VADUserStoppedSpeaking, :system, fields: [:source])
   defframe(UserStartedSpeaking, :system, fields: [:source])

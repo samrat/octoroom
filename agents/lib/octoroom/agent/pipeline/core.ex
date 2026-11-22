@@ -41,8 +41,8 @@ defmodule Octoroom.Agent.Pipeline.Core do
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.Pipeline.Spec
 
-  # Audio frames are too frequent for per-frame telemetry.
-  @untraced [Frames.InputAudio, Frames.OutputAudio]
+  # Audio and video frames are too frequent for per-frame telemetry.
+  @untraced [Frames.InputAudio, Frames.OutputAudio, Frames.InputImage]
 
   defstruct stages: {},
             index: %{},

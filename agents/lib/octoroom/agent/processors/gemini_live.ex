@@ -120,6 +120,13 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
       model_text: "",
       last_audio_at: nil,
       audio_end_timer?: false,
+      # Video sources seen recently: source => %{at, track_source, participant_id}.
+      video_sources: %{},
+      active_speaker_id: nil,
+      last_video_sent_at: nil,
+      min_video_interval_ms: Keyword.get(opts, :min_video_interval_ms, 900),
+      video_ttl_ms: Keyword.get(opts, :video_ttl_ms, 5_000),
+      clock: Keyword.get(opts, :clock, &now/0),
       owner: Map.get(ctx, :owner),
       conversation_events: ConversationEvents.new()
     }
@@ -166,6 +173,42 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     if state.audio_end_timer?,
       do: {[], state},
       else: {[{:timer, :audio_end, @audio_end_ms}], %{state | audio_end_timer?: true}}
+  end
+
+  def handle_frame(%Frames.InputImage{image: image, source: source} = frame, :downstream, state)
+      when is_binary(image) do
+    ts = state.clock.()
+
+    entry = %{
+      at: ts,
+      track_source: frame.track_source || video_track_source(source),
+      participant_id: video_participant_id(source)
+    }
+
+    video_sources =
+      state.video_sources
+      |> Map.put(source, entry)
+      |> Map.filter(fn {_k, v} -> ts - v.at <= state.video_ttl_ms end)
+
+    state = %{state | video_sources: video_sources}
+    preferred = preferred_video_source(video_sources, state.active_speaker_id)
+
+    can_send? =
+      preferred == source and
+        state.setup_complete? and
+        (state.last_video_sent_at == nil or
+           ts - state.last_video_sent_at >= state.min_video_interval_ms)
+
+    if can_send? do
+      send_gemini(state, {:video, image, mime_type: frame.mime_type || "image/jpeg"})
+      {[], %{state | last_video_sent_at: ts}}
+    else
+      {[], state}
+    end
+  end
+
+  def handle_frame(%Frames.VideoInactive{source: source}, :downstream, state) do
+    {[], %{state | video_sources: Map.delete(state.video_sources, source)}}
   end
 
   def handle_frame(%Frames.Start{} = frame, :downstream, state) do
@@ -261,6 +304,12 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
   def handle_info({:octoroom_agent_speaker, speaker}, state),
     do: {[], %{state | context: Map.put(state.context, :speaker, speaker)}}
+
+  def handle_info({:octoroom_agent_active_speaker, participant_id}, state),
+    do: {[], %{state | active_speaker_id: participant_id}}
+
+  def handle_info({:octoroom_agent_frames, frames}, state),
+    do: {[], %{state | context: Map.put(state.context, :frames, frames)}}
 
   def handle_info({:octoroom_agent_async_tool_result, %{response: response} = result}, state) do
     response =
@@ -615,9 +664,47 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   defp send_gemini(%{socket: socket}, {:audio, audio}),
     do: WebSocket.send_audio(socket, audio, sample_rate: Protocol.send_sample_rate())
 
+  defp send_gemini(%{socket: socket}, {:video, data, opts}),
+    do: WebSocket.send_video(socket, data, opts)
+
   defp send_gemini(%{socket: socket}, :audio_end), do: WebSocket.send_audio_end(socket)
   defp send_gemini(%{socket: socket}, {:text, text}), do: WebSocket.send_text(socket, text)
 
   defp send_gemini(%{socket: socket}, {:tool_response, responses}),
     do: WebSocket.send_tool_response(socket, responses)
+
+  # Picks one active video source so Gemini Live's single video stream never
+  # flickers between participants: active screen share first, then the active
+  # speaker's camera, then the most recently seen source.
+  defp preferred_video_source(sources, _active_speaker_id) when map_size(sources) == 0, do: nil
+
+  defp preferred_video_source(sources, active_speaker_id) do
+    {source, _entry} =
+      Enum.min_by(sources, fn {_src, entry} ->
+        tier =
+          cond do
+            entry.track_source == "screen" -> 0
+            active_speaker_id != nil and entry.participant_id == active_speaker_id -> 1
+            true -> 2
+          end
+
+        {tier, -entry.at}
+      end)
+
+    source
+  end
+
+  defp video_track_source(source) when is_binary(source) do
+    case String.split(source, "/", parts: 2) do
+      [_id, kind] -> kind
+      _ -> nil
+    end
+  end
+
+  defp video_track_source(_), do: nil
+
+  defp video_participant_id(source) when is_binary(source),
+    do: source |> String.split("/") |> hd()
+
+  defp video_participant_id(_), do: nil
 end

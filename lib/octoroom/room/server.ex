@@ -131,6 +131,16 @@ defmodule Octoroom.Room.Server do
   def worker_message(server, participant_id, worker_id, payload, tag),
     do: GenServer.cast(server, {:worker_message, participant_id, worker_id, payload, tag})
 
+  @doc """
+  A client-supplied video frame (JPEG snapshot) for `source` ("camera" or
+  "screen"). Fanned out to every running worker whose `inputs` include
+  `"<participant_id>/<source>"` and that opted into `video: [source: :client]`.
+  Replies `%{}`, or an error: `:not_published`, `:muted`, `:not_allowed`,
+  `:rate_limited`, `:too_large` or `:bad_payload`.
+  """
+  def video_frame(server, participant_id, source, frame, tag),
+    do: GenServer.cast(server, {:video_frame, participant_id, source, frame, tag})
+
   @doc "Marks a published source muted or not. Nothing renegotiates."
   def mute(server, participant_id, source, muted),
     do: GenServer.cast(server, {:mute, participant_id, source, muted})
@@ -227,9 +237,15 @@ defmodule Octoroom.Room.Server do
        cloudflare: cf,
        signal_timeout: Keyword.get(opts, :signal_timeout, @signal_timeout),
        message_limits: Octoroom.worker_message_limits(Keyword.get(opts, :worker_messages, [])),
+       video_limits: Octoroom.video_frame_limits(Keyword.get(opts, :video_frames, [])),
        # {participant id, worker id} => {tokens, at_ms}: clients' messages
        # to workers.
        buckets: %{},
+       # {participant id, source} => {tokens, at_ms}: client video frames.
+       video_buckets: %{},
+       # participant id => %{source => %{fps, max_dimension, quality}}: what
+       # video sources each participant was last asked to capture.
+       captures: %{},
        # Failures back off retry_base_ms * 2^n: 0.5 s, 1 s, 2 s, ...
        retry_base_ms: Keyword.get(opts, :retry_base_ms, 250),
        pull_coalesce_ms: Keyword.get(opts, :pull_coalesce_ms, @pull_coalesce_ms),
@@ -434,6 +450,11 @@ defmodule Octoroom.Room.Server do
   defp well_formed?({:worker_message, _, worker_id, payload, _}),
     do: is_binary(worker_id) and is_map(payload)
 
+  defp well_formed?({:video_frame, _, source, %{data: data} = frame, _}),
+    do: source?(source) and is_binary(data) and is_map(frame)
+
+  defp well_formed?({:video_frame, _, _, _, _}), do: false
+
   defp well_formed?(_request), do: true
 
   # Source names are strings from a browser; atoms are accepted from Elixir
@@ -454,6 +475,35 @@ defmodule Octoroom.Room.Server do
            :ok <- may_message(state, p, w.spec),
            {:ok, state} <- take_token(state, {id, worker_id}) do
         send(worker, {:octoroom, :message, id, payload})
+        reply(p, tag, {:ok, %{}})
+        state
+      else
+        {:error, reason} ->
+          reply(p, tag, {:error, reason})
+          state
+      end
+    end)
+  end
+
+  defp cast({:video_frame, id, source, frame, tag}, state) do
+    with_participant(state, id, fn p ->
+      source = to_string(source)
+      name = track_name(id, source)
+
+      with :ok <- check_video_source(p, source),
+           {:ok, targets} <- video_targets(state, name),
+           :ok <- check_video_frame(frame, state.video_limits),
+           {:ok, state} <- take_video_token(state, {id, source}) do
+        payload = %{
+          data: frame.data,
+          mime_type: Map.get(frame, :mime_type, "image/jpeg"),
+          width: Map.get(frame, :width),
+          height: Map.get(frame, :height),
+          source: source,
+          participant_id: id
+        }
+
+        for pid <- targets, do: send(pid, {:octoroom_video, name, payload})
         reply(p, tag, {:ok, %{}})
         state
       else
@@ -593,6 +643,10 @@ defmodule Octoroom.Room.Server do
           }
 
           state = put_p(state, p)
+
+          if Track.kind(source) == :video,
+            do: notify_video_inactive(state, track_name(id, source))
+
           if status == :live, do: event(state, {:updated, public(p)})
           reconcile(state)
 
@@ -611,6 +665,10 @@ defmodule Octoroom.Room.Server do
         %{muted: was} = t when was != muted and is_boolean(muted) ->
           p = put_in(p.tracks[source], %{t | muted: muted})
           state = put_p(state, p)
+
+          if muted and Track.kind(source) == :video,
+            do: notify_video_inactive(state, track_name(id, source))
+
           if t.status == :live, do: event(state, {:updated, public(p)})
           state
 
@@ -1203,7 +1261,7 @@ defmodule Octoroom.Room.Server do
         apply_ops(state, state.participants[id], Map.get(ops, id, []), Map.get(desired, id, []))
       end)
 
-    state |> sync_seen() |> schedule_retry()
+    state |> sync_seen() |> sync_capture() |> schedule_retry()
   end
 
   defp apply_ops(state, p, ops, desired_tracks) do
@@ -1532,6 +1590,99 @@ defmodule Octoroom.Room.Server do
     if tokens >= 1,
       do: {:ok, put_in(state.buckets[key], {tokens - 1, now})},
       else: {:error, :rate_limited}
+  end
+
+  ## Client video frames
+
+  defp check_video_source(p, source) do
+    if Track.kind(source) != :video do
+      {:error, :bad_payload}
+    else
+      case p.tracks[source] do
+        %{status: status, muted: false} when status in [:pending, :live] -> :ok
+        %{status: status, muted: true} when status in [:pending, :live] -> {:error, :muted}
+        _ -> {:error, :not_published}
+      end
+    end
+  end
+
+  defp video_targets(state, name) do
+    targets =
+      for {_id, %{pid: pid, spec: spec}} <- state.workers,
+          name in spec.inputs,
+          match?(%{source: :client}, Worker.video_config(spec.module)),
+          do: pid
+
+    if targets == [], do: {:error, :not_allowed}, else: {:ok, targets}
+  end
+
+  defp check_video_frame(frame, %{max_bytes: max}) do
+    mime = Map.get(frame, :mime_type, "image/jpeg")
+    data = frame.data
+
+    cond do
+      mime != "image/jpeg" -> {:error, :bad_payload}
+      byte_size(data) > max -> {:error, :too_large}
+      not match?(<<0xFF, 0xD8, 0xFF, _::binary>>, data) -> {:error, :bad_payload}
+      true -> :ok
+    end
+  end
+
+  defp take_video_token(state, key) do
+    %{per_second: rate, burst: burst} = state.video_limits
+    now = now_ms()
+    {tokens, at} = Map.get(state.video_buckets, key, {burst, now})
+    tokens = min(burst, tokens + (now - at) * rate / 1000)
+
+    if tokens >= 1,
+      do: {:ok, put_in(state.video_buckets[key], {tokens - 1, now})},
+      else: {:error, :rate_limited}
+  end
+
+  defp notify_video_inactive(state, name) do
+    for {_id, %{pid: pid, spec: spec}} <- state.workers,
+        name in spec.inputs,
+        Worker.video_config(spec.module) != nil,
+        do: send(pid, {:octoroom, :video_inactive, name})
+
+    :ok
+  end
+
+  # Computes what video sources each participant should capture for workers,
+  # taking the highest fps, max_dimension and quality across all workers
+  # seeing each track. Signals `:capture` whenever a participant's map changes.
+  defp sync_capture(state) do
+    now =
+      Map.new(state.participants, fn {id, _p} ->
+        {id, capture_for(state, id)}
+      end)
+
+    for {id, sources} <- now,
+        Map.get(state.captures, id, %{}) != sources do
+      signal(state.participants[id], :capture, %{sources: sources})
+    end
+
+    %{state | captures: now}
+  end
+
+  defp capture_for(state, participant_id) do
+    for spec <- state.worker_specs,
+        %{source: :client} = video <- [Worker.video_config(spec.module)],
+        input <- spec.inputs,
+        {^participant_id, source} <- [Track.parse(input)],
+        Track.kind(source) == :video,
+        reduce: %{} do
+      acc ->
+        params = Worker.video_params(video, source)
+
+        Map.update(acc, source, params, fn cur ->
+          %{
+            fps: max(cur.fps, params.fps),
+            max_dimension: max(cur.max_dimension, params.max_dimension),
+            quality: max(cur.quality, params.quality)
+          }
+        end)
+    end
   end
 
   ## Worker presence and events
@@ -2100,12 +2251,18 @@ defmodule Octoroom.Room.Server do
         if p.publish_tag, do: reply(p, p.publish_tag, {:error, reason})
         for {_, _, tag} <- p.requests, do: reply(p, tag, {:error, reason})
 
+        for {source, _} <- p.tracks,
+            Track.kind(source) == :video,
+            do: notify_video_inactive(state, track_name(id, source))
+
         state = %{
           state
           | participants: participants,
             order: List.delete(state.order, id),
             failures: Map.reject(state.failures, fn {{pid, _}, _} -> pid == id end),
-            buckets: Map.reject(state.buckets, fn {{pid, _}, _} -> pid == id end)
+            buckets: Map.reject(state.buckets, fn {{pid, _}, _} -> pid == id end),
+            video_buckets: Map.reject(state.video_buckets, fn {{pid, _}, _} -> pid == id end),
+            captures: Map.delete(state.captures, id)
         }
 
         event(state, {:left, public(p)})
@@ -2243,6 +2400,8 @@ defmodule Octoroom.Room.Server do
       ice_servers: Octoroom.ice_servers(),
       # The workers it sees; updates come as `worker` signals.
       workers: seen_workers(state, p.id),
+      # What video sources workers want this client to capture.
+      capture: %{sources: Map.get(state.captures, p.id, %{})},
       resumed: resumed,
       # The channel turns this into the client's resume token.
       resume: resume_data(p)
@@ -2266,6 +2425,7 @@ defmodule Octoroom.Room.Server do
   defp resync(state, p) do
     open = for {name, %{status: :open}} <- p.subs, do: name
     signal(p, :tracks, %{reset: true, added: track_infos(state, p, open), removed: []})
+    signal(p, :capture, %{sources: Map.get(state.captures, p.id, %{})})
 
     case p.op do
       %{request: {kind, payload}, stage: stage} = op

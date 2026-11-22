@@ -214,3 +214,36 @@ public struct AudioLevels: Sendable, Hashable {
     self.remote = remote
   }
 }
+
+/// Capture parameters requested by the server for a video source.
+public struct CaptureConfig: Codable, Sendable, Hashable {
+  public var fps: Double
+  public var maxDimension: Int
+  public var quality: Double
+
+  public init(fps: Double = 1.0, maxDimension: Int = 1024, quality: Double = 0.75) {
+    self.fps = fps
+    self.maxDimension = maxDimension
+    self.quality = quality
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case fps, quality
+    case maxDimension = "max_dimension"
+  }
+}
+
+/// A JPEG snapshot captured from a local video track.
+public struct CapturedFrame: Sendable, Hashable {
+  public var data: Data
+  public var mimeType: String
+  public var width: Int?
+  public var height: Int?
+
+  public init(data: Data, mimeType: String = "image/jpeg", width: Int? = nil, height: Int? = nil) {
+    self.data = data
+    self.mimeType = mimeType
+    self.width = width
+    self.height = height
+  }
+}
