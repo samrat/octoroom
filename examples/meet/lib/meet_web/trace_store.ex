@@ -14,6 +14,7 @@ defmodule MeetWeb.TraceStore do
   @topic "octoroom:traces"
 
   def topic, do: @topic
+  def room_topic(room_id), do: "octoroom:room_spans:#{room_id}"
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -113,6 +114,29 @@ defmodule MeetWeb.TraceStore do
     Phoenix.PubSub.broadcast(Meet.PubSub, @topic, :traces_updated)
   end
 
+  defp broadcast_room_spans(nil, _agent_id, _spans, _now_ms), do: :ok
+  defp broadcast_room_spans(_room_id, _agent_id, [], _now_ms), do: :ok
+
+  defp broadcast_room_spans(room_id, agent_id, spans, now_ms) do
+    payloads =
+      for span <- spans do
+        %{
+          id: span.id,
+          agent: agent_id,
+          kind: Atom.to_string(span.kind),
+          label: span.label,
+          ago_start_ms: Float.round(max(now_ms - span.start_ms, 0.0), 1),
+          ago_end_ms: Float.round(max(now_ms - span.end_ms, 0.0), 1),
+          duration_ms: Float.round(span.duration_ms * 1.0, 1),
+          first_output_ms:
+            if(is_number(span[:first_output_ms]), do: Float.round(span.first_output_ms * 1.0, 1)),
+          status: Atom.to_string(span.status || :ok)
+        }
+      end
+
+    Phoenix.PubSub.broadcast(Meet.PubSub, room_topic(room_id), {:timeline_spans, payloads})
+  end
+
   # -- Room lifecycle (calls) --
 
   defp record([:octoroom, :room, :start], _m, meta, now_ms, wall_at, state) do
@@ -200,6 +224,7 @@ defmodule MeetWeb.TraceStore do
         |> recompute_bounds()
       end)
 
+    broadcast_room_spans(room_id, agent_id, front_spans, now_ms)
     put_in(state.active_utterance[{room_id, agent_id}], utterance_id)
   end
 
@@ -234,6 +259,8 @@ defmodule MeetWeb.TraceStore do
           meta: %{outcome: meta[:outcome], duration_ms: round(dur)}
         }
 
+        broadcast_room_spans(room_id, agent_id, [span], now_ms)
+
         update_utterance(state, utterance_id, fn u ->
           lane =
             u.lanes
@@ -255,6 +282,7 @@ defmodule MeetWeb.TraceStore do
        )
        when status in [:stop, :exception] do
     {span, state} = build_async_span(status, m, meta, now_ms, state)
+    broadcast_room_spans(meta[:room_id], meta[:agent_id], [span], now_ms)
     attach_backend_span(meta[:room_id], meta[:agent_id], meta[:turn_id], span, wall_at, state)
   end
 
@@ -289,6 +317,7 @@ defmodule MeetWeb.TraceStore do
       meta: compact_map(%{tool: meta[:tool], result: meta[:result], reason: meta[:reason]})
     }
 
+    broadcast_room_spans(meta[:room_id], meta[:agent_id], [span], now_ms)
     attach_backend_span(meta[:room_id], meta[:agent_id], nil, span, wall_at, state)
   end
 
@@ -472,6 +501,7 @@ defmodule MeetWeb.TraceStore do
         |> recompute_bounds()
       end)
 
+    broadcast_room_spans(room_id, agent_id, spans, now_ms)
     put_in(state.active_utterance[{room_id, agent_id}], utterance_id)
   end
 

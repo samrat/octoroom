@@ -4,6 +4,7 @@
 // everything else from the room server's state.
 import {RoomClient} from "../../../../priv/static/octoroom.mjs"
 import {Socket} from "phoenix"
+import {resumeTimelineAudio} from "./voice_timeline_canvas.js"
 
 let room = null
 const previews = new WeakMap() // local track => MediaStream, so previews don't flicker
@@ -208,6 +209,31 @@ export const LobbyPreview = {
 }
 
 const mediaChanged = () => window.dispatchEvent(new Event("meet:media"))
+const callStateChanged = (running) =>
+  window.dispatchEvent(new CustomEvent("meet:call-state", {detail: {running}}))
+
+export const isCallLive = () => Boolean(room && room.state === "joined")
+
+// Active audio MediaStreamTracks by lane id (local mic, remote mics, workers).
+export const audioTracks = () => {
+  const tracks = new Map()
+  if (!room) return tracks
+  const mic = room.localTracks().mic
+  if (room.participantId && mic?.track && !room.muted && !mic.muted) {
+    tracks.set(room.participantId, mic.track)
+  }
+  for (const t of room.tracks()) {
+    if (t.kind !== "audio") continue
+    const audioTrack = t.stream?.getAudioTracks()[0] || null
+    if (!audioTrack) continue
+    if (t.source === "mic" && t.participant_id) {
+      tracks.set(t.participant_id, audioTrack)
+    } else if (t.worker_id) {
+      tracks.set(t.worker_id, audioTrack)
+    }
+  }
+  return tracks
+}
 
 // The <video> for a participant's camera or screen.
 const streamFor = (participantId, source, local) => {
@@ -257,6 +283,10 @@ export const Call = {
     // the room's channel. The room only takes it from someone the
     // assistant hears; what it says back comes through the transcript.
     this.el.addEventListener("submit", (event) => {
+      if (event.target.id === "join-form") {
+        resumeTimelineAudio()
+        return
+      }
       if (event.target.id !== "say-form") return
       event.preventDefault()
       this.say(event.target)
@@ -301,10 +331,14 @@ export const Call = {
       clearInterval(this.meters)
       stopHandedOff()
       if (room === client) room = null
+      callStateChanged(false)
+      mediaChanged()
     })
 
     try {
       await client.join()
+      callStateChanged(true)
+      mediaChanged()
       this.meters = setInterval(() => this.updateLevels(), 120)
     } catch (error) {
       console.error("couldn't join:", error)

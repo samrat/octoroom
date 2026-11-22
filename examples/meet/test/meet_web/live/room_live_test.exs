@@ -15,6 +15,8 @@ defmodule MeetWeb.RoomLiveTest do
     refute has_element?(view, "#join-form")
     refute has_element?(view, "#lobby-preview")
     assert has_element?(view, "#transcript-panel")
+    assert has_element?(view, "#voice-timeline")
+    assert has_element?(view, "#toggle-timeline")
   end
 
   test "a page that mounts again rebuilds the transcript from what the assistants saved",
@@ -183,5 +185,107 @@ defmodule MeetWeb.RoomLiveTest do
 
     assert %{response: %{result: "error"}} =
              Meet.Assistant.set_theme(%{call | args: %{"theme" => "purple"}}, %{room_id: "themes"})
+  end
+
+  test "pushes voice timeline events for assistant states, waterfall spans, interruptions, latency, and turns",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/r/timeline-test")
+    refute has_element?(view, "#voice-timeline")
+
+    render_hook(view, "client", %{"state" => "joined", "participant_id" => "p1"})
+    assert has_element?(view, "#voice-timeline")
+
+    send(
+      view.pid,
+      {:octoroom, "timeline-test", {:worker, :updated, %{id: "assistant", state: "thinking"}}}
+    )
+
+    assert_push_event(view, "timeline_event", %{
+      type: "agent_state",
+      id: "assistant",
+      state: "thinking"
+    })
+
+    send(
+      view.pid,
+      {:octoroom, "timeline-test", {:worker, :updated, %{id: "assistant", state: "speaking"}}}
+    )
+
+    assert_push_event(view, "timeline_event", %{
+      type: "agent_state",
+      id: "assistant",
+      state: "speaking"
+    })
+
+    assistant(
+      view,
+      {:conversation,
+       %{role: "assistant", message_id: "m1", text: "Actually—", status: "interrupted"}}
+    )
+
+    assert_push_event(view, "timeline_event", %{type: "interruption", agent: "assistant"})
+
+    send(
+      view.pid,
+      {:octoroom, "timeline-test", {:worker, :updated, %{id: "assistant", state: "listening"}}}
+    )
+
+    assert_push_event(view, "timeline_event", %{
+      type: "agent_state",
+      id: "assistant",
+      state: "listening"
+    })
+
+    assistant(view, {:latency, %{transcript: 180, llm: 410, audio: 620}})
+
+    assert_push_event(view, "timeline_event", %{
+      type: "reply_latency",
+      agent: "assistant",
+      audio_ms: 620
+    })
+
+    assistant(view, {
+      :decision,
+      %{
+        source: "p1/mic",
+        speaker: "Ada",
+        text: "Mm-hmm.",
+        outcome: :listen,
+        why: :not_addressed,
+        decision: nil
+      }
+    })
+
+    assert_push_event(view, "timeline_event", %{
+      type: "user_turn",
+      lane_id: "p1",
+      text: "Mm-hmm.",
+      outcome: "listen"
+    })
+
+    # Telemetry spans recorded by TraceStore stream straight into the room's Voice Timeline.
+    ms = &System.convert_time_unit(&1, :millisecond, :native)
+
+    :telemetry.execute(
+      [:octoroom_agent, :processor, :async, :stop],
+      %{duration: ms.(350), first_output_duration: ms.(190), outputs: 4},
+      %{
+        room_id: "timeline-test",
+        agent_id: "assistant",
+        turn_id: 1,
+        processor: :llm,
+        task: :reply,
+        provider: :openrouter,
+        model: "nvidia/nemotron-3.5-lightning",
+        status: :ok
+      }
+    )
+
+    assert_push_event(view, "timeline_event", %{
+      type: "stage_spans",
+      spans: [%{agent: "assistant", kind: "llm", first_output_ms: ttft}]
+    })
+
+    assert_in_delta ttft, 190.0, 2.0
   end
 end

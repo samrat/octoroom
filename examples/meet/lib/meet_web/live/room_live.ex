@@ -24,6 +24,7 @@ defmodule MeetWeb.RoomLive do
     if connected?(socket) do
       Octoroom.subscribe(room, scope: :room)
       Phoenix.PubSub.subscribe(Meet.PubSub, "theme:#{room}")
+      Phoenix.PubSub.subscribe(Meet.PubSub, MeetWeb.TraceStore.room_topic(room))
     end
 
     socket =
@@ -121,8 +122,25 @@ defmodule MeetWeb.RoomLive do
     do: {:noreply, assistant_event(socket, id, event)}
 
   # An assistant says what it's doing (its `presence:`).
-  def handle_info({:octoroom, _room, {:worker, :updated, %{id: id, state: state}}}, socket),
-    do: {:noreply, put_state(socket, id, presence_state(state))}
+  def handle_info({:octoroom, _room, {:worker, :updated, %{id: id, state: state}}}, socket) do
+    old_state = Map.get(socket.assigns.states, id, :listening)
+    new_state = presence_state(state)
+    socket = put_state(socket, id, new_state)
+
+    socket =
+      if old_state != new_state do
+        push_timeline(socket, %{type: "agent_state", id: id, state: Atom.to_string(new_state)})
+      else
+        socket
+      end
+
+    {:noreply, socket}
+  end
+
+  # Pipeline stage spans from TraceStore (STT, decisions, floor wait, LLM, tools, TTS, live).
+  def handle_info({:timeline_spans, spans}, socket) do
+    {:noreply, push_timeline(socket, %{type: "stage_spans", spans: spans})}
+  end
 
   # The same transcript the assistants send clients: this page builds its
   # own from their events, with decisions.
@@ -241,9 +259,18 @@ defmodule MeetWeb.RoomLive do
       at_ms: System.monotonic_time(:millisecond)
     }
 
-    if id == primary(socket) or primary_absent?(socket),
-      do: add_turn(socket, d, verdict),
-      else: join_turn(socket, d.source, verdict)
+    if id == primary(socket) or primary_absent?(socket) do
+      socket
+      |> add_turn(d, verdict)
+      |> push_timeline(%{
+        type: "user_turn",
+        lane_id: source_participant(d.source),
+        text: d.text,
+        outcome: Atom.to_string(d.outcome)
+      })
+    else
+      join_turn(socket, d.source, verdict)
+    end
   end
 
   # Words as they're recognized, before the turn ends.
@@ -260,16 +287,31 @@ defmodule MeetWeb.RoomLive do
     dom_id = "reply-#{id}-#{item[:message_id] || System.unique_integer([:positive])}"
     at = socket.assigns.reply_times[dom_id] || now()
 
-    socket
-    |> assign(reply_times: Map.put(socket.assigns.reply_times, dom_id, at))
-    |> stream_insert(:transcript, %{
-      id: dom_id,
-      kind: :reply,
+    socket =
+      socket
+      |> assign(reply_times: Map.put(socket.assigns.reply_times, dom_id, at))
+      |> stream_insert(:transcript, %{
+        id: dom_id,
+        kind: :reply,
+        agent: id,
+        name: assistant_name(socket, id),
+        text: item.text,
+        status: item.status,
+        at: at
+      })
+
+    if item.status == "interrupted",
+      do: push_timeline(socket, %{type: "interruption", agent: id}),
+      else: socket
+  end
+
+  defp assistant_event(socket, id, {:latency, latency}) when is_map(latency) do
+    push_timeline(socket, %{
+      type: "reply_latency",
       agent: id,
-      name: assistant_name(socket, id),
-      text: item.text,
-      status: item.status,
-      at: at
+      audio_ms: latency[:audio],
+      transcript_ms: latency[:transcript],
+      llm_ms: latency[:llm]
     })
   end
 
@@ -347,6 +389,12 @@ defmodule MeetWeb.RoomLive do
     do: present != [] and not Enum.any?(present, &(&1.id == primary(socket)))
 
   defp put_state(socket, id, state), do: update(socket, :states, &Map.put(&1, id, state))
+
+  defp push_timeline(%{assigns: %{me: nil}} = socket, _payload), do: socket
+  defp push_timeline(socket, payload), do: push_event(socket, "timeline_event", payload)
+
+  defp source_participant(source) when is_binary(source), do: source |> String.split("/") |> hd()
+  defp source_participant(_source), do: nil
 
   defp presence_state("thinking"), do: :thinking
   defp presence_state("speaking"), do: :speaking
@@ -478,9 +526,16 @@ defmodule MeetWeb.RoomLive do
     tile_count =
       length(assigns.participants) + length(screens) + length(assigns.assistants)
 
-    assigns = assign(assigns, screens: screens, cols: cols(tile_count))
     me = Enum.find(assigns.participants, &(&1.id == assigns.me))
-    assigns = assign(assigns, my_tracks: (me && me.tracks) || %{})
+
+    assigns =
+      assign(assigns,
+        screens: screens,
+        cols: cols(tile_count),
+        my_tracks: (me && me.tracks) || %{},
+        timeline_lanes:
+          timeline_lanes(assigns.assistants, assigns.participants, assigns.me, assigns.states)
+      )
 
     ~H"""
     <div class="flex h-full">
@@ -497,6 +552,8 @@ defmodule MeetWeb.RoomLive do
           </div>
         </div>
 
+        <.voice_timeline lanes={@timeline_lanes} />
+
         <.control_bar room={@room} tracks={@my_tracks} count={length(@participants)} />
       </div>
 
@@ -509,6 +566,153 @@ defmodule MeetWeb.RoomLive do
         say_to={@say_to}
       />
     </div>
+    """
+  end
+
+  defp timeline_lanes(assistants, participants, me, states) do
+    agent_lanes =
+      for a <- assistants do
+        %{
+          id: a.id,
+          label: a.name,
+          role: "agent",
+          state: Atom.to_string(Map.get(states, a.id, :listening))
+        }
+      end
+
+    people =
+      Enum.sort_by(participants, fn p ->
+        {if(p.id == me, do: 0, else: 1), p.meta.name}
+      end)
+
+    user_lanes =
+      case people do
+        [] when is_binary(me) ->
+          [%{id: me, label: "You", role: "user", muted: false}]
+
+        list ->
+          for p <- list do
+            %{
+              id: p.id,
+              label: if(p.id == me, do: "#{p.meta.name} (you)", else: p.meta.name),
+              role: "user",
+              muted: get_in(p.tracks, ["mic", :muted]) == true
+            }
+          end
+      end
+
+    agent_lanes ++ user_lanes
+  end
+
+  @dev_routes? Application.compile_env(:meet, :dev_routes, false)
+
+  attr :lanes, :list, required: true
+
+  defp voice_timeline(assigns) do
+    assigns = assign(assigns, :dev_routes?, @dev_routes?)
+
+    ~H"""
+    <section
+      id="voice-timeline"
+      phx-hook="VoiceTimeline"
+      data-lanes={Jason.encode!(@lanes)}
+      aria-label="Voice timeline"
+      class="mx-4 mb-3 flex flex-col rounded-xl bg-base-100 shadow-lg sm:mx-6"
+    >
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 px-3 py-1.5 text-[11px] text-base-content/65">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="text-xs font-semibold text-base-content">Voice timeline</span>
+          <div class="join" role="group" aria-label="Time window">
+            <button
+              type="button"
+              data-timeline-window="10"
+              class="btn btn-ghost btn-xs join-item font-mono text-[10px] font-medium"
+            >
+              10s
+            </button>
+            <button
+              type="button"
+              data-timeline-window="15"
+              class="btn btn-ghost btn-xs join-item btn-active font-mono text-[10px] font-medium"
+            >
+              15s
+            </button>
+            <button
+              type="button"
+              data-timeline-window="30"
+              class="btn btn-ghost btn-xs join-item font-mono text-[10px] font-medium"
+            >
+              30s
+            </button>
+          </div>
+          <div class="hidden items-center gap-3 font-mono text-[10px] sm:flex">
+            <span class="flex items-center gap-1.5">
+              <span
+                aria-hidden="true"
+                class="h-2 w-2.5 rounded-[2px] border border-warning/70 bg-warning/25"
+              >
+              </span>
+              floor wait
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span aria-hidden="true" class="size-2 rounded-[2px] bg-base-content/40"></span>
+              backchannel
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span aria-hidden="true" class="size-2 rounded-[2px] bg-error"></span>cut
+            </span>
+          </div>
+        </div>
+        <div class="flex items-center gap-1">
+          <a
+            :if={@dev_routes?}
+            href="/dev/dashboard/octoroom"
+            target="_blank"
+            rel="noopener"
+            class="btn btn-ghost btn-xs font-mono text-[10px] font-normal"
+            title="Open full turn waterfall in LiveDashboard"
+          >
+            Waterfall ↗
+          </a>
+          <button
+            id="voice-timeline-pause"
+            type="button"
+            data-timeline-pause
+            data-paused="false"
+            class="btn btn-ghost btn-xs font-mono text-[10px] font-normal"
+            title="Pause timeline"
+          >
+            <span data-timeline-pause-label>Pause</span>
+          </button>
+          <.button
+            id="close-voice-timeline"
+            class="btn btn-ghost btn-xs btn-circle"
+            phx-click={JS.hide(to: "#voice-timeline")}
+            title="Hide voice timeline"
+          >
+            <.icon name="hero-x-mark" class="size-4" />
+          </.button>
+        </div>
+      </div>
+
+      <div id="voice-timeline-body" phx-update="ignore" class="relative flex gap-2.5 px-3 py-2">
+        <div data-timeline-lane-labels class="relative w-28 shrink-0 sm:w-32"></div>
+        <div class="relative min-w-0 flex-1 [mask-image:linear-gradient(to_right,transparent,black_2.25rem)]">
+          <canvas
+            data-timeline-canvas
+            role="img"
+            aria-label="Live speech waveforms for everyone in the call; hover an assistant reply to inspect its pipeline stages"
+            class="block w-full"
+          >
+          </canvas>
+        </div>
+        <div
+          data-timeline-popover
+          class="pointer-events-none absolute bottom-[calc(100%+8px)] z-30 hidden max-w-sm min-w-64 rounded-xl bg-neutral px-3 py-2.5 font-mono text-[11px] text-neutral-content shadow-xl"
+        >
+        </div>
+      </div>
+    </section>
     """
   end
 
@@ -721,7 +925,15 @@ defmodule MeetWeb.RoomLive do
           <.icon name="hero-phone-x-mark" class="size-6" />
         </.button>
       </div>
-      <div class="flex justify-end sm:flex-1">
+      <div class="flex justify-end gap-1 sm:flex-1">
+        <.button
+          id="toggle-timeline"
+          class="btn btn-ghost btn-circle sm:btn-lg"
+          phx-click={JS.toggle(to: "#voice-timeline", display: "flex")}
+          title="Voice timeline"
+        >
+          <.icon name="hero-chart-bar" class="size-6" />
+        </.button>
         <.button
           id="toggle-transcript"
           class="btn btn-ghost btn-circle sm:btn-lg"
