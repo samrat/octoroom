@@ -6,8 +6,9 @@ defmodule Call.Application do
   def start(_type, _args) do
     cf = Application.get_env(:octoroom, :cloudflare, [])
 
-    if cf[:app_id] in [nil, ""] or cf[:app_secret] in [nil, ""],
-      do: raise("Set OCTOROOM_CLOUDFLARE_APP_ID and OCTOROOM_CLOUDFLARE_APP_SECRET (see README)")
+    if cf[:client] in [nil, Octoroom.Cloudflare.HTTP] and
+         (cf[:app_id] in [nil, ""] or cf[:app_secret] in [nil, ""]),
+       do: raise("Set OCTOROOM_CLOUDFLARE_APP_ID and OCTOROOM_CLOUDFLARE_APP_SECRET (see README)")
 
     children = [{Phoenix.PubSub, name: Call.PubSub}, Call.Presence, Call.Endpoint]
     Supervisor.start_link(children, strategy: :one_for_one, name: Call.Supervisor)
@@ -140,68 +141,194 @@ defmodule Call.Layouts do
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Octoroom call</title>
         <style>
-          :root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6e6e73; --bg: #fff; --card: #f5f5f7; --accent: #f38020; --ok: #2f9e44; }
-          @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --muted: #98989d; --bg: #111; --card: #1c1c1e; } }
-          body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; }
-          main { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
-          h1 { font-size: 22px; margin: 0 0 4px; }
-          .sub { color: var(--muted); margin: 0 0 20px; }
-          .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--card); padding: 12px; border-radius: 10px; }
-          input[type=text] { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid #8884; background: var(--bg); color: var(--fg); }
-          button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
-          button:disabled { opacity: .4; cursor: default; }
-          button.secondary { background: #8883; color: var(--fg); }
-          #status { color: var(--muted); font-size: 13px; width: 100%; }
-          table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-          th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #8883; vertical-align: top; }
-          th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
-          .you { color: var(--accent); font-size: 12px; margin-left: 4px; }
-          .pill { font-size: 12px; padding: 1px 8px; border-radius: 99px; background: #8883; }
-          .pill.live { background: var(--ok); color: #fff; }
-          .meter { display: inline-block; width: 80px; height: 8px; background: #8883; border-radius: 4px; overflow: hidden; vertical-align: middle; }
-          .meter > span { display: block; height: 100%; width: 0; background: var(--ok); transition: width .15s; }
-          .empty { color: var(--muted); margin-top: 20px; }
-          .workers { margin-top: 12px; }
-          .recorded { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 12px; }
-          .recorded .dir { width: 100%; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
-          .viewers { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
-          .captions { background: var(--card); border-radius: 10px; padding: 8px 12px; margin-top: 12px; }
+          :root {
+            color-scheme: light;
+            --bg: #fafaf9;
+            --card: #ffffff;
+            --subtle: #f5f5f4;
+            --fg: #1c1917;
+            --muted: #57534e;
+            --faint: #78716c;
+            --border: #e7e5e4;
+            --border-strong: #d6d3d1;
+            --accent: #ea580c;
+            --accent-hover: #c2410c;
+            --ok-bg: #ecfdf5;
+            --ok-border: #a7f3d0;
+            --ok-fg: #047857;
+            --ok: #16a34a;
+            --danger-bg: #fef2f2;
+            --danger-border: #fecaca;
+            --danger-fg: #b91c1c;
+          }
+          * { box-sizing: border-box; }
+          body {
+            font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            color: var(--fg);
+            background: var(--bg);
+            margin: 0;
+          }
+          main { max-width: 860px; margin: 0 auto; padding: 36px 20px 64px; }
+          .head {
+            display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;
+            padding-bottom: 18px; border-bottom: 1px solid var(--border); margin-bottom: 24px;
+          }
+          h1 { font-size: 22px; font-weight: 650; margin: 0; letter-spacing: -0.025em; }
+          .badges {
+            display: flex; gap: 8px; align-items: center;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--faint);
+          }
+          .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+          .controls {
+            background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+            padding: 12px 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+          }
+          .controls.card:not(.in-call) {
+            max-width: 480px; margin: 44px auto 0; padding: 28px; border-radius: 16px;
+            display: block; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.04);
+          }
+          .controls:not(.in-call) .in-call-only { display: none; }
+          .controls.in-call .pre-join-only { display: none; }
+          .controls:not(.has-camera) .camera-only { display: none; }
+          .pre-join-copy h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; letter-spacing: -0.015em; }
+          .pre-join-copy p { margin: 0 0 18px; font-size: 14px; color: var(--muted); }
+          .field-row { display: flex; gap: 8px; align-items: center; flex: 1; }
+          .controls.in-call .bar-left { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+          .controls.in-call .bar-right { display: flex; gap: 10px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+          .join-checks {
+            display: flex; flex-wrap: wrap; gap: 14px; margin-top: 16px; padding-top: 14px;
+            border-top: 1px solid var(--subtle); font-size: 13px; color: var(--muted); width: 100%;
+          }
+          .join-checks label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+          input[type=text] {
+            flex: 1; min-width: 160px; font: inherit; font-size: 14px;
+            padding: 9px 12px; border-radius: 9px; border: 1px solid var(--border-strong);
+            background: var(--card); color: var(--fg); outline: none;
+          }
+          input[type=text]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(234,88,12,.12); }
+          button {
+            font: inherit; font-size: 13.5px; font-weight: 500;
+            padding: 8px 14px; border-radius: 9px; border: 1px solid transparent;
+            background: var(--accent); color: #fff; cursor: pointer; transition: background .12s;
+          }
+          button:hover:not(:disabled) { background: var(--accent-hover); }
+          button:disabled { opacity: .45; cursor: default; }
+          button.secondary { background: var(--card); border-color: var(--border); color: var(--fg); }
+          button.secondary:hover:not(:disabled) { background: var(--subtle); }
+          button.danger { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger-fg); }
+          button.danger:hover:not(:disabled) { background: #fee2e2; }
+          #status {
+            color: var(--faint); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          }
+          #status:empty { display: none; }
+          .controls:not(.in-call) #status { display: block; margin-top: 12px; }
+          .controls.in-call #status { margin-left: auto; }
+          .controls.in-call .bar-right { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+          .controls.in-call #status:empty + .bar-right { margin-left: auto; }
+          .roster { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+          .member {
+            display: inline-flex; align-items: center; gap: 8px;
+            background: var(--card); border: 1px solid var(--border);
+            padding: 6px 12px; border-radius: 99px; font-size: 13px;
+          }
+          .member .name { font-weight: 600; }
+          table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 12.5px; }
+          th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--subtle); vertical-align: top; }
+          th {
+            font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--faint); font-weight: 600; border-bottom-color: var(--border);
+          }
+          td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+          .you { color: var(--accent); font-size: 11.5px; font-weight: 600; }
+          .pill {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11.5px; padding: 2px 8px; border-radius: 6px;
+            background: var(--subtle); border: 1px solid var(--border); color: var(--muted);
+          }
+          .pill.live { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-fg); }
+          .meter { display: inline-block; width: 42px; height: 5px; background: var(--border); border-radius: 99px; overflow: hidden; vertical-align: middle; }
+          .meter > span { display: block; height: 100%; width: 0; background: var(--ok); transition: width .12s; }
+          .empty { color: var(--faint); margin-top: 16px; font-size: 14px; }
+          .workers { margin-top: 10px; }
+          .recorded { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 10px; font-size: 12.5px; }
+          .recorded .dir { width: 100%; color: var(--faint); font-size: 12px; font-family: ui-monospace, monospace; }
+          .viewers { color: var(--faint); font-size: 12.5px; margin: 12px 0 0; }
+          .captions {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 12px 16px; margin-top: 16px;
+          }
           .captions .line { margin: 4px 0; }
-          .captions .partial { color: var(--muted); }
-          .hint { color: var(--muted); font-size: 13px; }
-          details.tools { margin-top: 16px; border: 1px solid #8883; border-radius: 10px; padding: 8px 12px; }
-          details.tools > summary { cursor: pointer; color: var(--muted); font-size: 14px; }
-          details.tools[open] > summary { margin-bottom: 8px; }
-          a { color: var(--accent); }
+          .captions .partial { color: var(--faint); }
+          .hint { color: var(--faint); font-size: 13px; }
+          .tools {
+            margin-top: 22px; background: var(--card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 14px 16px;
+          }
+          .tools-toggle {
+            width: 100%; display: flex; align-items: center; justify-content: space-between;
+            background: transparent; border: 0; padding: 0; color: var(--muted);
+            font-size: 13px; font-weight: 500; text-align: left; cursor: pointer;
+          }
+          .tools-toggle:hover:not(:disabled) { background: transparent; color: var(--fg); }
+          .tools-body { margin-top: 12px; }
+          .tool-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+          .tool-row button { padding: 6px 12px; font-size: 13px; }
+          .tool-row button.active { background: var(--fg); border-color: var(--fg); color: #fff; }
+          a { color: var(--accent); text-decoration: none; font-weight: 500; }
+          a:hover { text-decoration: underline; }
           .lab { display: grid; grid-template-columns: 300px 1fr; gap: 16px; margin-top: 16px; align-items: start; }
           @media (max-width: 760px) { .lab { grid-template-columns: 1fr; } }
-          .panel { background: var(--card); border-radius: 10px; padding: 12px 14px; }
-          .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+          .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+          .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin: 0 0 8px; }
           .panel fieldset { border: 0; padding: 0; margin: 0 0 14px; }
           .panel legend { font-weight: 600; margin-bottom: 4px; }
           .panel label.opt { display: block; margin: 4px 0; }
-          .panel label.opt small, .panel .note { display: block; color: var(--muted); font-size: 12px; margin-left: 22px; }
+          .panel label.opt small, .panel .note { display: block; color: var(--faint); font-size: 12px; margin-left: 22px; }
           .panel .note { margin-left: 0; }
           .panel .range { display: grid; grid-template-columns: 1fr 52px; gap: 6px; align-items: center; font-size: 13px; margin: 6px 0; }
           .panel .range span { grid-column: 1 / -1; }
           .panel .range output { font-family: ui-monospace, monospace; text-align: right; }
-          .feed .entry { padding: 8px 0; border-bottom: 1px solid #8882; }
+          .feed .entry { padding: 8px 0; border-bottom: 1px solid var(--subtle); }
           .feed .entry:last-child { border-bottom: 0; }
           .feed .who { font-weight: 600; }
           .feed .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 12px; }
-          .chip { padding: 1px 8px; border-radius: 99px; background: #8883; font-family: ui-monospace, monospace; }
-          .chip.reply { background: var(--ok); color: #fff; }
-          .chip.wait { background: var(--accent); color: #fff; }
-          .feed .latency { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; margin-top: 2px; }
+          .chip { padding: 2px 8px; border-radius: 6px; background: var(--subtle); border: 1px solid var(--border); font-family: ui-monospace, monospace; }
+          .chip.reply { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-fg); }
+          .chip.wait { background: #fff7ed; border-color: #fed7aa; color: var(--accent-hover); }
+          .feed .latency { color: var(--faint); font-size: 12px; font-family: ui-monospace, monospace; margin-top: 2px; }
           .status-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
-          .videos { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 12px; }
+          .videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px; }
           .videos:empty { display: none; }
-          .tile { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+          .tile {
+            position: relative; aspect-ratio: 16 / 9; background: #1c1917; border-radius: 14px;
+            overflow: hidden; border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0,0,0,.06);
+          }
           .tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+          .tile.audio-only video { display: none; }
+          .tile .avatar-stage {
+            position: absolute; inset: 0; display: none; place-items: center;
+            background: radial-gradient(circle at 30% 25%, #2c3e50 0%, #141820 70%);
+          }
+          .tile:nth-child(2n) .avatar-stage {
+            background: radial-gradient(circle at 70% 30%, #3b2f4a 0%, #17141f 70%);
+          }
+          .tile.audio-only .avatar-stage { display: grid; }
+          .tile .avatar-circle {
+            width: 68px; height: 68px; border-radius: 999px; display: grid; place-items: center;
+            font-weight: 600; font-size: 24px; color: #fff;
+            background: linear-gradient(135deg, #f38020, #e11d48);
+            box-shadow: 0 8px 28px rgba(0,0,0,.35);
+          }
+          .tile:nth-child(2n) .avatar-circle { background: linear-gradient(135deg, #6366f1, #0ea5e9); }
           .tile.screen video { object-fit: contain; }
           .tile.mirror video { transform: scaleX(-1); }
-          .tile .label { position: absolute; left: 6px; bottom: 6px; font-size: 12px; color: #fff; background: #0008; padding: 1px 6px; border-radius: 4px; }
-          .tile .paused { position: absolute; inset: 0; display: none; place-items: center; color: #fff; background: #222; font-size: 13px; }
+          .tile .label {
+            position: absolute; left: 10px; bottom: 10px; font-size: 12.5px; font-weight: 500;
+            color: var(--fg); background: rgba(255,255,255,.92); backdrop-filter: blur(8px);
+            padding: 3px 9px; border-radius: 7px;
+          }
+          .tile .paused { position: absolute; inset: 0; display: none; place-items: center; color: #f5f5f4; background: #292524; font-size: 13px; }
           .tile.muted .paused { display: grid; }
         </style>
         <script type="importmap">
@@ -226,21 +353,52 @@ defmodule Call.Components do
 
   @doc "Join, mute, camera and screen controls, run by the `Call` hook in app.js."
   attr :room, :string, required: true
+  attr :card, :boolean, default: false
+  attr :local_sfu?, :boolean, default: false
 
   def call_controls(assigns) do
     ~H"""
-    <div id="call" class="controls" phx-hook="Call" phx-update="ignore" data-room={@room}>
-      <input id="name" type="text" placeholder="Your name" />
-      <label><input id="tone" type="checkbox" /> test tone instead of mic</label>
-      <label><input id="pattern" type="checkbox" /> test pattern instead of camera</label>
-      <label><input id="join-camera" type="checkbox" /> join with camera</label>
-      <button id="join">Join call</button>
-      <button id="mute" class="secondary" disabled>Mute</button>
-      <button id="camera" class="secondary" disabled>Camera on</button>
-      <button id="pause" class="secondary" disabled>Pause video</button>
-      <button id="screen" class="secondary" disabled>Share screen</button>
-      <button id="leave" class="secondary" disabled>Leave</button>
-      <div id="status">Not in the call.</div>
+    <div
+      id="call"
+      class={["controls", @card && "card"]}
+      phx-hook="Call"
+      phx-update="ignore"
+      data-room={@room}
+    >
+      <div :if={@card} class="pre-join-copy pre-join-only">
+        <h2>Join the call</h2>
+        <p>
+          {if @local_sfu?,
+            do:
+              "Runs locally over WebRTC with zero API keys. Open another tab at this URL to talk between tabs.",
+            else:
+              "WebRTC audio and video routed by your Phoenix room server. Open another tab to test."}
+        </p>
+      </div>
+
+      <div class="field-row pre-join-only">
+        <input id="name" type="text" placeholder="Your name" />
+        <button id="join">Join call →</button>
+      </div>
+
+      <div class="join-checks pre-join-only">
+        <label><input id="join-camera" type="checkbox" /> Join with camera</label>
+        <label><input id="tone" type="checkbox" /> Test tone</label>
+        <label><input id="pattern" type="checkbox" /> Test pattern</label>
+      </div>
+
+      <div class="bar-left in-call-only">
+        <button id="mute" class="secondary" disabled>Mute</button>
+        <button id="camera" class="secondary" disabled>Camera on</button>
+        <button id="pause" class="secondary camera-only" disabled>Pause video</button>
+        <button id="screen" class="secondary" disabled>Share screen</button>
+      </div>
+
+      <span id="status"></span>
+
+      <div class="bar-right in-call-only">
+        <button id="leave" class="danger" disabled>Leave</button>
+      </div>
     </div>
     """
   end
@@ -280,7 +438,9 @@ defmodule Call.CallLive do
         recorded: %{},
         recording_dir: nil,
         captions?: Call.Room.captions_available?(),
-        assistant?: Call.Room.assistant_available?()
+        assistant?: Call.Room.assistant_available?(),
+        local_sfu?: Octoroom.Cloudflare.config().client == Octoroom.Cloudflare.Local,
+        tools_open: false
       )
 
     {:ok, load(socket)}
@@ -314,6 +474,9 @@ defmodule Call.CallLive do
     me = if state == "joined", do: params["participant_id"]
     {:noreply, socket |> assign(me: me) |> load()}
   end
+
+  def handle_event("toggle_tools", _params, socket),
+    do: {:noreply, assign(socket, tools_open: not socket.assigns.tools_open)}
 
   def handle_event("toggle_echo", _params, %{assigns: %{me: me}} = socket) when is_binary(me) do
     Octoroom.Room.update_meta(socket.assigns.room, me, &%{&1 | echo: not &1.echo})
@@ -445,39 +608,36 @@ defmodule Call.CallLive do
   def render(assigns) do
     ~H"""
     <main>
-      <h1>Room “{@room}”</h1>
-      <p class="sub">
-        Browsers talk to Cloudflare Realtime SFU; this LiveView only renders what the room server knows.
-      </p>
-
-      <.call_controls room={@room} />
-
-      <div class="controls workers">
-        <strong>Video</strong>
-        <button phx-click="toggle_video" disabled={@me == nil}>
-          {if @my_video, do: "Receive video: on", else: "Receive video: off"}
-        </button>
-        <span class="hint">Off: the server stops pulling cameras and screens into your session.</span>
+      <div class="head">
+        <h1>Room “{@room}”</h1>
+        <div class="badges">
+          <span class="pill">{if @local_sfu?, do: "LOCAL SFU", else: "CLOUDFLARE SFU"}</span>
+          <span :if={@participants != []} class="pill live">
+            {length(@participants)} IN CALL
+          </span>
+          <a :if={@assistant?} href={path(@room, "lab")}>Agent lab →</a>
+        </div>
       </div>
 
       <div id="videos" class="videos" phx-update="ignore"></div>
 
-      <div :if={@assistant?} class="controls workers">
-        <strong>Assistant</strong>
-        <span class={["pill", @assigns[:assistant] && "live"]}>
-          {if @assigns[:assistant], do: "on", else: "off"}
-        </span>
-        <a href={path(@room, "lab")}>Open the agent lab →</a>
-        <span class="hint">Pipeline, how it decides to answer, transcript and latency.</span>
-      </div>
+      <.call_controls room={@room} card={true} local_sfu?={@local_sfu?} />
 
-      <p class="viewers">
-        <strong>Here now:</strong>
-        {length(@viewers)} page(s) open{case Enum.reject(@viewers, &is_nil/1) do
-          [] -> ""
-          names -> ", in the call: " <> Enum.join(Enum.sort(names), ", ")
-        end}
-      </p>
+      <div :if={@participants != []} class="roster">
+        <div :for={p <- @participants} id={"p-#{p.id}"} class="member">
+          <span class="name">{p.meta.name}</span>
+          <span :if={p.id == @me} class="you">you</span>
+          <span id={"meter-#{p.id}"} class="meter" phx-update="ignore">
+            <span id={"level-#{p.id}"}></span>
+          </span>
+          <span
+            :for={{source, t} <- Enum.sort(p.tracks)}
+            class={["pill", t.status == :live && not t.muted && "live"]}
+          >
+            {source}{if t.muted, do: " muted"}
+          </span>
+        </div>
+      </div>
 
       <div :if={@assigns[:captions]} class="captions" id="captions">
         <p :if={@captions == []} class="empty">Captions are on. Say something…</p>
@@ -486,111 +646,150 @@ defmodule Call.CallLive do
         </p>
       </div>
 
-      <table :if={@participants != []}>
-        <thead>
-          <tr>
-            <th>Participant</th><th>Publishes</th><th>Level</th><th>Hears</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr :for={p <- @participants} id={"p-#{p.id}"}>
-            <td>{p.meta.name}<span :if={p.id == @me} class="you">you</span></td>
-            <td>
-              <span :if={p.tracks == %{}} class="pill">{p.mic}</span>
-              <span
-                :for={{source, t} <- Enum.sort(p.tracks)}
-                class={["pill", t.status == :live && not t.muted && "live"]}
-              >
-                {source}{if t.muted, do: " (muted)"}{if t.status != :live, do: " (#{t.status})"}
-              </span>
-            </td>
-            <td>
-              <span id={"meter-#{p.id}"} class="meter" phx-update="ignore"><span id={"level-#{p.id}"}></span></span>
-            </td>
-            <td>
-              {case p.hears do
-                [] -> "—"
-                hears -> hears |> Enum.map(&name(@names, &1)) |> Enum.join(", ")
-              end}
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <p :if={@participants == []} class="empty">Nobody is here yet.</p>
+      <div class="tools">
+        <button
+          type="button"
+          class="tools-toggle"
+          phx-click="toggle_tools"
+          aria-expanded={@tools_open}
+        >
+          <span>Room inspector &amp; server workers</span>
+          <span>{if @tools_open, do: "▾", else: "▸"}</span>
+        </button>
 
-      <details class="tools">
-        <summary>Testing tools: echo, metronome, recording, captions, workers</summary>
-        <div class="controls workers">
-          <button phx-click="toggle_echo" disabled={@me == nil}>
-            {if @my_echo, do: "Echo off", else: "Echo on"}
-          </button>
-          <button class="secondary" phx-click="flush_echo" disabled={not @my_echo}>
-            Flush my echo
-          </button>
-          <button class="secondary" phx-click="crash_echo" disabled={not @my_echo}>
-            Crash my echo
-          </button>
-          <button phx-click="toggle" phx-value-assign="metronome">
-            {if @assigns[:metronome], do: "Metronome off", else: "Metronome on"}
-          </button>
-          <button phx-click="toggle" phx-value-assign="recording">
-            {if @assigns[:recording], do: "Stop recording", else: "Record"}
-          </button>
-          <button :if={@captions?} phx-click="toggle" phx-value-assign="captions">
-            {if @assigns[:captions], do: "Captions off", else: "Captions on"}
-          </button>
-        </div>
+        <div :if={@tools_open} class="tools-body">
+          <div class="tool-row">
+            <button
+              class={["secondary", @my_echo && "active"]}
+              phx-click="toggle_echo"
+              disabled={@me == nil}
+            >
+              {if @my_echo, do: "Echo: on", else: "Echo: off"}
+            </button>
+            <button class="secondary" phx-click="flush_echo" disabled={not @my_echo}>
+              Flush echo
+            </button>
+            <button class="secondary" phx-click="crash_echo" disabled={not @my_echo}>
+              Crash echo
+            </button>
+            <button
+              class={["secondary", @assigns[:metronome] && "active"]}
+              phx-click="toggle"
+              phx-value-assign="metronome"
+            >
+              {if @assigns[:metronome], do: "Metronome: on", else: "Metronome: off"}
+            </button>
+            <button
+              class={["secondary", @assigns[:recording] && "active"]}
+              phx-click="toggle"
+              phx-value-assign="recording"
+            >
+              {if @assigns[:recording], do: "Stop recording", else: "Record WAV"}
+            </button>
+            <button
+              :if={@captions?}
+              class={["secondary", @assigns[:captions] && "active"]}
+              phx-click="toggle"
+              phx-value-assign="captions"
+            >
+              {if @assigns[:captions], do: "Captions: on", else: "Captions: off"}
+            </button>
+            <button
+              class={["secondary", @my_video && "active"]}
+              phx-click="toggle_video"
+              disabled={@me == nil}
+            >
+              {if @my_video, do: "Receive video: on", else: "Receive video: off"}
+            </button>
+          </div>
 
-        <table :if={@workers != []}>
-          <thead>
-            <tr>
-              <th>Worker</th><th>Hears</th><th>Plays</th><th>Queued</th><th>Sent</th><th>
-                Underruns
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr :for={w <- @workers} id={"w-#{w.id}"}>
-              <td>
-                {w.id |> String.split(":") |> hd()}
-                <span class={["pill", w.running && "live"]}>{if w.running,
-                  do: "running",
-                  else: "restarting"}</span>
-              </td>
-              <td>
-                {case w.inputs do
-                  [] ->
-                    "—"
+          <p class="viewers">
+            <strong>Here now:</strong>
+            {length(@viewers)} page(s) open{case Enum.reject(@viewers, &is_nil/1) do
+              [] -> ""
+              names -> ", in the call: " <> Enum.join(Enum.sort(names), ", ")
+            end}
+          </p>
 
-                  inputs ->
-                    inputs
-                    |> Enum.map(&(name(@names, &1) <> input_note(w, &1)))
-                    |> Enum.join(", ")
-                end}
-              </td>
-              <td>
-                <span :for={o <- w.outputs}>
-                  {name(@names, o)}
-                  <span class={["pill", get_in(@outputs, [o, :status]) == :live && "live"]}>
-                    {get_in(@outputs, [o, :status]) || "—"}
+          <table :if={@participants != []}>
+            <thead>
+              <tr>
+                <th>Participant</th><th>Publishes</th><th>Hears</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={p <- @participants} id={"inspect-p-#{p.id}"}>
+                <td>{p.meta.name}<span :if={p.id == @me} class="you"> you</span></td>
+                <td>
+                  <span :if={p.tracks == %{}} class="pill">{p.mic}</span>
+                  <span
+                    :for={{source, t} <- Enum.sort(p.tracks)}
+                    class={["pill", t.status == :live && not t.muted && "live"]}
+                  >
+                    {source}{if t.muted, do: " (muted)"}{if t.status != :live, do: " (#{t.status})"}
                   </span>
-                </span>
-              </td>
-              <td>{stat(@stats, w.outputs, :queued_ms, " ms")}</td>
-              <td>{stat(@stats, w.outputs, :sent)}</td>
-              <td>{stat(@stats, w.outputs, :underruns)}</td>
-            </tr>
-          </tbody>
-        </table>
+                </td>
+                <td>
+                  {case p.hears do
+                    [] -> "—"
+                    hears -> hears |> Enum.map(&name(@names, &1)) |> Enum.join(", ")
+                  end}
+                </td>
+              </tr>
+            </tbody>
+          </table>
 
-        <div :if={@recorded != %{}} class="recorded">
-          <strong>Recorded</strong>
-          <span :for={{track, seconds} <- Enum.sort(@recorded)}>
-            {name(@names, track)}: {:erlang.float_to_binary(seconds, decimals: 1)} s
-          </span>
-          <div class="dir">{@recording_dir}</div>
+          <table :if={@workers != []}>
+            <thead>
+              <tr>
+                <th>Worker</th><th>Hears</th><th>Plays</th><th>Queued</th><th>Sent</th><th>
+                  Underruns
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={w <- @workers} id={"w-#{w.id}"}>
+                <td>
+                  {w.id |> String.split(":") |> hd()}
+                  <span class={["pill", w.running && "live"]}>{if w.running,
+                    do: "running",
+                    else: "restarting"}</span>
+                </td>
+                <td>
+                  {case w.inputs do
+                    [] ->
+                      "—"
+
+                    inputs ->
+                      inputs
+                      |> Enum.map(&(name(@names, &1) <> input_note(w, &1)))
+                      |> Enum.join(", ")
+                  end}
+                </td>
+                <td>
+                  <span :for={o <- w.outputs}>
+                    {name(@names, o)}
+                    <span class={["pill", get_in(@outputs, [o, :status]) == :live && "live"]}>
+                      {get_in(@outputs, [o, :status]) || "—"}
+                    </span>
+                  </span>
+                </td>
+                <td>{stat(@stats, w.outputs, :queued_ms, " ms")}</td>
+                <td>{stat(@stats, w.outputs, :sent)}</td>
+                <td>{stat(@stats, w.outputs, :underruns)}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div :if={@recorded != %{}} class="recorded">
+            <strong>Recorded</strong>
+            <span :for={{track, seconds} <- Enum.sort(@recorded)}>
+              {name(@names, track)}: {:erlang.float_to_binary(seconds, decimals: 1)} s
+            </span>
+            <div class="dir">{@recording_dir}</div>
+          </div>
         </div>
-      </details>
+      </div>
     </main>
     """
   end

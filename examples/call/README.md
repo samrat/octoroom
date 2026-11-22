@@ -69,21 +69,27 @@ who of them is in the call.
 
 ## Run it
 
-You need a Cloudflare Realtime SFU app (dashboard: Realtime → SFU). Put its
-credentials in `.env` here (gitignored) or the environment:
+With no configuration, this example runs against `Octoroom.Cloudflare.Local`
+(an in-process localhost SFU on `ex_webrtc`), so you can try browser-to-browser
+audio/video, echo, metronome and recording with zero accounts or keys:
 
 ```sh
+mix deps.get
+mix run --no-halt
+```
+
+To run against Cloudflare Realtime SFU instead (dashboard: Realtime → SFU), or
+to enable captions and the voice assistant, put credentials in `.env` here
+(gitignored) or the environment:
+
+```sh
+# Optional: use real Cloudflare Realtime SFU instead of the local dev SFU.
 OCTOROOM_CLOUDFLARE_APP_ID=...
 OCTOROOM_CLOUDFLARE_APP_SECRET=...
 # Optional: captions (Soniox), and the assistant (all three).
 SONIOX_API_KEY=...
 GOOGLE_API_KEY=...
 INWORLD_API_KEY=...
-```
-
-```sh
-mix deps.get
-mix run --no-halt
 ```
 
 Open <http://localhost:4300> in two tabs or browsers, and join in both.

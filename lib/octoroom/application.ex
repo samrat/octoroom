@@ -13,6 +13,7 @@ defmodule Octoroom.Application do
         {Registry, keys: :duplicate, name: Octoroom.Events},
         {Task.Supervisor, name: Octoroom.TaskSupervisor},
         store.child_spec(store_opts),
+        {Octoroom.Cloudflare.Local, []},
         {DynamicSupervisor, name: Octoroom.RoomSupervisor, strategy: :one_for_one},
         {Octoroom.Janitor, Application.get_env(:octoroom, :janitor, [])}
       ]

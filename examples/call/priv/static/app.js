@@ -120,6 +120,9 @@ const Call = {
     this.socket.connect()
     this.$ = (sel) => this.el.querySelector(sel)
     this.$("#name").value = localStorage.getItem("octoroom-name") || ""
+    this.$("#name").onkeydown = (e) => {
+      if (e.key === "Enter" && !this.$("#join").disabled) this.join()
+    }
     this.$("#join").onclick = () => this.join()
     this.$("#leave").onclick = () => this.leave()
     this.$("#mute").onclick = () => this.toggleMute()
@@ -134,6 +137,7 @@ const Call = {
   },
 
   buttons(inCall) {
+    this.el.classList.toggle("in-call", inCall)
     this.$("#join").disabled = inCall
     this.$("#leave").disabled = !inCall
     this.$("#mute").disabled = !inCall
@@ -144,6 +148,7 @@ const Call = {
 
   updateVideoButtons() {
     const local = this.room?.state === "joined" ? this.room.localTracks() : {}
+    this.el.classList.toggle("has-camera", Boolean(local.camera))
     this.$("#camera").textContent = local.camera ? "Camera off" : "Camera on"
     this.$("#pause").disabled = !local.camera
     this.$("#pause").textContent = local.camera?.muted ? "Resume video" : "Pause video"
@@ -160,7 +165,7 @@ const Call = {
     try { localStorage.setItem("octoroom-name", name) } catch {}
 
     this.tone = this.$("#tone").checked ? testTone() : null
-    const withCamera = this.$("#join-camera").checked
+    const withCamera = this.$("#join-camera").checked || this.$("#pattern").checked
     const pattern = withCamera ? this.cameraTrack() : null
     const audio = {echoCancellation: true, noiseSuppression: true, autoGainControl: true}
     let stream = this.tone?.stream
@@ -184,7 +189,7 @@ const Call = {
       this.pushEvent("client", {state, participant_id: room.participantId})
       this.buttons(state !== "idle")
     })
-    room.on("connection", (state) => this.status(`Connection to Cloudflare: ${state}`))
+    room.on("connection", (state) => this.status(`Media: ${state}`))
     room.on("tracks", (tracks) => {
       if (room.state === "joined") this.status(`In the call. Receiving ${tracks.length} track(s).`)
       this.renderVideos()
@@ -276,8 +281,8 @@ const Call = {
     this.updateVideoButtons()
   },
 
-  // One tile per video: this tab's own camera and screen, and every video
-  // track the server pulled into this session.
+  // One tile per participant (showing their camera when on, or an avatar when
+  // audio-only), plus a separate tile for any active screen share.
   renderVideos() {
     const grid = document.getElementById("videos")
     if (!grid) return
@@ -285,20 +290,47 @@ const Call = {
     const tiles = new Map()
 
     if (room && room.state !== "idle") {
-      for (const [source, {track, muted}] of Object.entries(room.localTracks())) {
-        if (source !== "camera" && source !== "screen") continue
+      const local = room.localTracks()
+      const me = room.participants.find((p) => p.id === room.participantId)
+      const myName = me?.meta?.name || this.$("#name")?.value.trim() || "You"
+
+      if (local.camera) {
+        const {track, muted} = local.camera
         if (!this.previews.has(track)) this.previews.set(track, new MediaStream([track]))
-        // A real camera is mirrored, like a mirror; a test pattern isn't, so its text reads.
-        const mirror = source === "camera" && track !== this.pattern
-        tiles.set(`local-${source}`, {stream: this.previews.get(track), source, muted, mirror, label: `You · ${source}`})
+        const mirror = track !== this.pattern
+        tiles.set("local-camera", {stream: this.previews.get(track), source: "camera", muted, mirror, name: myName, label: `${myName} · you`})
+      } else {
+        tiles.set("local-camera", {stream: null, source: "audio", muted: false, mirror: false, name: myName, label: `${myName} · you`})
       }
 
+      if (local.screen) {
+        const {track, muted} = local.screen
+        if (!this.previews.has(track)) this.previews.set(track, new MediaStream([track]))
+        tiles.set("local-screen", {stream: this.previews.get(track), source: "screen", muted, mirror: false, name: myName, label: `${myName} · screen`})
+      }
+
+      const remoteVideoByParticipant = new Map()
       for (const t of room.tracks()) {
         if (t.kind !== "video") continue
         const p = room.participants.find((p) => p.id === t.participant_id)
         const name = p?.meta?.name || t.worker_id || "?"
         const muted = p?.tracks?.[t.source]?.muted || false
-        tiles.set(`mid-${t.mid}`, {stream: t.stream, source: t.source, muted, label: `${name} · ${t.source}`})
+        if (t.source === "camera" && t.participant_id) {
+          remoteVideoByParticipant.set(t.participant_id, {stream: t.stream, source: "camera", muted, mirror: false, name, label: name})
+        } else {
+          tiles.set(`mid-${t.mid}`, {stream: t.stream, source: t.source, muted, mirror: false, name, label: `${name} · ${t.source}`})
+        }
+      }
+
+      for (const p of room.participants) {
+        if (p.id === room.participantId) continue
+        const name = p.meta?.name || p.id
+        const cam = remoteVideoByParticipant.get(p.id)
+        if (cam) {
+          tiles.set(`p-${p.id}`, cam)
+        } else {
+          tiles.set(`p-${p.id}`, {stream: null, source: "audio", muted: false, mirror: false, name, label: name})
+        }
       }
     }
 
@@ -314,15 +346,27 @@ const Call = {
       if (!el) {
         el = document.createElement("div")
         el.dataset.key = key
-        el.innerHTML = `<video autoplay playsinline muted></video><span class="paused">Video paused</span><span class="label"></span>`
+        el.innerHTML = `<video autoplay playsinline muted></video><div class="avatar-stage"><div class="avatar-circle"></div></div><span class="paused">Video paused</span><span class="label"></span>`
         grid.appendChild(el)
       }
       const video = el.querySelector("video")
-      if (video.srcObject !== tile.stream) {
-        video.srcObject = tile.stream
-        video.play().catch(() => {})
+      if (tile.stream) {
+        if (video.srcObject !== tile.stream) {
+          video.srcObject = tile.stream
+          video.play().catch(() => {})
+        }
+      } else if (video.srcObject) {
+        video.srcObject = null
       }
-      el.className = ["tile", tile.source, tile.muted && "muted", tile.mirror && "mirror"]
+      const initial = (tile.name || "?").trim().charAt(0).toUpperCase() || "?"
+      el.querySelector(".avatar-circle").textContent = initial
+      el.className = [
+        "tile",
+        tile.source,
+        !tile.stream && "audio-only",
+        tile.muted && "muted",
+        tile.mirror && "mirror",
+      ]
         .filter(Boolean)
         .join(" ")
       el.querySelector(".label").textContent = tile.label

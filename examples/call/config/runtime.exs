@@ -24,11 +24,24 @@ file_env =
 
 fetch = fn key -> System.get_env(key) || file_env[key] end
 
-config :octoroom,
-  cloudflare: [
-    app_id: fetch.("OCTOROOM_CLOUDFLARE_APP_ID"),
-    app_secret: fetch.("OCTOROOM_CLOUDFLARE_APP_SECRET")
-  ]
+app_id = fetch.("OCTOROOM_CLOUDFLARE_APP_ID")
+app_secret = fetch.("OCTOROOM_CLOUDFLARE_APP_SECRET")
+
+if app_id not in [nil, ""] and app_secret not in [nil, ""] do
+  config :octoroom,
+    cloudflare: [
+      app_id: app_id,
+      app_secret: app_secret
+    ]
+else
+  IO.puts(
+    "Octoroom: no Cloudflare credentials set — using Octoroom.Cloudflare.Local (localhost dev SFU)."
+  )
+
+  config :octoroom,
+    cloudflare: [client: Octoroom.Cloudflare.Local],
+    ice_servers: []
+end
 
 # SONIOX_API_KEY: for live captions (optional).
 config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
