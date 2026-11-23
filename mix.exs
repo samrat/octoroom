@@ -29,12 +29,26 @@ defmodule Octoroom.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: [quality: :test, q: :test]]
+  end
+
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
   # The browser client's tests run on Node's own test runner: no npm.
   defp aliases do
-    ["test.js": ["cmd node --test test/js/*.test.mjs"]]
+    [
+      "test.js": ["cmd node --test test/js/*.test.mjs"],
+      quality: [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "credo --only warning,consistency",
+        "cmd mix test",
+        "test.js"
+      ],
+      q: ["quality"]
+    ]
   end
 
   defp deps do

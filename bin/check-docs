@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Verifies lockstep versioning, Hex dependency hygiene, generated ExDoc output,
+# and README links for both `octoroom` and `octoroom_agents`.
+#
+# Run `mix docs` in both the repo root and `agents/` before running this script.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+root_version="$(sed -nE 's/^  @version "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' mix.exs)"
+agents_version="$(sed -nE 's/^  @version "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' agents/mix.exs)"
+
+if [ -z "$root_version" ] || [ -z "$agents_version" ]; then
+  echo "FAIL: could not parse @version from mix.exs or agents/mix.exs" >&2
+  exit 1
+fi
+
+if [ "$root_version" != "$agents_version" ]; then
+  echo "FAIL: lockstep version mismatch: octoroom=$root_version, octoroom_agents=$agents_version" >&2
+  exit 1
+fi
+
+# Guard against accidentally shipping a :path dep for :octoroom in agents/mix.exs.
+if ! grep -Fq '{:octoroom, "~> #{@version}"}' agents/mix.exs; then
+  echo "FAIL: agents/mix.exs must default to {:octoroom, \"~> #{@version}\"} for Hex releases" >&2
+  exit 1
+fi
+
+# Verify generated ExDoc files exist and are non-empty.
+for file in doc/index.html doc/readme.html agents/doc/index.html agents/doc/readme.html; do
+  if [ ! -s "$file" ]; then
+    echo "FAIL: missing or empty $file (run 'mix docs' in root and agents/)" >&2
+    exit 1
+  fi
+done
+
+# Verify agents HexDocs source links include the `agents/` monorepo prefix.
+source_url="https://github.com/samrat/octoroom"
+if ! grep -Fq "$source_url/blob/v$root_version/agents/lib/" agents/doc/Octoroom.Agent.html; then
+  echo "FAIL: agents/doc source links do not point to $source_url/blob/v$root_version/agents/lib/" >&2
+  exit 1
+fi
+
+# Verify no broken relative links leak into HexDocs README pages.
+for readme_html in doc/readme.html agents/doc/readme.html; do
+  if grep -Eq 'href="(\.\./|agents/|swift/|examples/|docs/|lib/?")' "$readme_html"; then
+    echo "FAIL: relative repo link found in $readme_html (use full GitHub URLs for HexDocs):" >&2
+    grep -En 'href="(\.\./|agents/|swift/|examples/|docs/|lib/?")' "$readme_html" >&2
+    exit 1
+  fi
+done
+
+# Verify example directories referenced in READMEs exist.
+for example in examples/call examples/agent examples/meet examples/vision examples/ios; do
+  if [ ! -d "$example" ]; then
+    echo "FAIL: referenced example directory missing: $example" >&2
+    exit 1
+  fi
+done
+
+echo "ok: v$root_version lockstep, Hex dep hygiene, and generated docs verified."

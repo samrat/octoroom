@@ -1,5 +1,9 @@
 # octoroom_agents
 
+[![Hex.pm](https://img.shields.io/hexpm/v/octoroom_agents.svg)](https://hex.pm/packages/octoroom_agents)
+[![HexDocs](https://img.shields.io/badge/hex-docs-purple.svg)](https://hexdocs.pm/octoroom_agents)
+[![License](https://img.shields.io/hexpm/l/octoroom_agents.svg)](https://github.com/samrat/octoroom/blob/main/agents/LICENSE)
+
 AI participants for Octoroom rooms. An agent is an `Octoroom.Worker` whose
 process runs a voice pipeline: it hears the tracks the room's policy gives
 it and speaks on a track the policy routes like any other. Octoroom itself
@@ -86,9 +90,9 @@ agent carries on with its Gemini session handle or saved transcript. The
 keys are `GOOGLE_API_KEY` (Gemini Live) and `OPENAI_API_KEY` (OpenAI Live).
 `Octoroom.Agent.Worker`'s moduledoc has what's different.
 
-See [`examples/meet`](../examples/meet) for a multi-agent call combining
+See [`examples/meet`](https://github.com/samrat/octoroom/tree/main/examples/meet) for a multi-agent call combining
 cascaded, Gemini Live and OpenAI Live assistants with decision gating, and
-[`examples/agent`](../examples/agent) for a single-agent pipeline switcher.
+[`examples/agent`](https://github.com/samrat/octoroom/tree/main/examples/agent) for a single-agent pipeline switcher.
 See `Octoroom.Agent.Worker` for the args, what it emits, and how it reports
 latency.
 

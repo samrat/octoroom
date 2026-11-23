@@ -1,5 +1,9 @@
 # Octoroom
 
+[![Hex.pm](https://img.shields.io/hexpm/v/octoroom.svg)](https://hex.pm/packages/octoroom)
+[![HexDocs](https://img.shields.io/badge/hex-docs-purple.svg)](https://hexdocs.pm/octoroom)
+[![License](https://img.shields.io/hexpm/l/octoroom.svg)](https://github.com/samrat/octoroom/blob/main/LICENSE)
+
 Programmable voice, video, and AI agent rooms for Phoenix, backed by [Cloudflare
 Realtime SFU](https://developers.cloudflare.com/realtime/sfu/).
 
@@ -8,8 +12,8 @@ no public media endpoint, open inbound ports, or TURN server—each worker opens
 an outbound WebRTC connection to Cloudflare. Live calls survive server restarts
 and deploys without renegotiation.
 
-Includes [`octoroom_agents`](agents/README.md) (voice and vision AI agents), a
-zero-npm browser client, and a native [Swift SDK](swift/README.md) for iOS and
+Includes [`octoroom_agents`](https://github.com/samrat/octoroom/blob/main/agents/README.md) (voice and vision AI agents), a
+zero-npm browser client, and a native [Swift SDK](https://github.com/samrat/octoroom/blob/main/swift/README.md) for iOS and
 macOS.
 
 ## What it looks like
@@ -105,20 +109,20 @@ over PubSub, query Ecto, or enforce app permissions directly.
 
 | Path                          | Description                                                                                                                                                                                                                                              |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`lib/`](lib)                 | Core `octoroom` package: room server, policy reconciler, Cloudflare Realtime SFU client (plus localhost-only `Octoroom.Cloudflare.Local` for dev), server-side WebRTC workers, and browser client (`priv/static/octoroom.mjs`).                          |
-| [`agents/`](agents/README.md) | `octoroom_agents`: cascaded voice + vision pipelines (`Silero` VAD, `SmartTurn`, Soniox/AssemblyAI/Reson8 STT, ReqLLM, Inworld/AssemblyAI/OpenAI/local `TinyVoca` ONNX TTS), Gemini Live, OpenAI Live (WebRTC + sideband WS), and `octoroom_agents.mjs`. |
-| [`swift/`](swift/README.md)   | Native iOS 17+ and macOS 14+ SwiftPM SDK (`OctoroomCore`, `Octoroom`, `OctoroomAgents`).                                                                                                                                                                 |
-| [`examples/`](examples)       | Standalone Phoenix and iOS apps demonstrating each capability.                                                                                                                                                                                           |
+| [`lib/`](https://github.com/samrat/octoroom/tree/main/lib)                 | Core `octoroom` package: room server, policy reconciler, Cloudflare Realtime SFU client (plus localhost-only `Octoroom.Cloudflare.Local` for dev), server-side WebRTC workers, and browser client (`priv/static/octoroom.mjs`).                          |
+| [`agents/`](https://github.com/samrat/octoroom/blob/main/agents/README.md) | `octoroom_agents`: cascaded voice + vision pipelines (`Silero` VAD, `SmartTurn`, Soniox/AssemblyAI/Reson8 STT, ReqLLM, Inworld/AssemblyAI/OpenAI/local `TinyVoca` ONNX TTS), Gemini Live, OpenAI Live (WebRTC + sideband WS), and `octoroom_agents.mjs`. |
+| [`swift/`](https://github.com/samrat/octoroom/blob/main/swift/README.md)   | Native iOS 17+ and macOS 14+ SwiftPM SDK (`OctoroomCore`, `Octoroom`, `OctoroomAgents`).                                                                                                                                                                 |
+| [`examples/`](https://github.com/samrat/octoroom/tree/main/examples)       | Standalone Phoenix and iOS apps demonstrating each capability.                                                                                                                                                                                           |
 
 ## Try it
 
 Building needs the system `libsrtp` library (see [Requirements](#requirements)).
 
-1. **[`examples/call`](examples/call)** _(zero accounts or keys needed)_: LiveView group video call with echo, metronome, and recording workers. Runs against `Octoroom.Cloudflare.Local` by default on localhost, or against real Cloudflare Realtime SFU when credentials are set.
-2. **[`examples/vision`](examples/vision)** _(Cloudflare + `GOOGLE_API_KEY` in Gemini Live mode)_: talk to an agent that sees your camera and shared screen, switching between Cascaded (`TinyVoca` local TTS) and Gemini Live mid-call.
-3. **[`examples/agent`](examples/agent)**: 1-on-1 voice agent that times each turn end-to-end as heard in the browser, plus a deterministic scripted booking agent (`Hello.Booking`).
-4. **[`examples/meet`](examples/meet)**: group video call with multiple AI assistants, decision-model routing, and the live Voice Timeline latency waterfall.
-5. **[`examples/ios`](examples/ios)**: native iOS app joining the same rooms.
+1. **[`examples/call`](https://github.com/samrat/octoroom/tree/main/examples/call)** _(zero accounts or keys needed)_: LiveView group video call with echo, metronome, and recording workers. Runs against `Octoroom.Cloudflare.Local` by default on localhost, or against real Cloudflare Realtime SFU when credentials are set.
+2. **[`examples/vision`](https://github.com/samrat/octoroom/tree/main/examples/vision)** _(Cloudflare + `GOOGLE_API_KEY` in Gemini Live mode)_: talk to an agent that sees your camera and shared screen, switching between Cascaded (`TinyVoca` local TTS) and Gemini Live mid-call.
+3. **[`examples/agent`](https://github.com/samrat/octoroom/tree/main/examples/agent)**: 1-on-1 voice agent that times each turn end-to-end as heard in the browser, plus a deterministic scripted booking agent (`Hello.Booking`).
+4. **[`examples/meet`](https://github.com/samrat/octoroom/tree/main/examples/meet)**: group video call with multiple AI assistants, decision-model routing, and the live Voice Timeline latency waterfall.
+5. **[`examples/ios`](https://github.com/samrat/octoroom/tree/main/examples/ios)**: native iOS app joining the same rooms.
 
 ## How it compares
 
@@ -159,7 +163,7 @@ None of the suites needs Cloudflare or the network.
 
 ## Status
 
-Early (`0.1.0`, pre-Hex). Working today: browser and Swift rooms, server-side
+Early (`0.1.0`). Working today: browser and Swift rooms, server-side
 routing policies, deploy/restart survival, cascaded and speech-to-speech
 voice/vision agents, and local ONNX VAD/turn-detection/TTS.
 

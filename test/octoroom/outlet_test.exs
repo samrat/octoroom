@@ -121,8 +121,8 @@ defmodule Octoroom.OutletTest do
 
   test "sends Opus over RTP, with the clock moving on across a pause", ctx do
     send(ctx.outlet, {:octoroom_sink, {:rtp, self(), "track"}})
-    # The frame of silence it sends once connected.
-    [silence] = rtp(30)
+    # The frame of silence it sends once connected (allow extra time for cold Opus NIF load).
+    [silence] = rtp(150)
     assert silence.marker
 
     tone =

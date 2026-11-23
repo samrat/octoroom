@@ -167,8 +167,10 @@ defmodule Octoroom.Agent.Processors.Context do
       |> prompt_input(history)
       |> attach_frames(state, frame.source)
 
-    {[{:push, %Frames.PreemptiveLLMContext{text: text, messages: input, tools: state.tools},
-       :downstream}], state}
+    {[
+       {:push, %Frames.PreemptiveLLMContext{text: text, messages: input, tools: state.tools},
+        :downstream}
+     ], state}
   end
 
   defp frame(%Frames.Transcription{text: text} = frame, :downstream, state)

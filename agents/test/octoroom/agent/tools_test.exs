@@ -67,8 +67,7 @@ defmodule Octoroom.Agent.ToolsTest do
                  name: "set_voice_focus",
                  response: %{result: "ok", focus: "Prototype review"}
                }, %{type: "poc_focus_set", focus: "Prototype review"}}
-            ],
-            %{focus: "Prototype review"}} =
+            ], %{focus: "Prototype review"}} =
              ToolDispatcher.handle_calls([call], [focus_tool()], %{})
   end
 

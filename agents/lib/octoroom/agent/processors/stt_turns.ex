@@ -68,7 +68,8 @@ defmodule Octoroom.Agent.Processors.STTTurns do
       if state.preemptive? and state.pending? and is_binary(state.last_interim) and
            state.last_interim != "",
          do: [
-           {:push, %Frames.PreemptiveTranscription{text: state.last_interim, source: frame.source},
+           {:push,
+            %Frames.PreemptiveTranscription{text: state.last_interim, source: frame.source},
             :downstream}
          ],
          else: []

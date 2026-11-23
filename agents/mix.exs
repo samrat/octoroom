@@ -17,7 +17,8 @@ defmodule OctoroomAgents.MixProject do
       homepage_url: @source_url,
       package: package(),
       docs: docs(),
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
 
@@ -25,14 +26,29 @@ defmodule OctoroomAgents.MixProject do
     [extra_applications: [:logger]]
   end
 
+  def cli do
+    [preferred_envs: [quality: :test, q: :test]]
+  end
+
   # Octoroom's own fakes (FakeCloudflare, FakePeerMedia) run rooms in tests.
   defp elixirc_paths(:test), do: ["lib", "test/support", Path.expand("../test/support", __DIR__)]
   defp elixirc_paths(_), do: ["lib"]
 
+  defp aliases do
+    [
+      quality: [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "credo --only warning,consistency",
+        "cmd mix test"
+      ],
+      q: ["quality"]
+    ]
+  end
+
   defp deps do
     [
-      # Switch to {:octoroom, "~> 0.1.0"} when publishing to Hex after octoroom 0.1.0 is live.
-      {:octoroom, path: ".."},
+      octoroom_dep(),
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.0"},
       {:telemetry, "~> 1.2"},
@@ -44,6 +60,14 @@ defmodule OctoroomAgents.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
+  end
+
+  defp octoroom_dep do
+    if System.get_env("OCTOROOM_LOCAL") == "1" do
+      {:octoroom, path: ".."}
+    else
+      {:octoroom, "~> #{@version}"}
+    end
   end
 
   defp package do
@@ -59,6 +83,7 @@ defmodule OctoroomAgents.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url,
+      source_url_pattern: "#{@source_url}/blob/v#{@version}/agents/%{path}#L%{line}",
       extras: ["README.md"]
     ]
   end

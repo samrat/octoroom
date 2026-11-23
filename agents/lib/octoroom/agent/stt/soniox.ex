@@ -219,8 +219,14 @@ defmodule Octoroom.Agent.STT.Soniox do
 
   defp endpoint(opts) do
     case Keyword.get(opts, :url) do
-      url when is_binary(url) -> url
-      nil -> if(Keyword.get(opts, :region) == :eu, do: "wss://stt-rt.eu.soniox.com/transcribe-websocket", else: @endpoint)
+      url when is_binary(url) ->
+        url
+
+      nil ->
+        if(Keyword.get(opts, :region) == :eu,
+          do: "wss://stt-rt.eu.soniox.com/transcribe-websocket",
+          else: @endpoint
+        )
     end
   end
 
