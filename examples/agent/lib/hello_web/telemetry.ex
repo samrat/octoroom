@@ -124,6 +124,7 @@ defmodule HelloWeb.Telemetry do
       ),
       counter("octoroom.failure.count",
         tags: [:name, :given_up],
+        tag_values: &failure_tag_values/1,
         description: "Retried or abandoned room/worker failures"
       ),
 
@@ -165,6 +166,17 @@ defmodule HelloWeb.Telemetry do
       summary("vm.total_run_queue_lengths.io")
     ]
   end
+
+  defp failure_tag_values(meta) do
+    Map.update(meta, :name, "", &format_failure_name/1)
+  end
+
+  defp format_failure_name({:peer, id}), do: "peer:#{id}"
+  defp format_failure_name({:outlet, name}), do: "outlet:#{name}"
+  defp format_failure_name({:inlet, {worker_id, input}}), do: "inlet:#{worker_id}:#{input}"
+  defp format_failure_name(name) when is_binary(name), do: name
+  defp format_failure_name(name) when is_atom(name), do: Atom.to_string(name)
+  defp format_failure_name(other), do: inspect(other)
 
   defp periodic_measurements do
     [

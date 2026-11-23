@@ -59,4 +59,37 @@ defmodule MeetWeb.MetricsStorageTest do
              p.label == "assistant" and p.measurement == 340
            end)
   end
+
+  test "formats tuple failure names without crashing the telemetry handler" do
+    :telemetry.execute(
+      [:octoroom, :failure],
+      %{count: 1},
+      %{
+        room_id: "r1",
+        id: :media,
+        name: {:peer, "atlas"},
+        reason: {:shutdown, :connect_timeout},
+        given_up: false
+      }
+    )
+
+    :telemetry.execute(
+      [:octoroom, :failure],
+      %{count: 2},
+      %{
+        room_id: "r1",
+        id: :media,
+        name: {:inlet, {"atlas", "p1/mic"}},
+        reason: :empty_track,
+        given_up: true
+      }
+    )
+
+    failure_metric =
+      Enum.find(Telemetry.metrics(), &(&1.name == [:octoroom, :failure, :count]))
+
+    history = MetricsStorage.metrics_history(failure_metric)
+    assert Enum.any?(history, &(&1.label == "peer:atlas false"))
+    assert Enum.any?(history, &(&1.label == "inlet:atlas:p1/mic true"))
+  end
 end

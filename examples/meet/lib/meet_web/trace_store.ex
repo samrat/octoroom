@@ -694,18 +694,19 @@ defmodule MeetWeb.TraceStore do
 
   defp record([:octoroom, :failure], m, meta, now_ms, wall_at, state) do
     {span_id, state} = next_id(state)
+    name = format_failure_name(meta[:name])
 
     span = %{
       id: span_id,
       kind: :failure,
-      label: "failure: #{meta[:name]}",
+      label: "failure: #{name}",
       start_ms: now_ms - 5.0,
       end_ms: now_ms,
       duration_ms: 0.0,
       status: :error,
       meta: %{
         id: meta[:id],
-        name: meta[:name],
+        name: name,
         count: m[:count],
         given_up: meta[:given_up],
         reason: inspect(meta[:reason])
@@ -716,6 +717,13 @@ defmodule MeetWeb.TraceStore do
   end
 
   defp record(_event, _m, _meta, _now_ms, _wall_at, state), do: state
+
+  defp format_failure_name({:peer, id}), do: "peer:#{id}"
+  defp format_failure_name({:outlet, name}), do: "outlet:#{name}"
+  defp format_failure_name({:inlet, {worker_id, input}}), do: "inlet:#{worker_id}:#{input}"
+  defp format_failure_name(name) when is_binary(name), do: name
+  defp format_failure_name(name) when is_atom(name), do: Atom.to_string(name)
+  defp format_failure_name(other), do: inspect(other)
 
   # -- Helpers --
 
