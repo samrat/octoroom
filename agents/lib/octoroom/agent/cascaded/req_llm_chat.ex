@@ -41,7 +41,7 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
 
       {:ok,
        %{
-         text: String.trim(classified.text || ""),
+         text: String.trim(classified.text),
          function_calls: function_calls,
          continuation: [assistant_message(classified)]
        }}
@@ -92,7 +92,7 @@ defmodule Octoroom.Agent.Cascaded.ReqLLMChat do
 
       {:ok,
        %{
-         text: String.trim(classified.text || ""),
+         text: String.trim(classified.text),
          function_calls: function_calls,
          continuation: [assistant_message(classified)]
        }}

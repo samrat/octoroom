@@ -17,7 +17,7 @@ defmodule Call.DelayEcho do
 
     case byte_size(held) - @delay_bytes do
       excess when excess > 0 ->
-        <<out::binary-size(excess), held::binary>> = held
+        <<out::binary-size(^excess), held::binary>> = held
         {:ok, held, play: {:default, out}}
 
       _ ->
