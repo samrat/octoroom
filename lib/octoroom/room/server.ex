@@ -1667,6 +1667,7 @@ defmodule Octoroom.Room.Server do
 
   defp capture_for(state, participant_id) do
     for spec <- state.worker_specs,
+        Map.get(spec, :video_inputs, :client) == :client,
         %{source: :client} = video <- [Worker.video_config(spec.module)],
         input <- spec.inputs,
         {^participant_id, source} <- [Track.parse(input)],
@@ -1709,6 +1710,14 @@ defmodule Octoroom.Room.Server do
     if state.presence[id] == presence,
       do: state,
       else: presence_changed(put_in(state.presence[id], presence), id)
+  end
+
+  defp worker_message(state, id, {:request_pli, input}) do
+    if peer = get_in(state.peers, [id, :pid]) do
+      Peer.request_pli(peer, input)
+    end
+
+    state
   end
 
   # A worker (re)started: its state is unknown until it sets it again.
@@ -1922,26 +1931,41 @@ defmodule Octoroom.Room.Server do
 
   defp apply_worker_op({:update_worker, spec}, state) do
     w = state.workers[spec.id]
-    send(w.pid, {:octoroom_io, spec.inputs, spec.outputs, Map.get(spec, :data, [])})
+
+    send(
+      w.pid,
+      {:octoroom_io, spec.inputs, spec.outputs, Map.get(spec, :data, []),
+       Map.get(spec, :output_kinds, %{})}
+    )
+
     put_in(state.workers[spec.id].spec, spec)
   end
 
   defp apply_worker_op({:start_outlet, name, worker_id}, state) do
     with true <- may_retry?(state, :media, {:outlet, name}),
          {:ok, peer, state} <- ensure_peer(state, worker_id) do
-      opts = %{room_id: state.id, name: name, server: self()}
+      kind = output_kind(state, worker_id, name)
+
+      opts = %{
+        room_id: state.id,
+        worker_id: worker_id,
+        name: name,
+        kind: kind,
+        server: self()
+      }
 
       case start_child(state, :media, {Outlet, opts}) do
         {:ok, pid} ->
           # Track names are unique per Cloudflare session, and a worker's
           # outputs have distinct names.
           cf_track = "out-" <> Base.url_encode64(name, padding: false)
-          Peer.push(peer, name, cf_track, pid)
+          Peer.push(peer, name, cf_track, pid, kind)
 
           outlet = %{
             pid: pid,
             monitor: Process.monitor(pid),
             worker_id: worker_id,
+            kind: kind,
             cf_track: cf_track,
             session_id: nil,
             status: :creating,
@@ -1970,6 +1994,7 @@ defmodule Octoroom.Room.Server do
         room_id: state.id,
         worker_id: worker_id,
         input: input,
+        kind: Track.new(input).kind,
         format: state.workers[worker_id].spec.module.__octoroom_audio__()
       }
 
@@ -1985,6 +2010,19 @@ defmodule Octoroom.Room.Server do
     else
       false -> state
       {:error, state} -> state
+    end
+  end
+
+  defp output_kind(state, worker_id, name) do
+    spec =
+      case state.workers[worker_id] do
+        %{spec: spec} -> spec
+        nil -> Enum.find(state.worker_specs, &(&1.id == worker_id))
+      end
+
+    case spec do
+      %{output_kinds: %{^name => kind}} -> kind
+      _ -> Track.new(name).kind
     end
   end
 
@@ -2484,11 +2522,12 @@ defmodule Octoroom.Room.Server do
       sub = p.subs[name]
 
       track = Track.new(name)
+      kind = get_in(state.outlets, [name, :kind]) || track.kind
 
       %{
         mid: sub.mid,
         track: name,
-        kind: track.kind,
+        kind: kind,
         source: with({_, source} <- Track.parse(name), do: source),
         participant_id:
           owner(state, name) || (Map.has_key?(state.ghosts, name) && owner_id(name)) || nil,

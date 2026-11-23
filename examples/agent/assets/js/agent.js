@@ -103,6 +103,7 @@ const stateBadges = {
   waiting: "badge-warning",
   speaking: "badge-primary",
   joining: "badge-info",
+  error: "badge-error",
 }
 
 const stateCopy = {
@@ -112,6 +113,7 @@ const stateCopy = {
   thinking: "Thinking…",
   waiting: "Waiting…",
   speaking: "Speaking",
+  error: "Error",
 }
 
 const readyStates = new Set(["listening", "thinking", "waiting", "speaking"])
@@ -126,6 +128,8 @@ export const Agent = {
     this.$("#join").onclick = () => this.join()
     this.$("#leave").onclick = () => this.room?.leave()
     this.$("#mute").onclick = () => this.toggleMute()
+    const camBtn = this.$("#camera")
+    if (camBtn) camBtn.onclick = () => this.toggleCamera()
     this.el.querySelectorAll(".ask").forEach((b) => (b.onclick = () => this.ask(b.dataset.src)))
     this.$("#say").onsubmit = (e) => {
       e.preventDefault()
@@ -561,7 +565,9 @@ export const Agent = {
     el.classList.add("flex")
     if (who) {
       const tag = document.createElement("span")
-      tag.className = `mr-2 font-mono text-[11px] font-bold uppercase tracking-wide ${role === "agent" ? "text-primary" : "text-success"}`
+      const color =
+        role === "error" ? "text-error" : role === "agent" ? "text-primary" : "text-success"
+      tag.className = `mr-2 font-mono text-[11px] font-bold uppercase tracking-wide ${color}`
       tag.textContent = who
       el.append(tag)
     }
@@ -589,7 +595,7 @@ export const Agent = {
 
   enable(inCall) {
     this.$("#join").disabled = inCall
-    for (const el of this.el.querySelectorAll("#leave, #mute, .ask, #say input, #say button")) {
+    for (const el of this.el.querySelectorAll("#leave, #mute, #camera, .ask, #say input, #say button")) {
       el.disabled = !inCall
     }
     const dot = this.$("[data-live-dot]")
@@ -662,11 +668,24 @@ export const Agent = {
       this.setAgentState(state)
     })
     ai.on("transcript", ({agent, items}) => agent === "assistant" && this.renderTranscript(items))
-    ai.on("error", ({stage, fatal}) => this.status(`The agent's ${stage} failed${fatal ? " and it stopped" : ""}.`))
+    ai.on("error", ({stage, fatal, message}) => {
+      const text = message || `The agent's ${stage} failed${fatal ? " and it stopped" : ""}.`
+      this.status(text)
+      if (fatal) {
+        this.awaitingReady = false
+        this.setAgentState("error")
+        this.setCaption("Error", text, {role: "error"})
+      }
+    })
     this.ai = ai
 
     let greeting = null
     room.on("tracks", (tracks) => {
+      const video = tracks.find(
+        (t) => t.kind === "video" && (t.worker_id === "assistant" || t.track === "assistant/video"),
+      )
+      this.setAgentVideo(video?.stream || null)
+
       const voice = tracks.find(
         (t) => t.kind === "audio" && (t.worker_id === "assistant" || t.track === "assistant"),
       )
@@ -693,6 +712,11 @@ export const Agent = {
           this.pushEvent("greeting", {...greeting, sound: performance.now() - startedAt})
         }
       }, 10)
+    })
+    room.on("local", (tracks) => {
+      const cam = tracks.camera?.track
+      this.setLocalVideo(cam ? new MediaStream([cam]) : null)
+      this.setCameraUi(Boolean(cam))
     })
     room.on("error", (error) => this.status(`Error: ${error.message}`))
     room.on("left", () => this.cleanup())
@@ -766,6 +790,38 @@ export const Agent = {
     this.room.setMuted(muted)
     if (this.micGain) this.micGain.gain.value = muted ? 0 : 1
     this.setMuteUi(muted)
+  },
+
+  setCameraUi(on) {
+    const btn = this.$("#camera")
+    if (!btn) return
+    const text = on ? "Stop camera" : "Share camera"
+    const label = this.$("[data-camera-label]")
+    if (label) label.textContent = text
+    btn.title = text
+    btn.setAttribute("aria-label", text)
+    btn.classList.toggle("btn-primary", on)
+    btn.classList.toggle("btn-neutral", !on)
+    this.$("[data-cam-on]")?.classList.toggle("hidden", !on)
+    this.$("[data-cam-off]")?.classList.toggle("hidden", on)
+  },
+
+  async toggleCamera() {
+    if (!this.room) return
+    try {
+      if (this.room.localTracks().camera) {
+        await this.room.stop("camera")
+        this.setLocalVideo(null)
+        this.setCameraUi(false)
+      } else {
+        await this.room.startCamera({width: {ideal: 1280}, height: {ideal: 720}})
+        const track = this.room.localTracks().camera?.track
+        if (track) this.setLocalVideo(new MediaStream([track]))
+        this.setCameraUi(Boolean(track))
+      }
+    } catch (error) {
+      this.status(`Camera error: ${error.message}`)
+    }
   },
 
   renderTranscript(items) {
@@ -903,7 +959,56 @@ export const Agent = {
     return card
   },
 
+  setAgentVideo(stream) {
+    const videoEl = this.$("[data-agent-video]")
+    const orbWrap = this.$("[data-agent-orb-wrap]")
+    if (!videoEl) return
+    if (stream) {
+      if (videoEl.srcObject !== stream) {
+        videoEl.srcObject = stream
+        videoEl.play().catch(() => {})
+      }
+      videoEl.classList.remove("hidden")
+      orbWrap?.classList.add("hidden")
+    } else {
+      videoEl.srcObject = null
+      videoEl.classList.add("hidden")
+      orbWrap?.classList.remove("hidden")
+    }
+    this.positionLocalVideo()
+  },
+
+  setLocalVideo(stream) {
+    const localEl = this.$("[data-local-video]")
+    if (!localEl) return
+    if (stream) {
+      if (localEl.srcObject !== stream) {
+        localEl.srcObject = stream
+        localEl.play().catch(() => {})
+      }
+      localEl.classList.remove("hidden")
+    } else {
+      localEl.srcObject = null
+      localEl.classList.add("hidden")
+    }
+    this.positionLocalVideo()
+  },
+
+  positionLocalVideo() {
+    const agentEl = this.$("[data-agent-video]")
+    const localEl = this.$("[data-local-video]")
+    if (!localEl) return
+    const overlay = agentEl && !agentEl.classList.contains("hidden")
+    localEl.classList.toggle("absolute", overlay)
+    localEl.classList.toggle("right-3", overlay)
+    localEl.classList.toggle("bottom-3", overlay)
+    localEl.classList.toggle("z-10", overlay)
+  },
+
   cleanup() {
+    this.setAgentVideo(null)
+    this.setLocalVideo(null)
+    this.setCameraUi(false)
     clearInterval(this.probeTimer)
     clearInterval(this.clockTimer)
     this.probe = null

@@ -92,6 +92,10 @@ defmodule Octoroom.Worker do
   @type state :: term
   @type actions :: [
           play: {String.t() | :default, binary},
+          play_video:
+            {String.t() | :default_video, ExRTP.Packet.t()}
+            | {String.t() | :default_video, ExRTP.Packet.t(), atom | String.t() | nil},
+          request_pli: String.t(),
           flush: String.t() | :default,
           emit: term,
           notify:
@@ -300,13 +304,24 @@ defmodule Octoroom.Worker.Context do
   well as on recovery.
   """
 
-  defstruct [:room_id, :id, :resumed, :saved, inputs: [], outputs: [], data: [], participants: []]
+  defstruct [
+    :room_id,
+    :id,
+    :resumed,
+    :saved,
+    inputs: [],
+    outputs: [],
+    output_kinds: %{},
+    data: [],
+    participants: []
+  ]
 
   @type t :: %__MODULE__{
           room_id: String.t(),
           id: String.t(),
           inputs: [String.t()],
           outputs: [String.t()],
+          output_kinds: %{String.t() => :audio | :video},
           data: [String.t()],
           participants: [Octoroom.Participant.t()],
           resumed: nil | %{gone_ms: non_neg_integer},

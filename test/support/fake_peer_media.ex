@@ -23,16 +23,28 @@ defmodule Octoroom.Test.FakePeerMedia do
   end
 
   @impl true
-  def offer_sendonly(state, n) do
+  def offer_sendonly(state, n) when is_integer(n),
+    do: offer_sendonly(state, List.duplicate(:audio, n))
+
+  def offer_sendonly(state, kinds) when is_list(kinds) do
     {fake, session} = {state.fake, state.session}
 
     slots =
-      for i <- 1..n do
+      kinds
+      |> Enum.with_index(1)
+      |> Enum.map(fn {kind, i} ->
         mid = "out#{state.n + i}"
-        %{mid: mid, sink: {:pcm, &FakeCloudflare.ingest(fake, session, mid, &1)}}
-      end
 
-    {:ok, "offer", slots, %{state | n: state.n + n}}
+        sink =
+          case kind do
+            :video -> {:video_rtp, &FakeCloudflare.ingest(fake, session, mid, &1)}
+            _ -> {:pcm, &FakeCloudflare.ingest(fake, session, mid, &1)}
+          end
+
+        %{mid: mid, sink: sink, track_id: mid}
+      end)
+
+    {:ok, "offer", slots, %{state | n: state.n + length(kinds)}}
   end
 
   @impl true

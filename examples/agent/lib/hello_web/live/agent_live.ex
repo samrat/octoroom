@@ -382,7 +382,7 @@ defmodule HelloWeb.AgentLive do
                   phx-update="ignore"
                   class="flex flex-col items-center justify-center gap-3"
                 >
-                  <div class="relative flex size-44 items-center justify-center">
+                  <div data-agent-orb-wrap class="relative flex size-44 items-center justify-center">
                     <canvas
                       data-agent-orb
                       width="176"
@@ -392,6 +392,25 @@ defmodule HelloWeb.AgentLive do
                       class="size-44"
                     >
                     </canvas>
+                  </div>
+
+                  <div class="relative flex items-center justify-center">
+                    <video
+                      data-agent-video
+                      autoplay
+                      playsinline
+                      class="hidden aspect-video w-full max-w-md rounded-2xl border border-base-300 bg-black object-cover shadow-lg"
+                    >
+                    </video>
+
+                    <video
+                      data-local-video
+                      muted
+                      autoplay
+                      playsinline
+                      class="hidden h-24 w-32 -scale-x-100 rounded-xl border border-base-300 bg-black object-cover shadow-md"
+                    >
+                    </video>
                   </div>
 
                   <span
@@ -682,6 +701,22 @@ defmodule HelloWeb.AgentLive do
                     <.icon name="hero-microphone-slash" class="block size-5" />
                   </span>
                   <span data-mute-label class="sr-only">Mute</span>
+                </button>
+                <button
+                  id="camera"
+                  type="button"
+                  class="btn btn-neutral btn-circle sm:btn-lg"
+                  title="Share camera"
+                  aria-label="Camera"
+                  disabled
+                >
+                  <span data-cam-on class="hidden">
+                    <.icon name="hero-video-camera" class="block size-5" />
+                  </span>
+                  <span data-cam-off>
+                    <.icon name="hero-video-camera-slash" class="block size-5" />
+                  </span>
+                  <span data-camera-label class="sr-only">Camera</span>
                 </button>
                 <.button
                   id="leave"

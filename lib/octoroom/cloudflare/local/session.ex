@@ -38,7 +38,7 @@ defmodule Octoroom.Cloudflare.Local.Session do
         ice_servers: [],
         ice_aggressive_nomination: true,
         audio_codecs: [:opus],
-        video_codecs: [:vp8]
+        video_codecs: Octoroom.Peer.WebRTC.default_video_codecs()
       )
 
     :ets.insert(tables.sessions, {session_id, self(), pc})
@@ -56,6 +56,10 @@ defmodule Octoroom.Cloudflare.Local.Session do
        published: %{},
        # rx_track_id => track_name
        rx_by_track_id: %{},
+       # rx_track_id => %{payload_type => mime_type} (video only)
+       rx_codecs: %{},
+       # {dest_pc, dest_track_id} => mime_type
+       tx_codecs: %{},
        # mid => %{src_session, src_track_name, track_id, kind}
        pulled: %{},
        # tx_track_id => {src_session, src_track_name}
@@ -229,16 +233,31 @@ defmodule Octoroom.Cloudflare.Local.Session do
 
   @impl true
   def handle_info({:ex_webrtc, pc, {:rtp, rx_track_id, _rid, packet}}, %{pc: pc} = state) do
-    case Map.get(state.rx_by_track_id, rx_track_id) do
-      nil ->
-        :ok
+    state =
+      case Map.get(state.rx_by_track_id, rx_track_id) do
+        nil ->
+          state
 
-      track_name ->
-        for {_, {_dest_session, dest_pc, dest_track_id, _dest_mid}} <-
-              :ets.lookup(state.tables.subs, {state.id, track_name}) do
-          PeerConnection.send_rtp(dest_pc, dest_track_id, packet)
-        end
-    end
+        track_name ->
+          mime = get_in(state.rx_codecs, [rx_track_id, packet.payload_type])
+
+          Enum.reduce(
+            :ets.lookup(state.tables.subs, {state.id, track_name}),
+            state,
+            fn {_, {_dest_session, dest_pc, dest_track_id, _dest_mid}}, acc ->
+              acc =
+                if is_binary(mime) and Map.get(acc.tx_codecs, {dest_pc, dest_track_id}) != mime do
+                  Octoroom.Peer.WebRTC.select_sender_codec(dest_pc, dest_track_id, mime)
+                  put_in(acc.tx_codecs[{dest_pc, dest_track_id}], mime)
+                else
+                  acc
+                end
+
+              PeerConnection.send_rtp(dest_pc, dest_track_id, packet)
+              acc
+            end
+          )
+      end
 
     {:noreply, state}
   end
@@ -296,12 +315,26 @@ defmodule Octoroom.Cloudflare.Local.Session do
 
     Enum.reduce(tracks, state, fn %{mid: mid, track_name: track_name}, state ->
       case by_mid[mid] do
-        %{kind: kind, receiver: %{track: %{id: rx_track_id}}} ->
+        %{kind: kind, codecs: codecs, receiver: %{track: %{id: rx_track_id}}} ->
           :ets.insert(
             state.tables.tracks,
             {{state.id, track_name},
              %{kind: kind, session_pid: self(), pc: state.pc, track_id: rx_track_id, mid: mid}}
           )
+
+          rx_codecs =
+            if kind == :video do
+              codec_map =
+                for c <- codecs,
+                    not String.ends_with?(String.downcase(c.mime_type), "/rtx"),
+                    into: %{} do
+                  {c.payload_type, String.downcase(c.mime_type)}
+                end
+
+              Map.put(state.rx_codecs, rx_track_id, codec_map)
+            else
+              state.rx_codecs
+            end
 
           %{
             state
@@ -311,7 +344,8 @@ defmodule Octoroom.Cloudflare.Local.Session do
                   track_id: rx_track_id,
                   kind: kind
                 }),
-              rx_by_track_id: Map.put(state.rx_by_track_id, rx_track_id, track_name)
+              rx_by_track_id: Map.put(state.rx_by_track_id, rx_track_id, track_name),
+              rx_codecs: rx_codecs
           }
 
         _other ->

@@ -55,6 +55,8 @@ defmodule OctoroomAgents.MixProject do
       {:req, "~> 0.5"},
       {:req_llm, "~> 1.31"},
       {:websockex, "~> 0.5.1"},
+      # Optional: enables WebRTC DataChannels in `ex_webrtc`, required for Nuance Live.
+      {:ex_sctp, "~> 0.1.3", optional: true},
       # Silero VAD and Smart Turn run on ONNX Runtime via precompiled NIFs.
       {:onnxruntime, "~> 0.1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

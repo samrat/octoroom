@@ -288,6 +288,56 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     {nil, processor(:openai, Octoroom.Agent.Processors.OpenAILive, opts)}
   end
 
+  @doc """
+  The pipeline of a Nuance Live video + voice AI persona agent: no front end
+  (the agent mixes its inputs) and one `:nuance` stage,
+  `Octoroom.Agent.Processors.NuanceLive`.
+
+  Options:
+    * `:persona` - `"sam"` (default), `"sonia"`, or `"mira"`
+    * `:api_key` - default `NUANCE_API_KEY`
+    * `:expressiveness` - optional number in `0..2`
+    * `:delegation` - `:none`, `:client`, `[model: "default", ...]`, or a map
+    * `:runtime_tools` - `[stay_quiet: true, end_call: false, call_time: false]`
+    * `:timezone` - IANA timezone string
+    * `:max_session_seconds` - max session duration in seconds
+    * `:green_screen` - boolean (default `false`)
+    * `:camera` - boolean (default `false`): enables user camera input to the
+      persona (pair with `sees: [camera(p)]` and `video_inputs: :rtp` on `agent/3`)
+
+  Pair with `video: true` on `Octoroom.Agent.agent/3` so the room publishes the
+  persona's video track alongside its voice:
+
+      agent("emma", MyApp.VideoAssistant,
+        hears: Enum.map(room.participants, &mic/1),
+        video: true
+      )
+
+      Spec.nuance_live(
+        persona: "sonia",
+        delegation: [model: "default"]
+      )
+  """
+  def nuance_live(opts \\ []) do
+    alias Octoroom.Agent.NuanceLive.Protocol
+
+    Protocol.persona(Keyword.get(opts, :persona))
+
+    if Keyword.has_key?(opts, :expressiveness) do
+      Protocol.expressiveness(opts[:expressiveness])
+    end
+
+    if Keyword.has_key?(opts, :delegation) do
+      Protocol.delegation(opts[:delegation])
+    end
+
+    if Keyword.has_key?(opts, :runtime_tools) do
+      Protocol.runtime_tools(opts[:runtime_tools])
+    end
+
+    {nil, processor(:nuance, Octoroom.Agent.Processors.NuanceLive, opts)}
+  end
+
   @doc "The options of the stage named `name`, or nil when there's none."
   def opts(%__MODULE__{stages: stages}, name) do
     Enum.find_value(stages, fn stage -> if stage.name == name, do: stage.opts end)

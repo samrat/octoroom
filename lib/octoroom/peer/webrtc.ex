@@ -25,28 +25,102 @@ defmodule Octoroom.Peer.WebRTC do
 
   @behaviour Octoroom.Peer.Media
 
-  alias ExWebRTC.{ICECandidate, MediaStreamTrack, PeerConnection, SessionDescription}
+  alias ExRTCP.Packet.PayloadFeedback.PLI
+
+  alias ExWebRTC.{
+    ICECandidate,
+    MediaStreamTrack,
+    PeerConnection,
+    RTPCodecParameters,
+    SessionDescription
+  }
+
+  alias ExWebRTC.PeerConnection.Configuration
 
   @gather_timeout 5_000
+
+  @doc false
+  def default_video_codecs do
+    vp9 = [
+      %RTPCodecParameters{
+        payload_type: 100,
+        mime_type: "video/VP9",
+        clock_rate: 90_000,
+        sdp_fmtp_line: %ExSDP.Attribute.FMTP{pt: 100, profile_id: 0}
+      },
+      %RTPCodecParameters{
+        payload_type: 102,
+        mime_type: "video/VP9",
+        clock_rate: 90_000,
+        sdp_fmtp_line: %ExSDP.Attribute.FMTP{pt: 102, profile_id: 1}
+      }
+    ]
+
+    Configuration.default_video_codecs() ++ vp9
+  end
+
+  @doc false
+  def select_sender_codec(pc, track_id, codec) when is_pid(pc) and not is_nil(codec) do
+    target_mime = normalize_video_mime(codec)
+
+    with transceivers when is_list(transceivers) <- PeerConnection.get_transceivers(pc),
+         %{sender: %{id: sender_id}, codecs: codecs} <-
+           Enum.find(transceivers, &(&1.sender.track && &1.sender.track.id == track_id)),
+         %RTPCodecParameters{} = chosen <-
+           Enum.find(codecs, &(String.downcase(&1.mime_type) == target_mime)) do
+      PeerConnection.set_sender_codec(pc, sender_id, chosen)
+    else
+      _ -> :ok
+    end
+  catch
+    :exit, _ -> :ok
+  end
+
+  def select_sender_codec(_pc, _track_id, _codec), do: :ok
+
+  defp normalize_video_mime(mime) when is_binary(mime) do
+    down = String.downcase(mime)
+    if String.contains?(down, "/"), do: down, else: "video/#{down}"
+  end
+
+  defp normalize_video_mime(codec) when is_atom(codec), do: "video/#{codec}"
+
+  defp video_codec_atom(mime) when is_binary(mime) do
+    case String.downcase(mime) do
+      "video/vp8" -> :vp8
+      "video/vp9" -> :vp9
+      "video/h264" -> :h264
+      "video/av1" -> :av1
+      other -> other
+    end
+  end
 
   @impl true
   def init(_opts) do
     opts =
-      [ice_servers: [], ice_aggressive_nomination: true]
+      [
+        ice_servers: [],
+        ice_aggressive_nomination: true,
+        audio_codecs: [:opus],
+        video_codecs: default_video_codecs()
+      ]
       |> Keyword.merge(Application.get_env(:octoroom, :webrtc, []))
 
     {:ok, pc} = PeerConnection.start_link(opts)
-    {:ok, %{pc: pc, connected: false, held: []}}
+    {:ok, %{pc: pc, connected: false, held: [], rx_codecs: %{}}}
   end
 
   @impl true
   def session_created(state, _session_id), do: state
 
   @impl true
-  def offer_sendonly(%{pc: pc} = state, n) do
+  def offer_sendonly(state, n) when is_integer(n) and n > 0,
+    do: offer_sendonly(state, List.duplicate(:audio, n))
+
+  def offer_sendonly(%{pc: pc} = state, kinds) when is_list(kinds) and kinds != [] do
     tracks =
-      for _ <- 1..n do
-        track = MediaStreamTrack.new(:audio)
+      for kind <- kinds do
+        track = MediaStreamTrack.new(kind)
         {:ok, _} = PeerConnection.add_transceiver(pc, track, direction: :sendonly)
         track
       end
@@ -59,7 +133,7 @@ defmodule Octoroom.Peer.WebRTC do
     slots =
       for track <- tracks do
         tr = Enum.find(transceivers, &(&1.sender.track && &1.sender.track.id == track.id))
-        %{mid: tr.mid, sink: {:rtp, pc, track.id}}
+        %{mid: tr.mid, sink: {:rtp, pc, track.id}, track_id: track.id}
       end
 
     {:ok, sdp, slots, state}
@@ -88,15 +162,32 @@ defmodule Octoroom.Peer.WebRTC do
          :ok <- PeerConnection.set_local_description(pc, answer) do
       answer = local_sdp(pc)
 
+      transceivers = PeerConnection.get_transceivers(pc)
+
       refs =
-        for tr <- PeerConnection.get_transceivers(pc),
+        for tr <- transceivers,
             tr.mid != nil,
             tr.receiver.track,
             into: %{} do
           {tr.mid, tr.receiver.track.id}
         end
 
-      {:ok, answer, refs, %{state | held: held}}
+      rx_codecs =
+        for tr <- transceivers,
+            tr.kind == :video,
+            tr.receiver.track,
+            into: state.rx_codecs do
+          map =
+            for c <- tr.codecs,
+                not String.ends_with?(String.downcase(c.mime_type), "/rtx"),
+                into: %{} do
+              {c.payload_type, video_codec_atom(c.mime_type)}
+            end
+
+          {tr.receiver.track.id, map}
+        end
+
+      {:ok, answer, refs, %{state | held: held, rx_codecs: rx_codecs}}
     end
   end
 
@@ -127,8 +218,29 @@ defmodule Octoroom.Peer.WebRTC do
   end
 
   @impl true
-  def handle_info({:ex_webrtc, pc, {:rtp, track_id, _rid, packet}}, %{pc: pc}),
-    do: {:input, track_id, {:rtp, packet}}
+  def send_pli(%{pc: pc} = state, track_id) when is_pid(pc) and not is_nil(track_id) do
+    PeerConnection.send_pli(pc, track_id)
+    state
+  catch
+    :exit, _ -> state
+  end
+
+  def send_pli(state, _track_id), do: state
+
+  @impl true
+  def handle_info({:ex_webrtc, pc, {:rtp, track_id, _rid, packet}}, %{pc: pc} = state) do
+    case Map.get(state.rx_codecs, track_id) do
+      nil -> {:input, track_id, {:rtp, packet}}
+      codecs -> {:input, track_id, {:video_rtp, packet, Map.get(codecs, packet.payload_type)}}
+    end
+  end
+
+  def handle_info({:ex_webrtc, pc, {:rtcp, packets}}, %{pc: pc} = state) do
+    case for({track_id, %PLI{}} <- packets, do: track_id) |> Enum.uniq() do
+      [] -> {:ignore, state}
+      track_ids -> {:pli, track_ids, state}
+    end
+  end
 
   def handle_info({:ex_webrtc, pc, {:connection_state_change, :connected}}, %{pc: pc} = state),
     do: {:connected, %{state | connected: true}}

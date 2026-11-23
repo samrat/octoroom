@@ -302,8 +302,10 @@ defmodule Octoroom.Agent.Worker do
         # outputs it can notify on, its presence state and attributes, and
         # the timer that sets `listening` once a reply has played.
         outputs: ctx.outputs,
+        output_kinds: Map.get(ctx, :output_kinds, %{}),
         data: ctx.data,
         presence: nil,
+        last_error: nil,
         attributes: attributes(name, args),
         presence_timer: nil,
         snapshot_items: Map.get(args, :snapshot_items, 50)
@@ -429,9 +431,27 @@ defmodule Octoroom.Agent.Worker do
   def handle_info({:octoroom, :outputs, outputs}, state), do: {:ok, %{state | outputs: outputs}}
   def handle_info({:octoroom, :data, data}, state), do: {:ok, %{state | data: data}}
 
+  def handle_info({:octoroom, :video_pli, _output}, state) do
+    {state, actions} = tell_back(state, :octoroom_video_pli, [])
+    result(state, actions)
+  end
+
+  def handle_info({:octoroom, :video_rtp, input, %ExRTP.Packet{} = packet, codec}, state) do
+    frame = %Frames.InputVideo{packet: packet, source: input, codec: codec}
+    {state, actions} = push_back(state, frame, [])
+    result(state, actions)
+  end
+
   # Someone can now see it on its first output: catch them up on the
   # conversation. A restarted agent is told about everyone again.
   def handle_info({:octoroom, :subscribed, participant_id, output}, state) do
+    {state, actions} =
+      if Map.get(state.output_kinds, output) == :video do
+        tell_back(state, :octoroom_video_pli, [])
+      else
+        {state, []}
+      end
+
     case channels(state) do
       [^output | _] ->
         items =
@@ -440,10 +460,16 @@ defmodule Octoroom.Agent.Worker do
           |> Enum.map(&client_item/1)
 
         snapshot = {output, "transcript_snapshot", %{items: items}, participant_id}
-        {:ok, state, notify: snapshot}
+
+        err_notice =
+          if state.last_error,
+            do: [notify: {output, "error", state.last_error, participant_id}],
+            else: []
+
+        result(state, actions ++ [notify: snapshot] ++ err_notice)
 
       _ ->
-        {:ok, state}
+        result(state, actions)
     end
   end
 
@@ -1454,6 +1480,22 @@ defmodule Octoroom.Agent.Worker do
     end)
   end
 
+  defp back_command(
+         {:output, %Frames.OutputVideo{packet: %ExRTP.Packet{} = packet, codec: codec}},
+         state
+       ) do
+    if Enum.any?(Map.values(state.output_kinds), &(&1 == :video)) do
+      action =
+        if codec,
+          do: {:default_video, packet, codec},
+          else: {:default_video, packet}
+
+      {state, [play_video: action]}
+    else
+      {state, []}
+    end
+  end
+
   defp back_command({:output, %Frames.OutputAudio{sample_rate: @out_rate, audio: audio}}, state) do
     {state, latency} = first_audio(state)
     # 24 kHz mono s16le: 48 bytes per ms.
@@ -1489,7 +1531,14 @@ defmodule Octoroom.Agent.Worker do
     )
 
     event = {:agent, {:error, %{stage: error.processor, fatal: error.fatal?}}}
-    {state, [emit: event] ++ error_to_clients(state, error)}
+    actions = [emit: event] ++ error_to_clients(state, error)
+
+    if error.fatal? do
+      state = %{state | last_error: error_payload(error)}
+      set_presence(state, "error", actions)
+    else
+      {state, actions}
+    end
   end
 
   defp back_command({:output_upstream, _frame}, state), do: {state, []}
@@ -1500,6 +1549,9 @@ defmodule Octoroom.Agent.Worker do
       do: push_back(state, %Frames.Interruption{}, []),
       else: {state, []}
   end
+
+  defp back_command({:notify, {:request_pli, input}}, state) when is_binary(input),
+    do: {state, [request_pli: input]}
 
   defp back_command({:notify, event}, state), do: {state, [emit: {:agent, event}]}
 
@@ -1588,7 +1640,25 @@ defmodule Octoroom.Agent.Worker do
   end
 
   defp error_to_clients(state, error),
-    do: to_clients(state, "error", %{stage: inspect(error.processor), fatal: error.fatal?})
+    do: to_clients(state, "error", error_payload(error))
+
+  defp error_payload(error) do
+    base = %{stage: inspect(error.processor), fatal: error.fatal?}
+
+    case error_message(error.reason) do
+      msg when is_binary(msg) and msg != "" -> Map.put(base, :message, msg)
+      _ -> base
+    end
+  end
+
+  defp error_message({_, _status, %{"detail" => msg}}) when is_binary(msg), do: msg
+  defp error_message({_, _status, %{"message" => msg}}) when is_binary(msg), do: msg
+  defp error_message({_, _status, %{"error" => %{"message" => msg}}}) when is_binary(msg), do: msg
+  defp error_message(%{"detail" => msg}) when is_binary(msg), do: msg
+  defp error_message(%{"message" => msg}) when is_binary(msg), do: msg
+  defp error_message({:missing_env, var}) when is_binary(var), do: "Missing #{var}"
+  defp error_message(msg) when is_binary(msg), do: msg
+  defp error_message(_other), do: nil
 
   # What clients see of a conversation item: strings and numbers only.
   defp client_item(item),

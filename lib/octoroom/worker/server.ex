@@ -34,6 +34,7 @@ defmodule Octoroom.Worker.Server do
       id: spec.id,
       inputs: spec.inputs,
       outputs: spec.outputs,
+      output_kinds: Map.get(spec, :output_kinds, %{}),
       data: Map.get(spec, :data, []),
       participants: participants,
       resumed: Map.get(opts, :resumed),
@@ -52,6 +53,7 @@ defmodule Octoroom.Worker.Server do
       out_channels: out_channels,
       inputs: spec.inputs,
       outputs: spec.outputs,
+      output_kinds: Map.get(spec, :output_kinds, %{}),
       data: Map.get(spec, :data, []),
       prev: %{},
       user: nil,
@@ -81,9 +83,15 @@ defmodule Octoroom.Worker.Server do
   def handle_info({:octoroom_video, input, frame}, state),
     do: {:noreply, state.module.handle_video(input, frame, state.user) |> handle_result(state)}
 
-  def handle_info({:octoroom_io, inputs, outputs, data}, state) do
+  def handle_info({:octoroom_video_rtp, input, %ExRTP.Packet{} = packet, codec}, state),
+    do: {:noreply, user_info({:octoroom, :video_rtp, input, packet, codec}, state)}
+
+  def handle_info({:octoroom_io, inputs, outputs, data}, state),
+    do: handle_info({:octoroom_io, inputs, outputs, data, state.output_kinds}, state)
+
+  def handle_info({:octoroom_io, inputs, outputs, data, output_kinds}, state) do
     old = state
-    state = %{state | inputs: inputs, outputs: outputs, data: data}
+    state = %{state | inputs: inputs, outputs: outputs, data: data, output_kinds: output_kinds}
 
     state =
       if inputs != old.inputs, do: user_info({:octoroom, :inputs, inputs}, state), else: state
@@ -119,6 +127,22 @@ defmodule Octoroom.Worker.Server do
     {out, prev} = to_room(pcm, Map.get(state.prev, output, {0, 0}), state)
     Outlet.play(state.room_id, output, out)
     put_in(state.prev[output], prev)
+  end
+
+  defp action({:play_video, {output, %ExRTP.Packet{} = packet}}, state) do
+    output = video_output!(output, state)
+    Outlet.play_video(state.room_id, output, packet)
+    state
+  end
+
+  defp action({:play_video, {output, %ExRTP.Packet{} = packet, codec}}, state) do
+    output = video_output!(output, state)
+    Outlet.play_video(state.room_id, output, packet, codec: codec)
+    state
+  end
+
+  defp action({:request_pli, input}, state) when is_binary(input) do
+    tell_room(state, {:request_pli, input})
   end
 
   defp action({:flush, output}, state) do
@@ -204,13 +228,33 @@ defmodule Octoroom.Worker.Server do
       else: raise(ArgumentError, "worker #{inspect(state.id)} has no output #{inspect(name)}")
   end
 
-  defp output!(:default, %{outputs: [first | _]}), do: first
+  defp output!(:default, state) do
+    case Enum.find(state.outputs, &(Map.get(state.output_kinds, &1, :audio) == :audio)) do
+      nil ->
+        case state.outputs do
+          [first | _] -> first
+          [] -> raise ArgumentError, "worker #{inspect(state.id)} has no audio outputs"
+        end
+
+      first ->
+        first
+    end
+  end
 
   defp output!(name, state) do
     if name in state.outputs,
       do: name,
       else: raise(ArgumentError, "worker #{inspect(state.id)} has no output #{inspect(name)}")
   end
+
+  defp video_output!(:default_video, state) do
+    case Enum.find(state.outputs, &(Map.get(state.output_kinds, &1, :audio) == :video)) do
+      nil -> raise ArgumentError, "worker #{inspect(state.id)} has no video outputs"
+      first -> first
+    end
+  end
+
+  defp video_output!(name, state), do: output!(name, state)
 
   # The room's own format needs no conversion.
   defp to_room(pcm, prev, %{out_rate: 48_000, out_channels: 2}) do

@@ -15,6 +15,7 @@ defmodule Octoroom.Agent.Frames do
   defframe(Interruption, :system)
   defframe(Error, :system, fields: [:reason, :processor, fatal?: false])
   defframe(InputAudio, :system, fields: [:audio, :source, sample_rate: 16_000])
+  defframe(InputVideo, :system, fields: [:packet, :source, codec: nil])
 
   defframe(InputImage, :system,
     fields: [
@@ -39,6 +40,9 @@ defmodule Octoroom.Agent.Frames do
   # `dropped_ms` of the audio it had queued never played (nil: unknown).
   # Tells `Octoroom.Agent.Processors.AssistantCollector` how much was heard.
   defframe(AudioFlushed, :system, fields: [:dropped_ms])
+  # Encoded video RTP packet from a video-capable agent (e.g. Nuance Live).
+  # System frame so audio barge-in interruptions don't drop live avatar video.
+  defframe(OutputVideo, :system, fields: [:packet, codec: nil])
 
   # data: delivered in order; dropped by an interruption unless uninterruptible
   defframe(InterimTranscription, :data, fields: [:text, :source])

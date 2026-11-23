@@ -127,7 +127,7 @@ defmodule Octoroom.Reconciler do
     wanted_inlets =
       for s <- specs,
           input <- s.inputs,
-          Track.new(input).kind == :audio,
+          Track.new(input).kind == :audio or Map.get(s, :video_inputs) == :rtp,
           Map.get(tracks, input) == :live,
           into: MapSet.new() do
         {s.id, input}
@@ -168,6 +168,8 @@ defmodule Octoroom.Reconciler do
         {:restart_worker, spec}
 
       old.inputs != spec.inputs or old.outputs != spec.outputs or
+        Map.get(old, :output_kinds, %{}) != Map.get(spec, :output_kinds, %{}) or
+        Map.get(old, :video_inputs) != Map.get(spec, :video_inputs) or
           Map.get(old, :data, []) != Map.get(spec, :data, []) ->
         {:update_worker, spec}
 

@@ -47,8 +47,8 @@ defmodule Octoroom.Peer do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @doc "Pushes output track `name` (Cloudflare track name `cf_track`), played by `outlet`."
-  def push(peer, name, cf_track, outlet),
-    do: GenServer.cast(peer, {:request, {:push, name, cf_track, outlet}})
+  def push(peer, name, cf_track, outlet, kind \\ :audio),
+    do: GenServer.cast(peer, {:request, {:push, name, cf_track, outlet, kind}})
 
   @doc "Pulls `source` (`%{session_id, track_name}`) as input `input`, heard by `inlet`."
   def pull(peer, input, source, inlet),
@@ -56,6 +56,9 @@ defmodule Octoroom.Peer do
 
   @doc "Stops an output (`{:output, name}`) or an input (`{:input, input}`)."
   def close(peer, ref), do: GenServer.cast(peer, {:close, ref})
+
+  @doc "Requests a keyframe (RTCP PLI) on a pulled video input."
+  def request_pli(peer, input), do: GenServer.cast(peer, {:request_pli, input})
 
   @doc "The peer's Cloudflare session id, or nil before its first operation."
   def session(peer), do: GenServer.call(peer, :session)
@@ -86,8 +89,10 @@ defmodule Octoroom.Peer do
        connected: false,
        queue: [],
        op: nil,
-       # name => %{mid, sink, outlet, sent: boolean}
+       # name => %{mid, sink, outlet, track_id, sent: boolean}
        outputs: %{},
+       # sender track_id => output name (for routing RTCP PLI back to the worker)
+       output_tracks: %{},
        # input => %{mid, ref, inlet}
        inputs: %{},
        # media ref => input
@@ -119,6 +124,21 @@ defmodule Octoroom.Peer do
       end
 
     {:noreply, run_next(state)}
+  end
+
+  def handle_cast({:request_pli, input}, state) do
+    media =
+      case Map.get(state.inputs, input) do
+        %{ref: ref} ->
+          if function_exported?(state.media_mod, :send_pli, 2),
+            do: state.media_mod.send_pli(state.media, ref),
+            else: state.media
+
+        nil ->
+          state.media
+      end
+
+    {:noreply, %{state | media: media}}
   end
 
   @impl true
@@ -173,6 +193,17 @@ defmodule Octoroom.Peer do
 
         {:stop, {:shutdown, :connection_failed}, state}
 
+      {:pli, track_ids, media} ->
+        if is_binary(state.room_id) and is_binary(state.worker_id) do
+          for track_id <- track_ids,
+              name = state.output_tracks[track_id],
+              name != nil do
+            Octoroom.Worker.send(state.room_id, state.worker_id, {:octoroom, :video_pli, name})
+          end
+        end
+
+        {:noreply, %{state | media: media}}
+
       {:ignore, media} ->
         {:noreply, %{state | media: media}}
     end
@@ -206,11 +237,14 @@ defmodule Octoroom.Peer do
   end
 
   defp start(%{op: %{kind: :push, batch: batch}} = state) do
-    {:ok, offer, slots, media} = state.media_mod.offer_sendonly(state.media, length(batch))
+    kinds = for {:push, _name, _cf_track, _outlet, kind} <- batch, do: kind
+    offer_arg = if Enum.all?(kinds, &(&1 == :audio)), do: length(batch), else: kinds
+    {:ok, offer, slots, media} = state.media_mod.offer_sendonly(state.media, offer_arg)
     items = Enum.zip(batch, slots)
 
     tracks =
-      for {{:push, _name, cf_track, _}, slot} <- items, do: %{mid: slot.mid, track_name: cf_track}
+      for {{:push, _name, cf_track, _, _}, slot} <- items,
+          do: %{mid: slot.mid, track_name: cf_track}
 
     {cf, session} = {state.cf, state.session_id}
     state = %{state | media: media, op: Map.put(state.op, :items, items)}
@@ -241,13 +275,26 @@ defmodule Octoroom.Peer do
       {:ok, media} ->
         state =
           Enum.reduce(state.op.items, %{state | media: media}, fn
-            {{:push, name, _cf_track, outlet}, slot}, state ->
-              output = %{mid: slot.mid, sink: slot.sink, outlet: outlet, sent: false}
+            {{:push, name, _cf_track, outlet, _kind}, slot}, state ->
+              track_id = Map.get(slot, :track_id)
+
+              output = %{
+                mid: slot.mid,
+                sink: slot.sink,
+                outlet: outlet,
+                track_id: track_id,
+                sent: false
+              }
+
               report(state, {:pushed, name, state.session_id})
-              put_in(state.outputs[name], output)
+              state = put_in(state.outputs[name], output)
+
+              if track_id,
+                do: put_in(state.output_tracks[track_id], name),
+                else: state
           end)
 
-        refs = for {{:push, name, _, _}, _} <- state.op.items, do: {:output, name}
+        refs = for {{:push, name, _, _, _}, _} <- state.op.items, do: {:output, name}
         {:noreply, state |> await_connection() |> send_sinks() |> finish(refs)}
 
       {:error, reason} ->
@@ -352,7 +399,17 @@ defmodule Octoroom.Peer do
         state
 
       {output, outputs} ->
-        %{state | outputs: outputs, queue: state.queue ++ [{:close, ref, output.mid}]}
+        output_tracks =
+          if output[:track_id],
+            do: Map.delete(state.output_tracks, output.track_id),
+            else: state.output_tracks
+
+        %{
+          state
+          | outputs: outputs,
+            output_tracks: output_tracks,
+            queue: state.queue ++ [{:close, ref, output.mid}]
+        }
     end
   end
 
@@ -399,9 +456,13 @@ defmodule Octoroom.Peer do
   end
 
   defp deliver(inlet, {:rtp, packet}), do: send(inlet, {:octoroom_rtp, packet})
+
+  defp deliver(inlet, {:video_rtp, packet, codec}),
+    do: send(inlet, {:octoroom_video_rtp, packet, codec})
+
   defp deliver(inlet, {:pcm, frame}), do: send(inlet, {:octoroom_pcm, self(), frame})
 
-  defp request_ref({:push, name, _, _}), do: {:output, name}
+  defp request_ref({:push, name, _, _, _}), do: {:output, name}
   defp request_ref({:pull, input, _, _}), do: {:input, input}
   defp request_ref({:close, ref, _}), do: ref
 
@@ -439,13 +500,13 @@ defmodule Octoroom.Peer.Media do
   # peer's process and may block briefly (gathering host candidates).
 
   @type state :: term
-  @typedoc "Where an outlet sends its frames: RTP through a peer connection, or a function of PCM."
-  @type sink :: {:rtp, pid, term} | {:pcm, (binary -> term)}
+  @typedoc "Where an outlet sends its frames: RTP through a peer connection, or a function of PCM/video RTP."
+  @type sink :: {:rtp, pid, term} | {:pcm, (binary -> term)} | {:video_rtp, (term -> term)}
 
   @callback init(%{cloudflare: map}) :: {:ok, state}
   @callback session_created(state, session_id :: String.t()) :: state
-  @doc "Adds `n` sendonly audio transceivers. Returns the complete offer and one slot per transceiver."
-  @callback offer_sendonly(state, n :: pos_integer) ::
+  @doc "Adds sendonly transceivers (`n` audio, or a list of `:audio | :video` kinds). Returns the complete offer and one slot per transceiver."
+  @callback offer_sendonly(state, pos_integer | [:audio | :video]) ::
               {:ok, sdp :: String.t(), [%{mid: String.t(), sink: sink}], state}
   @callback apply_answer(state, sdp :: String.t()) :: {:ok, state} | {:error, term}
   @doc "Answers Cloudflare's offer. Returns the answer and, per mid, the ref its RTP arrives under."
@@ -454,10 +515,13 @@ defmodule Octoroom.Peer.Media do
   @doc "Cloudflare has the answer to the last offer."
   @callback renegotiated(state) :: state
   @callback stop_and_offer(state, mids :: [String.t()]) :: {:ok, sdp :: String.t(), state}
+  @callback send_pli(state, ref :: term) :: state
   @callback handle_info(term, state) ::
-              {:input, ref :: term, {:rtp, term} | {:pcm, binary}}
+              {:input, ref :: term, {:rtp, term} | {:video_rtp, term, term} | {:pcm, binary}}
+              | {:pli, [term], state}
               | {:connected, state}
               | {:failed, state}
               | {:ignore, state}
   @callback close(state) :: term
+  @optional_callbacks [send_pli: 2]
 end

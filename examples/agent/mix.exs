@@ -63,6 +63,7 @@ defmodule Hello.MixProject do
       {:bandit, "~> 1.5"},
       {:octoroom, path: "../..", override: true},
       {:octoroom_agents, path: "../../agents"},
+      {:ex_sctp, "~> 0.1.3"},
       # ratio 4.0.1 caps its optional decimal dep at ~> 2.0; override to patched 3.2+.
       {:decimal, "~> 3.2", override: true}
     ]

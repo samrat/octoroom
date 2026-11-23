@@ -33,8 +33,15 @@ defmodule Hello.Room do
     pipeline = selected_pipeline(room)
     info = Hello.Assistant.pipeline_info(pipeline)
 
+    video? = Map.get(info, :video, false)
+
     opts =
-      [hears: Enum.map(room.participants, &mic/1)] ++
+      [
+        hears: Enum.map(room.participants, &mic/1),
+        sees: Enum.map(room.participants, &camera/1),
+        video: video?,
+        video_inputs: if(video?, do: :rtp, else: :client)
+      ] ++
         if info.agent == Hello.Booking do
           [respond: :always]
         else
@@ -51,5 +58,5 @@ defmodule Hello.Room do
   end
 
   @impl true
-  def subscriptions(_listener, _room), do: [track("assistant")]
+  def subscriptions(_listener, _room), do: [track("assistant"), track("assistant/video")]
 end

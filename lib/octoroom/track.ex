@@ -26,6 +26,9 @@ defmodule Octoroom.Track do
   @doc "A track by room-scoped name. Participants' camera and screen tracks are video."
   def new(name) when is_binary(name), do: %__MODULE__{name: name, kind: kind_of(name)}
 
+  @doc "A video track by room-scoped name, e.g. for a worker's video output."
+  def video(name) when is_binary(name), do: %__MODULE__{name: name, kind: :video}
+
   @doc "`{participant_id, source}` for a participant's track, or nil (a worker output)."
   def parse(name) when is_binary(name) do
     case String.split(name, "/") do

@@ -45,8 +45,12 @@ defmodule Octoroom.Outlet do
     end
   end
 
-  @doc "Queues room PCM on an output track. A no-op if the outlet isn't running."
+  @doc "Queues room PCM on an audio output track. A no-op if the outlet isn't running."
   def play(room_id, name, pcm) when is_binary(pcm), do: cast(room_id, name, {:play, pcm})
+
+  @doc "Sends an encoded video RTP packet on a video output track. A no-op if the outlet isn't running."
+  def play_video(room_id, name, %ExRTP.Packet{} = packet, opts \\ []),
+    do: cast(room_id, name, {:play_video, packet, Keyword.get(opts, :codec)})
 
   @doc """
   Drops an output track's queued, unplayed audio. Returns how many ms of
@@ -82,14 +86,18 @@ defmodule Octoroom.Outlet do
   end
 
   @impl true
-  def init(%{name: name, server: server}) do
+  def init(%{name: name, server: server} = opts) do
     {:ok,
      %{
+       room_id: Map.get(opts, :room_id),
+       worker_id: Map.get(opts, :worker_id),
        name: name,
+       kind: Map.get(opts, :kind, :audio),
        server: server,
-       # Where frames go, from the worker's peer: `{:rtp, pc, track_id}` or
-       # `{:pcm, fun}` (tests).
+       # Where frames go, from the worker's peer: `{:rtp, pc, track_id}`,
+       # `{:pcm, fun}` or `{:video_rtp, fun}` (tests).
        sink: nil,
+       video_codec: nil,
        encoder: nil,
        seq: :rand.uniform(65_536) - 1,
        timestamp: :rand.uniform(4_294_967_296) - 1,
@@ -108,12 +116,25 @@ defmodule Octoroom.Outlet do
   end
 
   @impl true
-  def handle_cast({:play, pcm}, state) do
+  def handle_cast({:play, pcm}, %{kind: :audio} = state) do
     {frames, buffer} = split(state.buffer <> pcm, [])
     queue = Enum.reduce(frames, state.queue, &:queue.in/2)
     state = %{state | buffer: buffer, queue: queue, queued: state.queued + length(frames)}
     {:noreply, if(state.next == nil and state.queued > 0, do: tick(state), else: state)}
   end
+
+  def handle_cast({:play, _pcm}, state), do: {:noreply, state}
+
+  def handle_cast({:play_video, %ExRTP.Packet{} = packet, codec}, %{kind: :video} = state) do
+    {:noreply, send_video_packet(state, packet, codec)}
+  end
+
+  def handle_cast({:play_video, %ExRTP.Packet{} = packet}, %{kind: :video} = state) do
+    {:noreply, send_video_packet(state, packet, nil)}
+  end
+
+  def handle_cast({:play_video, _packet, _codec}, state), do: {:noreply, state}
+  def handle_cast({:play_video, _packet}, state), do: {:noreply, state}
 
   @impl true
   def handle_call(:flush, _from, state) do
@@ -139,9 +160,19 @@ defmodule Octoroom.Outlet do
 
   # Cloudflare forgets a pushed track that has sent nothing for a while
   # (pulls of it fail with `not_found_track_error`, packets or not), while
-  # one that has sent a packet stays pullable through long silences. So the
-  # outlet sends a frame of silence as soon as it can, which also makes the
-  # track live, and pullable, before its worker first speaks.
+  # one that has sent a packet stays pullable through long silences. So an
+  # audio outlet sends a frame of silence as soon as it can, which also makes
+  # the track live, and pullable, before its worker first speaks. A video
+  # outlet goes live on its first real video RTP packet and asks its worker
+  # for a keyframe as soon as its sink is ready.
+  def handle_info({:octoroom_sink, sink}, %{kind: :video} = state) do
+    if is_binary(state.room_id) and is_binary(state.worker_id) do
+      Octoroom.Worker.send(state.room_id, state.worker_id, {:octoroom, :video_pli, state.name})
+    end
+
+    {:noreply, %{state | sink: sink, video_codec: nil}}
+  end
+
   def handle_info({:octoroom_sink, sink}, state) do
     state = %{state | sink: sink}
 
@@ -151,6 +182,41 @@ defmodule Octoroom.Outlet do
   end
 
   def handle_info(_message, state), do: {:noreply, state}
+
+  defp send_video_packet(%{sink: nil} = state, _packet, _codec),
+    do: %{state | dropped: state.dropped + 1}
+
+  defp send_video_packet(state, packet, codec) do
+    now = System.monotonic_time(:millisecond)
+    spurt? = state.live and is_integer(state.last_sent) and now - state.last_sent > 2_000
+
+    video_codec =
+      case state.sink do
+        {:rtp, pc, track_id} ->
+          if codec != nil and codec != state.video_codec do
+            Octoroom.Peer.WebRTC.select_sender_codec(pc, track_id, codec)
+          end
+
+          PeerConnection.send_rtp(pc, track_id, packet)
+          codec || state.video_codec
+
+        {:video_rtp, fun} ->
+          fun.(packet)
+          codec || state.video_codec
+
+        {:pcm, fun} ->
+          fun.(packet)
+          codec || state.video_codec
+      end
+
+    cond do
+      not state.live -> send(state.server, {:outlet_live, state.name, self()})
+      spurt? -> send(state.server, {:outlet_spurt, state.name, self()})
+      true -> :ok
+    end
+
+    %{state | live: true, sent: state.sent + 1, last_sent: now, video_codec: video_codec}
+  end
 
   # Sends the frame that's due and schedules the next one. With nothing
   # queued, the clock stops; the next `play` restarts it.

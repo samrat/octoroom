@@ -49,8 +49,8 @@ end
 ```
 
 An AI participant is an `Octoroom.Worker` whose pipeline can be cascaded
-(`VAD → STT → LLM → TTS`, including local ONNX TTS) or speech-to-speech
-(Gemini Live, OpenAI Live):
+(`VAD → STT → LLM → TTS`, including local ONNX TTS), speech-to-speech
+(Gemini Live, OpenAI Live), or audiovisual (Nuance Live video avatars):
 
 ```elixir
 defmodule MyApp.Assistant do
@@ -72,9 +72,10 @@ defmodule MyApp.Assistant do
       llm: "google:gemini-3.5-flash",
       tts: "tiny_voca:tiny-voca"
     )
-    # Pass a keyword list for stage options, or use speech-to-speech:
+    # Pass a keyword list for stage options, or use speech-to-speech / video:
     # Spec.gemini_live(model: "gemini-3.8-live", voice: "Puck")
     # Spec.openai_live(model: "gpt-live-1.1", voice: "marin", delegation: [model: "gpt-5.4-mini"])
+    # Spec.nuance_live(persona: "sam") # with `video: true` on `agent/3`
   end
 end
 ```
@@ -110,7 +111,7 @@ over PubSub, query Ecto, or enforce app permissions directly.
 | Path                          | Description                                                                                                                                                                                                                                              |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`lib/`](https://github.com/samrat/octoroom/tree/main/lib)                 | Core `octoroom` package: room server, policy reconciler, Cloudflare Realtime SFU client (plus localhost-only `Octoroom.Cloudflare.Local` for dev), server-side WebRTC workers, and browser client (`priv/static/octoroom.mjs`).                          |
-| [`agents/`](https://github.com/samrat/octoroom/blob/main/agents/README.md) | `octoroom_agents`: cascaded voice + vision pipelines (`Silero` VAD, `SmartTurn`, Soniox/AssemblyAI/Reson8 STT, ReqLLM, Inworld/AssemblyAI/OpenAI/local `TinyVoca` ONNX TTS), Gemini Live, OpenAI Live (WebRTC + sideband WS), and `octoroom_agents.mjs`. |
+| [`agents/`](https://github.com/samrat/octoroom/blob/main/agents/README.md) | `octoroom_agents`: cascaded voice + vision pipelines (`Silero` VAD, `SmartTurn`, Soniox/AssemblyAI/Reson8 STT, ReqLLM, Inworld/AssemblyAI/OpenAI/local `TinyVoca` ONNX TTS), Gemini Live, OpenAI Live (WebRTC + sideband WS), Nuance Live video avatars, and `octoroom_agents.mjs`. |
 | [`swift/`](https://github.com/samrat/octoroom/blob/main/swift/README.md)   | Native iOS 17+ and macOS 14+ SwiftPM SDK (`OctoroomCore`, `Octoroom`, `OctoroomAgents`).                                                                                                                                                                 |
 | [`examples/`](https://github.com/samrat/octoroom/tree/main/examples)       | Standalone Phoenix and iOS apps demonstrating each capability.                                                                                                                                                                                           |
 

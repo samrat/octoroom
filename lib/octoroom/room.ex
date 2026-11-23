@@ -189,16 +189,22 @@ defmodule Octoroom.Room do
   """
   def worker(id, module, opts) when is_binary(id) and is_atom(module) do
     inputs = opts |> Keyword.get(:inputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
+    video_inputs = Keyword.get(opts, :video_inputs, :client)
+
+    unless video_inputs in [:client, :rtp] do
+      raise ArgumentError,
+            "worker #{id}: video_inputs: must be :client or :rtp, got #{inspect(video_inputs)}"
+    end
 
     video = Enum.find(inputs, &(Track.new(&1).kind == :video))
 
-    if video && Octoroom.Worker.video_config(module) == nil do
+    if video && video_inputs == :client && Octoroom.Worker.video_config(module) == nil do
       raise ArgumentError,
             "worker #{id}: #{video} is video, and #{inspect(module)} doesn't accept video inputs " <>
-              "(opt in with `use Octoroom.Worker, video: [source: :client]`)"
+              "(opt in with `use Octoroom.Worker, video: [source: :client]` or `video_inputs: :rtp`)"
     end
 
-    outputs = opts |> Keyword.get(:outputs, []) |> Enum.map(&track_name/1) |> Enum.uniq()
+    {outputs, output_kinds} = parse_outputs(Keyword.get(opts, :outputs, []))
     data = opts |> Keyword.get(:data, []) |> Enum.uniq()
 
     if bad = Enum.find(data, &(not is_binary(&1))),
@@ -207,7 +213,7 @@ defmodule Octoroom.Room do
     if both = Enum.find(data, &(&1 in outputs)),
       do: raise(ArgumentError, "worker #{id}: #{both} is both an output and a data output")
 
-    %{
+    spec = %{
       id: id,
       module: module,
       inputs: inputs,
@@ -215,7 +221,33 @@ defmodule Octoroom.Room do
       data: data,
       args: Keyword.get(opts, :args, %{})
     }
+
+    spec =
+      if map_size(output_kinds) == 0, do: spec, else: Map.put(spec, :output_kinds, output_kinds)
+
+    if video_inputs == :rtp, do: Map.put(spec, :video_inputs, :rtp), else: spec
   end
+
+  defp parse_outputs(list) do
+    {names, kinds} =
+      Enum.reduce(list, {[], %{}}, fn item, {names, kinds} ->
+        {name, kind} = output_entry(item)
+
+        if name in names do
+          {names, kinds}
+        else
+          kinds = if kind == :video, do: Map.put(kinds, name, :video), else: kinds
+          {[name | names], kinds}
+        end
+      end)
+
+    {Enum.reverse(names), kinds}
+  end
+
+  defp output_entry(%Track{name: name, kind: kind}), do: {name, kind}
+  defp output_entry({:video, name}) when is_binary(name), do: {name, :video}
+  defp output_entry({:audio, name}) when is_binary(name), do: {name, :audio}
+  defp output_entry(name) when is_binary(name), do: {name, Track.new(name).kind}
 
   defp track_name(%Track{name: name}), do: name
   defp track_name(name) when is_binary(name), do: name

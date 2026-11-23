@@ -241,6 +241,8 @@ defmodule Octoroom.Agent do
 
     {sees, opts} = Keyword.pop(opts, :sees, [])
     {voice?, opts} = Keyword.pop(opts, :voice, true)
+    {video_opt, opts} = Keyword.pop(opts, :video, false)
+    {video_inputs, opts} = Keyword.pop(opts, :video_inputs, :client)
     {args, opts} = Keyword.pop(opts, :args, %{})
 
     case Keyword.keys(opts) -- @worker_opts do
@@ -254,10 +256,32 @@ defmodule Octoroom.Agent do
       |> Map.put_new(:name, id)
       |> Map.merge(%{agent: module, args: args, voice: voice?})
 
+    video_outputs =
+      case video_opt do
+        true ->
+          [Octoroom.Track.video("#{id}/video")]
+
+        name when is_binary(name) ->
+          [Octoroom.Track.video(name)]
+
+        false ->
+          []
+
+        nil ->
+          []
+
+        other ->
+          raise ArgumentError,
+                "agent #{id}: video: must be a boolean or track name, got #{inspect(other)}"
+      end
+
+    audio_outputs = if voice?, do: [id], else: []
+
     Octoroom.Room.worker(id, Octoroom.Agent.Worker,
       inputs: hears ++ sees,
-      outputs: if(voice?, do: [id], else: []),
-      data: if(voice?, do: [], else: [id]),
+      video_inputs: video_inputs,
+      outputs: audio_outputs ++ video_outputs,
+      data: if(voice? or video_outputs != [], do: [], else: [id]),
       args: worker_args
     )
   end

@@ -33,7 +33,7 @@ config :octoroom,
 
 # The agent's providers read their keys from the environment.
 for key <-
-      ~w(RESON8_API_KEY SONIOX_API_KEY ASSEMBLY_AI_API_KEY GOOGLE_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY INWORLD_API_KEY),
+      ~w(RESON8_API_KEY SONIOX_API_KEY ASSEMBLY_AI_API_KEY GOOGLE_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY INWORLD_API_KEY NUANCE_API_KEY),
     value = env.(key),
     value not in [nil, ""],
     do: System.put_env(key, value)

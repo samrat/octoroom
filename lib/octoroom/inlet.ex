@@ -46,6 +46,7 @@ defmodule Octoroom.Inlet do
        room_id: room_id,
        worker_id: worker_id,
        input: input,
+       kind: Map.get(opts, :kind, :audio),
        format: format,
        burst_ms: burst_ms,
        tokens_ms: burst_ms,
@@ -65,6 +66,16 @@ defmodule Octoroom.Inlet do
   end
 
   @impl true
+  def handle_info({:octoroom_video_rtp, packet, codec}, %{kind: :video} = state) do
+    Worker.send(state.room_id, state.worker_id, {:octoroom_video_rtp, state.input, packet, codec})
+    {:noreply, %{state | forwarded: state.forwarded + 1}}
+  end
+
+  def handle_info({:octoroom_rtp, packet}, %{kind: :video} = state) do
+    Worker.send(state.room_id, state.worker_id, {:octoroom_video_rtp, state.input, packet, nil})
+    {:noreply, %{state | forwarded: state.forwarded + 1}}
+  end
+
   def handle_info({:octoroom_rtp, packet}, state) do
     {packets, timer, jitter} = JitterBuffer.insert(state.jitter, packet)
     {:noreply, %{state | jitter: jitter} |> set_timer(timer) |> decode(packets)}

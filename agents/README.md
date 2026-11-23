@@ -61,10 +61,11 @@ stopped, using the outlet's flush report (see
 the outlet's `:drained` message, the history store, and the receptionist
 example.
 
-### Gemini Live and OpenAI Live
+### Gemini Live, OpenAI Live, and Nuance Live (video avatars)
 
-An agent can also be one speech-to-speech model, Gemini Live or OpenAI Live
-(`gpt-live-1.1`), instead of STT, an LLM and TTS:
+An agent can also be one speech-to-speech or audiovisual model — Gemini Live,
+OpenAI Live (`gpt-live-1.1`), or [Nuance Live](https://docs.nuancelabs.ai/) —
+instead of STT, an LLM and TTS:
 
 ```elixir
 def pipeline(_ctx),
@@ -81,13 +82,25 @@ def pipeline(_ctx) do
 end
 ```
 
+```elixir
+# In the agent module:
+def pipeline(_ctx),
+  do: Octoroom.Agent.Pipeline.Spec.nuance_live(persona: "sam")
+
+# In the room's workers/1 (adds a `"assistant/video"` output track):
+agent("assistant", MyApp.Assistant, hears: [mic(p)], video: true)
+```
+
 It has one audio input, so the agent mixes everyone it hears into it, and
 the model takes its own turns: `respond:` and `gate:` don't apply, and it
 tells speakers apart only by voice. Typing to it, `prompt/3`, tools
-(via `delegation: [model: "..."]` on OpenAI Live),
-presence and transcripts work as for the cascaded agent, and a restarted
-agent carries on with its Gemini session handle or saved transcript. The
-keys are `GOOGLE_API_KEY` (Gemini Live) and `OPENAI_API_KEY` (OpenAI Live).
+(via `delegation: [model: "..."]` on OpenAI Live, or automatic `responses`
+delegation on Nuance Live), presence and transcripts work as for the cascaded
+agent, and a restarted agent carries on with its Gemini session handle or saved
+transcript. The keys are `GOOGLE_API_KEY` (Gemini Live), `OPENAI_API_KEY`
+(OpenAI Live), and `NUANCE_API_KEY` (Nuance Live). Nuance Live uses WebRTC
+DataChannels, so add `{:ex_sctp, "~> 0.1.3"}` (needs Rust) to your app's
+`mix.exs` and recompile `ex_webrtc` (`mix deps.compile ex_webrtc --force`).
 `Octoroom.Agent.Worker`'s moduledoc has what's different.
 
 See [`examples/meet`](https://github.com/samrat/octoroom/tree/main/examples/meet) for a multi-agent call combining

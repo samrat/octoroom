@@ -9,6 +9,7 @@ const DEFAULT_PALETTE = {
   agentAccent: "#38bdf8",
   user: "#34d399",
   thinking: "#f59e0b",
+  error: "#ef4444",
   idle: "#64748b",
 }
 
@@ -54,20 +55,23 @@ export function createAgentOrb(canvas, options = {}) {
     const cy = size / 2
     const scale = size / 176
 
-    const isSpeaking = state === "speaking" || smoothAgent > 0.06
-    const isThinking = state === "thinking" || state === "waiting" || state === "joining"
+    const isError = state === "error"
+    const isSpeaking = !isError && (state === "speaking" || smoothAgent > 0.06)
+    const isThinking = !isError && (state === "thinking" || state === "waiting" || state === "joining")
     const isIdle = state === "idle"
-    const userTalking = !isSpeaking && smoothUser > 0.08
+    const userTalking = !isError && !isSpeaking && smoothUser > 0.08
 
-    const ringColor = isThinking
-      ? palette.thinking
-      : isSpeaking
-        ? palette.agent
-        : userTalking
-          ? palette.user
-          : isIdle
-            ? palette.idle
-            : palette.agent
+    const ringColor = isError
+      ? palette.error
+      : isThinking
+        ? palette.thinking
+        : isSpeaking
+          ? palette.agent
+          : userTalking
+            ? palette.user
+            : isIdle
+              ? palette.idle
+              : palette.agent
 
     // Ambient halo
     const breath = reducedMotion?.matches ? 0 : Math.sin(t * (isThinking ? 4.2 : 1.9)) * 4

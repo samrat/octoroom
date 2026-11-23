@@ -16,6 +16,27 @@ defmodule Hello.Assistant do
 
   @pipelines [
     %{
+      id: "nuance_sam",
+      name: "Nuance Live · Sam (Video)",
+      label: "Video avatar · Nuance Live (Sam)",
+      agent: __MODULE__,
+      video: true
+    },
+    %{
+      id: "nuance_sonia",
+      name: "Nuance Live · Sonia (Video)",
+      label: "Video avatar · Nuance Live (Sonia)",
+      agent: __MODULE__,
+      video: true
+    },
+    %{
+      id: "nuance_mira",
+      name: "Nuance Live · Mira (Video)",
+      label: "Video avatar · Nuance Live (Mira)",
+      agent: __MODULE__,
+      video: true
+    },
+    %{
       id: "openai_live",
       name: "OpenAI Live · gpt-live-1.1",
       label: "Speech-to-speech · OpenAI gpt-live-1.1",
@@ -77,9 +98,18 @@ defmodule Hello.Assistant do
   def valid_pipeline?(id), do: Enum.any?(@pipelines, &(&1.id == id))
 
   @impl true
-  def instructions(_ctx) do
+  def instructions(ctx) do
+    name_line =
+      case Map.get(ctx.args || %{}, :pipeline) do
+        "nuance_" <> persona ->
+          "Your name is #{String.capitalize(persona)}. When the patient asks to check availability, book, list, or cancel an appointment, hand the request off to your backend and let them know you're checking.\n"
+
+        _ ->
+          ""
+      end
+
     """
-    You are the front-desk receptionist at Elixir Clinic, open Monday through Friday from 8 AM to 5 PM.
+    #{name_line}You are the front-desk receptionist at Elixir Clinic, open Monday through Friday from 8 AM to 5 PM.
     You are on a direct one-on-one phone call with a patient, so always respond to the caller.
     #{Clinic.date_context()}
     Use your tools to check real availability, list existing appointments, book new appointments, or cancel appointments — never invent open slots or confirmation codes without calling a tool first.
@@ -97,6 +127,18 @@ defmodule Hello.Assistant do
   @impl true
   def pipeline(ctx) do
     build_pipeline(Map.get(ctx.args || %{}, :pipeline, @default_pipeline))
+  end
+
+  def build_pipeline("nuance_" <> persona) when persona in ~w(sam sonia mira) do
+    Spec.nuance_live(
+      persona: persona,
+      camera: true,
+      delegation: [
+        model: "default",
+        instructions:
+          "Use the Elixir Clinic tools to check availability, book, list, or cancel appointments, then answer in one short sentence."
+      ]
+    )
   end
 
   def build_pipeline("gemini_live") do
