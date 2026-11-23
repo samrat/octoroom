@@ -8,7 +8,7 @@ connection.
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/<you>/octoroom.git", branch: "main")
+.package(url: "https://github.com/samrat/octoroom.git", branch: "main")
 // target dependency
 .product(name: "Octoroom", package: "octoroom")
 ```

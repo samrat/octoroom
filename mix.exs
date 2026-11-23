@@ -1,13 +1,22 @@
 defmodule Octoroom.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/samrat/octoroom"
+
   def project do
     [
       app: :octoroom,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
+      description:
+        "Programmable voice, video, and AI agent rooms for Phoenix, backed by Cloudflare Realtime SFU.",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      package: package(),
+      docs: docs(),
       deps: deps(),
       aliases: aliases()
     ]
@@ -39,7 +48,25 @@ defmodule Octoroom.MixProject do
       {:membrane_opus_plugin, "~> 0.20"},
       {:phoenix, "~> 1.7", optional: true},
       {:stream_data, "~> 1.1", only: :test},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      files: ~w(lib priv/static mix.exs README.md LICENSE),
+      links: %{"GitHub" => @source_url}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
+      extras: ["README.md"]
     ]
   end
 end

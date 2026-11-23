@@ -3,14 +3,12 @@
 AI participants for Octoroom rooms. An agent is an `Octoroom.Worker` whose
 process runs a voice pipeline: it hears the tracks the room's policy gives
 it and speaks on a track the policy routes like any other. Octoroom itself
-ships no AI ([D5](../docs/decisions.md#d5-octoroom-ships-no-ai)); this
-package is where it lives.
+ships no AI; this package is where it lives.
 
-Status: phases 1 and 3 of [docs/proposal-agents.md](../docs/proposal-agents.md),
-and the start of phase 2: a cascaded agent (Silero VAD → Soniox → an LLM
-through ReqLLM → Inworld) that hears any number of people, each through
-their own VAD and speech-to-text, and answers when addressed by name. An
-agent is a module, added to a room with `agent/3`:
+A cascaded agent (Silero VAD → Soniox → an LLM through ReqLLM → Inworld)
+hears any number of people, each through their own VAD and speech-to-text,
+and answers when addressed by name. An agent is a module, added to a room
+with `agent/3`:
 
 ```elixir
 defmodule MyApp.Assistant do
@@ -49,8 +47,7 @@ With `gate: :decision` and `decisions: [model: "google:gemini-decision-1"]`,
 that decision model hears each turn. The module's
 `questions/1` and `decide/2` can ask it more and decide from the answers
 ("only questions about capital cities"), and `agents/2` puts several
-agents in one room, each told apart by name and `description:`
-([D41](../docs/decisions.md#d41-the-app-asks-the-decision-model-its-own-questions-and-several-agents-share-a-room)).
+agents in one room, each told apart by name and `description:`.
 
 Tool handlers get `speaker`, the participant who asked. From outside the
 room, `Octoroom.Agent.say/3`, `prompt/3` and `interrupt/2`. The history
@@ -97,8 +94,7 @@ latency.
 
 ## Clients
 
-Agents show up in clients through Octoroom's worker events
-([D44](../docs/decisions.md#d44-workers-reach-clients-through-their-outputs)):
+Agents show up in clients through Octoroom's worker events:
 each one's state (listening, thinking, speaking, waiting), its transcript,
 and a box to type to it. `priv/static/octoroom_agents.mjs` does it in the
 browser, and the Swift package's `OctoroomAgents` product on iOS and macOS:

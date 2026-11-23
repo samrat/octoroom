@@ -1,8 +1,10 @@
 defmodule Octoroom do
   @moduledoc """
-  Voice rooms for Phoenix apps, carried by Cloudflare Realtime SFU.
+  Programmable voice and video rooms for Phoenix apps, carried by Cloudflare
+  Realtime SFU.
 
-  See `Octoroom.Room` for writing a room and `docs/architecture.md` for the design.
+  See `Octoroom.Room` for writing a room and `Octoroom.Worker` for server-side
+  participants.
   """
 
   @events Octoroom.Events

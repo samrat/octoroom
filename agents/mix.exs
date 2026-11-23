@@ -1,13 +1,22 @@
 defmodule OctoroomAgents.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/samrat/octoroom"
+
   def project do
     [
       app: :octoroom_agents,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
+      description:
+        "Voice and vision AI participants for Octoroom rooms (cascaded pipelines, local ONNX, Gemini Live, OpenAI Live).",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      package: package(),
+      docs: docs(),
       deps: deps()
     ]
   end
@@ -17,25 +26,40 @@ defmodule OctoroomAgents.MixProject do
   end
 
   # Octoroom's own fakes (FakeCloudflare, FakePeerMedia) run rooms in tests.
-  # Octoroom's own fakes (FakeCloudflare, FakePeerMedia) run rooms in tests.
   defp elixirc_paths(:test), do: ["lib", "test/support", Path.expand("../test/support", __DIR__)]
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [
+      # Switch to {:octoroom, "~> 0.1.0"} when publishing to Hex after octoroom 0.1.0 is live.
       {:octoroom, path: ".."},
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.0"},
       {:telemetry, "~> 1.2"},
       {:req, "~> 0.5"},
-      # Pinned for the Gemini Decisions API (google:gemini-decision-1), which
-      # the agents' decision gate uses and released versions (1.30) lack.
-      # Subvocal used this commit. Needs a release before a Hex publish.
-      {:req_llm, github: "agentjido/req_llm", ref: "d711c4ab9ea75d3243643c68452825aa4cfaebe1"},
+      {:req_llm, "~> 1.31"},
       {:websockex, "~> 0.5.1"},
       # Silero VAD and Smart Turn run on ONNX Runtime via precompiled NIFs.
       {:onnxruntime, "~> 0.1.0"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      files: ~w(lib priv mix.exs README.md LICENSE),
+      links: %{"GitHub" => @source_url}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
+      extras: ["README.md"]
     ]
   end
 end
