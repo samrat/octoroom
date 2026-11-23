@@ -8,12 +8,13 @@
 //   chips, and coral barge-in overlap washes
 // - Hoverable assistant turns for Option B's on-demand waterfall popover
 
-import {DEFAULT_WINDOW_MS, SampleRing} from "./voice_timeline_store.js"
+import {DEFAULT_WINDOW_MS, HISTORY_MS, SampleRing} from "./voice_timeline_store.js"
 
 const RULER_HEIGHT = 20
-const BOTTOM_PAD = 6
+const BOTTOM_PAD = 10
 const PLAYHEAD_INSET = 6
 const SLOW_REPLY_MS = 1000
+const SAMPLE_INTERVAL_MS = 30
 
 const AUDIBLE_FLOOR = 0.04
 const USER_SPEECH_ON = 0.14
@@ -200,6 +201,10 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
   let running = false
   let paused = false
   let frozenAt = performance.now()
+  let startedAt = frozenAt
+  let lastSampleAt = -Infinity
+  /** When non-null, viewport is scrolled back and pinned to this timestamp. */
+  let viewEnd = null
   let frame = 0
   let lastDraw = -Infinity
   let width = 0
@@ -283,20 +288,42 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
     }
   }
 
+  function currentNow() {
+    return running ? performance.now() : frozenAt
+  }
+
+  function effectiveViewEnd(now) {
+    if (viewEnd !== null) return Math.min(viewEnd, now)
+    if (paused || !running) return frozenAt
+    return now
+  }
+
+  function notifyScrollState() {
+    callbacks.onScrollChange?.(viewEnd !== null)
+  }
+
   function redraw() {
-    if (!running || paused) draw(frozenAt)
+    const now = currentNow()
+    draw(effectiveViewEnd(now), now)
   }
 
   function tick(now) {
+    const shouldSample = now - lastSampleAt >= SAMPLE_INTERVAL_MS
+    if (shouldSample) lastSampleAt = now
+
     for (const lane of lanes) {
       const meter = meters.get(lane.id)
       const level = meter ? meter.read() : 0
-      ensureRing(lane.id).push(now, level)
+      if (shouldSample) ensureRing(lane.id).push(now, level)
       updateVad(lane, level, now)
     }
 
-    if (!paused && (!reducedMotion?.matches || now - lastDraw >= REDUCED_MOTION_MS)) {
-      draw(now)
+    if (!paused && viewEnd === null && (!reducedMotion?.matches || now - lastDraw >= REDUCED_MOTION_MS)) {
+      draw(now, now)
+      lastDraw = now
+    } else if (viewEnd !== null && now - lastDraw >= 250) {
+      // Keep relative age labels & scrollbar thumb updated while scrolled back.
+      draw(effectiveViewEnd(now), now)
       lastDraw = now
     }
     frame = requestAnimationFrame(tick)
@@ -318,10 +345,17 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
     )
   }
 
-  function drawRuler() {
+  function formatAgo(seconds) {
+    const s = Math.max(0, Math.round(seconds))
+    if (s < 60) return `-${s}s`
+    return `-${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`
+  }
+
+  function drawRuler(viewTime, realNow) {
     const right = playheadX()
     const stepSec = windowMs <= 10_000 ? 2 : 5
     const totalSec = Math.floor(windowMs / 1000)
+    const offsetSec = Math.max(0, (realNow - viewTime) / 1000)
 
     ctx.font = "500 10px ui-monospace, SFMono-Regular, Menlo, monospace"
     ctx.textBaseline = "middle"
@@ -339,13 +373,42 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
 
       ctx.fillStyle = palette.mutedText
       ctx.textAlign = "center"
-      ctx.fillText(`-${sec}s`, x, RULER_HEIGHT / 2)
+      ctx.fillText(formatAgo(sec + offsetSec), x, RULER_HEIGHT / 2)
     }
 
-    ctx.fillStyle = paused ? palette.wait : palette.mutedText
+    const scrolledBack = viewEnd !== null
+    ctx.fillStyle = paused || scrolledBack ? palette.wait : palette.mutedText
     ctx.textAlign = "right"
-    ctx.fillText(paused ? "PAUSED" : "LIVE", right - 2, RULER_HEIGHT / 2)
+    const rightLabel = scrolledBack ? `${formatAgo(offsetSec)} ago` : paused ? "PAUSED" : "LIVE"
+    ctx.fillText(rightLabel, right - 2, RULER_HEIGHT / 2)
     ctx.textAlign = "left"
+  }
+
+  function drawScrollbar(viewTime, realNow) {
+    const right = playheadX()
+    const earliest = Math.max(startedAt, realNow - HISTORY_MS)
+    const totalSpan = Math.max(realNow - earliest, windowMs)
+    if (totalSpan <= windowMs + 250 && viewEnd === null) return
+
+    const barY = layout.tracksBottom + 4
+    const barH = 3
+    ctx.save()
+    roundedRect(ctx, 0, barY, right, barH, 1.5)
+    ctx.fillStyle = palette.grid
+    ctx.fill()
+
+    const thumbFrac = Math.min(1, windowMs / totalSpan)
+    const thumbW = Math.max(24, Math.round(right * thumbFrac))
+    const maxOffset = Math.max(1, totalSpan - windowMs)
+    const offsetFromEnd = Math.min(maxOffset, Math.max(0, realNow - viewTime))
+    const posFrac = 1 - offsetFromEnd / maxOffset
+    const thumbX = Math.round(posFrac * (right - thumbW))
+
+    roundedRect(ctx, thumbX, barY, thumbW, barH, 1.5)
+    ctx.fillStyle = viewEnd !== null ? palette.wait : palette.mutedText
+    ctx.globalAlpha = viewEnd !== null ? 0.85 : 0.45
+    ctx.fill()
+    ctx.restore()
   }
 
   function drawBaselines() {
@@ -687,52 +750,55 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
     }
   }
 
-  function drawPlayhead() {
+  function drawPlayhead(isLive) {
     const x = playheadX()
     ctx.save()
-    ctx.strokeStyle = paused ? palette.wait : palette.divider
+    ctx.strokeStyle = paused || !isLive ? palette.wait : palette.divider
     ctx.lineWidth = 1.5
     ctx.beginPath()
     ctx.moveTo(x + 0.5, layout.tracksTop)
     ctx.lineTo(x + 0.5, layout.tracksBottom)
     ctx.stroke()
 
-    for (const track of layout.tracks) {
-      const level = rings.get(track.id)?.latest() || 0
-      if (level <= AUDIBLE_FLOOR) continue
-      const midY = track.top + track.height / 2
-      const color = laneColor(track)
+    if (isLive) {
+      for (const track of layout.tracks) {
+        const level = rings.get(track.id)?.latest() || 0
+        if (level <= AUDIBLE_FLOOR) continue
+        const midY = track.top + track.height / 2
+        const color = laneColor(track)
 
-      ctx.beginPath()
-      ctx.arc(x + 0.5, midY, 2.5 + level * 2.5, 0, Math.PI * 2)
-      ctx.fillStyle = color
-      ctx.globalAlpha = 0.28
-      ctx.fill()
+        ctx.beginPath()
+        ctx.arc(x + 0.5, midY, 2.5 + level * 2.5, 0, Math.PI * 2)
+        ctx.fillStyle = color
+        ctx.globalAlpha = 0.28
+        ctx.fill()
 
-      ctx.beginPath()
-      ctx.arc(x + 0.5, midY, 2.4, 0, Math.PI * 2)
-      ctx.fillStyle = color
-      ctx.globalAlpha = 1
-      ctx.fill()
+        ctx.beginPath()
+        ctx.arc(x + 0.5, midY, 2.4, 0, Math.PI * 2)
+        ctx.fillStyle = color
+        ctx.globalAlpha = 1
+        ctx.fill()
+      }
     }
     ctx.restore()
   }
 
-  function draw(now) {
+  function draw(viewTime, realNow = viewTime) {
     ctx.clearRect(0, 0, width, layout.totalHeight)
     if (width <= 0 || layout.tracks.length === 0) return
 
-    const fromTime = now - windowMs
-    drawRuler()
+    const fromTime = viewTime - windowMs
+    drawRuler(viewTime, realNow)
     drawBaselines()
-    drawPhases(now, fromTime)
-    drawOverlapWashes(now, fromTime)
-    drawHoveredTurnHalo(now, fromTime)
+    drawPhases(viewTime, fromTime)
+    drawOverlapWashes(viewTime, fromTime)
+    drawHoveredTurnHalo(viewTime, fromTime)
     for (const track of layout.tracks) {
-      drawWaveform(track, now, fromTime)
+      drawWaveform(track, viewTime, fromTime)
     }
-    drawInlineBadgesAndHitBoxes(now, fromTime)
-    drawPlayhead()
+    drawInlineBadgesAndHitBoxes(viewTime, fromTime)
+    drawPlayhead(viewEnd === null && !paused)
+    drawScrollbar(viewTime, realNow)
   }
 
   return {
@@ -770,6 +836,44 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
       windowMs = nextMs
       redraw()
     },
+    /**
+     * Scrolls the viewport by `deltaPx` pixels (positive moves forward toward
+     * live; negative moves back into history). Automatically snaps back to
+     * LIVE once within ~80ms of `now`.
+     */
+    scrollByPixels(deltaPx) {
+      const right = playheadX()
+      if (right <= 0 || !Number.isFinite(deltaPx) || deltaPx === 0) return
+      const now = currentNow()
+      const current = effectiveViewEnd(now)
+      const deltaMs = (deltaPx / right) * windowMs
+      const earliest = Math.max(startedAt, now - HISTORY_MS)
+      const minEnd = Math.min(now, earliest + Math.min(windowMs, now - earliest))
+      const next = Math.min(now, Math.max(minEnd, current + deltaMs))
+
+      if (next >= now - 80) {
+        if (viewEnd !== null) {
+          viewEnd = null
+          notifyScrollState()
+        }
+      } else {
+        const wasLive = viewEnd === null
+        viewEnd = next
+        if (wasLive) notifyScrollState()
+      }
+      draw(effectiveViewEnd(now), now)
+    },
+    jumpToLive() {
+      const wasScrolled = viewEnd !== null
+      viewEnd = null
+      paused = false
+      lastDraw = -Infinity
+      if (wasScrolled) notifyScrollState()
+      redraw()
+    },
+    isScrolledBack() {
+      return viewEnd !== null
+    },
     hitTestTurn(x, y) {
       for (let i = turnHitBoxes.length - 1; i >= 0; i--) {
         const box = turnHitBoxes[i]
@@ -806,16 +910,21 @@ export function createVoiceTimelineCanvas(canvas, callbacks = {}) {
       if (next === paused) return
       paused = next
       if (paused) {
-        frozenAt = performance.now()
-        draw(frozenAt)
+        frozenAt = effectiveViewEnd(currentNow())
+        draw(frozenAt, currentNow())
       } else {
+        viewEnd = null
+        notifyScrollState()
         lastDraw = -Infinity
       }
     },
     reset() {
       for (const ring of rings.values()) ring.clear()
       vad.clear()
-      frozenAt = performance.now()
+      viewEnd = null
+      lastSampleAt = -Infinity
+      frozenAt = startedAt = performance.now()
+      notifyScrollState()
       redraw()
     },
     dispose() {

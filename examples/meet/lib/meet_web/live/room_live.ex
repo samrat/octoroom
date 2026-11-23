@@ -675,6 +675,15 @@ defmodule MeetWeb.RoomLive do
             Waterfall ↗
           </a>
           <button
+            id="voice-timeline-live"
+            type="button"
+            data-timeline-live
+            class="btn btn-warning btn-soft btn-xs hidden font-mono text-[10px] font-medium"
+            title="Jump back to live edge"
+          >
+            Live ⇥
+          </button>
+          <button
             id="voice-timeline-pause"
             type="button"
             data-timeline-pause

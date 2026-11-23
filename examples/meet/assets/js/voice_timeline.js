@@ -91,6 +91,7 @@ export const VoiceTimeline = {
     this.bodyEl = this.el.querySelector("#voice-timeline-body")
     this.pauseBtn = this.el.querySelector("[data-timeline-pause]")
     this.pauseLabel = this.el.querySelector("[data-timeline-pause-label]")
+    this.liveBtn = this.el.querySelector("[data-timeline-live]")
     this.windowBtns = [...this.el.querySelectorAll("[data-timeline-window]")]
 
     this.state = createTimelineState()
@@ -99,6 +100,8 @@ export const VoiceTimeline = {
     this.audibleLanes = new Set()
     this.paused = false
     this.windowMs = DEFAULT_WINDOW_MS
+    this.dragging = false
+    this.dragLastX = 0
 
     this.renderer = createVoiceTimelineCanvas(this.canvas, {
       onSpeechEvent: (event) => this.dispatch(event),
@@ -106,6 +109,9 @@ export const VoiceTimeline = {
         if (speaking) this.audibleLanes.add(laneId)
         else this.audibleLanes.delete(laneId)
         this.syncLaneStatus()
+      },
+      onScrollChange: (scrolledBack) => {
+        this.liveBtn?.classList.toggle("hidden", !scrolledBack)
       },
     })
 
@@ -125,6 +131,13 @@ export const VoiceTimeline = {
     }
     this.pauseBtn?.addEventListener("click", this.onPauseClick)
 
+    this.onLiveClick = () => {
+      this.paused = false
+      this.renderer.jumpToLive()
+      this.updatePauseUi()
+    }
+    this.liveBtn?.addEventListener("click", this.onLiveClick)
+
     this.onWindowClick = (event) => {
       const btn = event.currentTarget
       const seconds = Number(btn.dataset.timelineWindow)
@@ -138,14 +151,46 @@ export const VoiceTimeline = {
     }
     this.updateWindowUi()
 
+    // Wheel scroll (trackpad horizontal or mouse vertical) scrubs through history.
+    this.onWheel = (event) => {
+      const delta = Math.abs(event.deltaX) >= Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+      if (delta === 0) return
+      event.preventDefault()
+      this.hidePopover()
+      this.renderer.scrollByPixels(delta)
+    }
+    this.canvas.addEventListener("wheel", this.onWheel, {passive: false})
+
+    // Click-and-drag pan on the timeline canvas.
+    this.onPointerDown = (event) => {
+      if (event.button !== 0) return
+      this.dragging = true
+      this.dragLastX = event.clientX
+      this.canvas.setPointerCapture?.(event.pointerId)
+      this.canvas.style.cursor = "grabbing"
+      this.hidePopover()
+    }
+    this.onPointerUp = (event) => {
+      if (!this.dragging) return
+      this.dragging = false
+      this.canvas.releasePointerCapture?.(event.pointerId)
+      this.canvas.style.cursor = "grab"
+    }
+
     // Option B-style on-demand waterfall popover when hovering an assistant reply.
     this.onPointerMove = (event) => {
+      if (this.dragging) {
+        const dx = event.clientX - this.dragLastX
+        this.dragLastX = event.clientX
+        this.renderer.scrollByPixels(-dx)
+        return
+      }
       const rect = this.canvas.getBoundingClientRect()
       const cx = event.clientX - rect.left
       const cy = event.clientY - rect.top
       const hit = this.renderer.hitTestTurn(cx, cy)
       this.renderer.setHoveredTurn(hit ? hit.turn.id : null)
-      this.canvas.style.cursor = hit ? "pointer" : ""
+      this.canvas.style.cursor = hit ? "pointer" : "grab"
       if (!hit) {
         this.hidePopover()
         return
@@ -153,10 +198,14 @@ export const VoiceTimeline = {
       this.showPopover(hit, event.clientX)
     }
     this.onPointerLeave = () => {
+      if (this.dragging) return
       this.renderer.setHoveredTurn(null)
       this.canvas.style.cursor = ""
       this.hidePopover()
     }
+    this.canvas.addEventListener("pointerdown", this.onPointerDown)
+    this.canvas.addEventListener("pointerup", this.onPointerUp)
+    this.canvas.addEventListener("pointercancel", this.onPointerUp)
     this.canvas.addEventListener("pointermove", this.onPointerMove)
     this.canvas.addEventListener("pointerleave", this.onPointerLeave)
 
@@ -514,9 +563,14 @@ export const VoiceTimeline = {
     window.removeEventListener("meet:call-state", this.onCallState)
     window.removeEventListener("pointerdown", this.onGesture)
     this.pauseBtn?.removeEventListener("click", this.onPauseClick)
+    this.liveBtn?.removeEventListener("click", this.onLiveClick)
     for (const btn of this.windowBtns) {
       btn.removeEventListener("click", this.onWindowClick)
     }
+    this.canvas?.removeEventListener("wheel", this.onWheel)
+    this.canvas?.removeEventListener("pointerdown", this.onPointerDown)
+    this.canvas?.removeEventListener("pointerup", this.onPointerUp)
+    this.canvas?.removeEventListener("pointercancel", this.onPointerUp)
     this.canvas?.removeEventListener("pointermove", this.onPointerMove)
     this.canvas?.removeEventListener("pointerleave", this.onPointerLeave)
     this.themeObserver?.disconnect()

@@ -6,17 +6,17 @@
 // - Assistant processing phases (`thinking` and `waiting` floor holds)
 // - Active and completed speaker overlaps / barge-in cuts
 
-export const HISTORY_MS = 40_000
+export const HISTORY_MS = 300_000
 export const DEFAULT_WINDOW_MS = 15_000
 export const BACKCHANNEL_MAX_MS = 700
 export const HANDOFF_MAX_MS = 15_000
 
 /**
- * Circular buffer of `{t, v}` audio envelope samples (>34s even at 120Hz).
+ * Circular buffer of `{t, v}` audio envelope samples (~5 min at ~33Hz).
  * Uses typed arrays so per-frame sampling allocates zero objects.
  */
 export class SampleRing {
-  constructor(capacity = 4096) {
+  constructor(capacity = 10_000) {
     this.capacity = capacity
     this.times = new Float64Array(capacity)
     this.values = new Float32Array(capacity)
