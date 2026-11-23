@@ -100,7 +100,7 @@ defmodule Octoroom.Agent.TTS.OpenAI do
 
   defp split_odd(audio) do
     size = byte_size(audio) - 1
-    <<whole::binary-size(size), odd::binary>> = audio
+    <<whole::binary-size(^size), odd::binary>> = audio
     {whole, odd}
   end
 

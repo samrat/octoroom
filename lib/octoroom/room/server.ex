@@ -2479,8 +2479,6 @@ defmodule Octoroom.Room.Server do
     end
   end
 
-  defp prepare_session(state, _p), do: state
-
   defp track_infos(state, p, names) do
     for name <- Enum.sort(names) do
       sub = p.subs[name]

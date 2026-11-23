@@ -17,7 +17,10 @@ defmodule Octoroom.Agent.Pipeline.Host do
   @doc "Runs a task, timer or kill command. Returns `:unhandled` for any other command."
   def execute(%__MODULE__{} = host, {:start_task, id, fun}) do
     reply_to = Process.alias()
-    emit = fn message -> send(reply_to, {:octoroom_agent_task, id, message}) && :ok end
+    emit = fn message ->
+      send(reply_to, {:octoroom_agent_task, id, message})
+      :ok
+    end
 
     {pid, monitor} =
       spawn_monitor(fn ->

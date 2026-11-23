@@ -320,7 +320,6 @@ defmodule Octoroom.Agent.TTS.TinyVoca.Dizione.Homographs do
   defp alpha?(nil), do: false
   defp alpha?(ch), do: Regex.match?(~r/^\p{L}$/u, ch)
 
-  defp digit?(nil), do: false
   defp digit?(ch), do: Regex.match?(~r/^\d$/, ch)
 
   defp upper?(nil), do: false

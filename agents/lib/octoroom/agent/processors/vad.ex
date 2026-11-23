@@ -14,8 +14,6 @@ defmodule Octoroom.Agent.Processors.VAD do
 
   use Octoroom.Agent.Processor
 
-  require Logger
-
   alias Octoroom.Agent.Frames
   alias Octoroom.Agent.VAD
 

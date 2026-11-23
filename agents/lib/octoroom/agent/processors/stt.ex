@@ -239,7 +239,7 @@ defmodule Octoroom.Agent.Processors.STT do
   defp split(audio, size) when byte_size(audio) < size, do: {[], audio}
 
   defp split(audio, size) do
-    <<chunk::binary-size(size), rest::binary>> = audio
+    <<chunk::binary-size(^size), rest::binary>> = audio
     {chunks, remainder} = split(rest, size)
     {[chunk | chunks], remainder}
   end

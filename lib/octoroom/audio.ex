@@ -30,13 +30,13 @@ defmodule Octoroom.Audio do
     factor = div(@room_rate, rate)
     group = factor * 4
     size = byte_size(pcm) - rem(byte_size(pcm), group)
-    <<whole::binary-size(size), rest::binary>> = pcm
+    <<whole::binary-size(^size), rest::binary>> = pcm
 
     out =
       if factor == 1 and channels == 2 do
         whole
       else
-        for <<chunk::binary-size(group) <- whole>>, into: <<>> do
+        for <<chunk::binary-size(^group) <- whole>>, into: <<>> do
           {l, r} = sum_stereo(chunk, 0, 0)
 
           case channels do

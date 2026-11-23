@@ -111,7 +111,7 @@ defmodule Octoroom.Agent.TTS.TinyVoca.G2P do
           {len, body}
       end
 
-    <<header::binary-size(header_len), raw::binary>> = data
+    <<header::binary-size(^header_len), raw::binary>> = data
     shape = parse_npy_shape!(header)
     %{shape: shape, raw: raw}
   end
@@ -249,7 +249,7 @@ defmodule Octoroom.Agent.TTS.TinyVoca.G2P do
   defp reorder_gates(bin, hidden, cols) do
     chunk_bytes = hidden * cols * 4
 
-    <<r::binary-size(chunk_bytes), z::binary-size(chunk_bytes), n::binary-size(chunk_bytes)>> =
+    <<r::binary-size(^chunk_bytes), z::binary-size(^chunk_bytes), n::binary-size(^chunk_bytes)>> =
       bin
 
     z <> r <> n

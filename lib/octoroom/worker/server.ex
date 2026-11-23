@@ -12,8 +12,6 @@ defmodule Octoroom.Worker.Server do
 
   use GenServer, restart: :temporary
 
-  require Logger
-
   alias Octoroom.{Audio, Outlet, Store}
   alias Octoroom.Worker.Context
 

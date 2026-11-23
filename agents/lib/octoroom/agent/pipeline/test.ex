@@ -197,7 +197,11 @@ defmodule Octoroom.Agent.Pipeline.Test do
 
     result =
       try do
-        {:done, fun.(fn message -> send(parent, {ref, message}) && :ok end)}
+        {:done,
+         fun.(fn message ->
+           send(parent, {ref, message})
+           :ok
+         end)}
       rescue
         error -> {:failed, error}
       catch

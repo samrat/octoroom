@@ -46,7 +46,7 @@ defmodule Octoroom.Agent.Audio.Mixer do
       Enum.reduce(mixer.inputs, {[], mixer.inputs}, fn
         {input, %{primed?: true, buffer: buffer}}, {chunks, inputs} ->
           size = min(byte_size(buffer), mixer.chunk)
-          <<chunk::binary-size(size), rest::binary>> = buffer
+          <<chunk::binary-size(^size), rest::binary>> = buffer
           chunk = chunk <> :binary.copy(<<0>>, mixer.chunk - size)
           state = %{buffer: rest, primed?: rest != <<>>}
           {[chunk | chunks], Map.put(inputs, input, state)}
