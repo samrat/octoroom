@@ -9,7 +9,7 @@
   "coerce": {:hex, :coerce, "1.0.2", "5ef791040c92baaa5dd344887563faaeac6e6742573a167493294f8af3672bbe", [:mix], [], "hexpm", "0b3451c729571234fdac478636c298e71d1f2ce1243abed5fa43fa3181b980eb"},
   "complex": {:hex, :complex, "0.7.0", "695632ef9487517aa5d57edd1697801079d622414cb2e1a7cf538b1f9a50f205", [:mix], [], "hexpm", "0ee39c0803129f546e7f3f640da8f021c9e659402bf59da6f7f2c4848f068f8d"},
   "crc": {:hex, :crc, "0.11.0", "179cd2cb8d5f35d8b7d285eb12541da4680eefba253a5b97d4a949f7a30b56b4", [:mix, :rebar3], [], "hexpm", "b9e37d3e54c2d828611ad83dc2e0ea448c37cdb60a8b481355f9f68d69c9c3fc"},
-  "decimal": {:hex, :decimal, "2.4.1", "6c0fbede12fb122ba685e9ab41c6a40c129e322b3aa192f9e072e61f3a6ffaf2", [:mix], [], "hexpm", "7e618897933a8455f19a727d7c5e50a2c071a544b700e5e724298ecb4340187f"},
+  "decimal": {:hex, :decimal, "3.2.0", "f1235f05d841a211fda78a08fdb9777f2ff51a71f18455233fae186ff76187c6", [:mix], [], "hexpm", "190bca80580ce61aa69bb0eacadd7677710205c770225c2c2c07e32a5c31b234"},
   "dns_cluster": {:hex, :dns_cluster, "0.2.0", "aa8eb46e3bd0326bd67b84790c561733b25c5ba2fe3c7e36f28e88f384ebcb33", [:mix], [], "hexpm", "ba6f1893411c69c01b9e8e8f772062535a4cf70f3f35bcc964a324078d8c8240"},
   "dotenvy": {:hex, :dotenvy, "1.2.1", "43b28d17c996d70ac09f6a6dfd2245378b346ed7290c36452b46cdca77cd96bc", [:mix], [], "hexpm", "20cf780119be89a7cae7808543ebc8b7e56f0993b6aa058260fab686afe9073d"},
   "elixir_make": {:hex, :elixir_make, "0.10.1", "f5a44ab6b48421de1c4fd33c147e22cd2f82fd86e8a9a4d24809d466cad63c5e", [:mix], [], "hexpm", "ce1eaa234bc87f0279718e793fd6f8ad35b4e8ee8d412329e3879eee8d40adba"},

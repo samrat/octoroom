@@ -62,7 +62,9 @@ defmodule Hello.MixProject do
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
       {:octoroom, path: "../.."},
-      {:octoroom_agents, path: "../../agents"}
+      {:octoroom_agents, path: "../../agents"},
+      # ratio 4.0.1 caps its optional decimal dep at ~> 2.0; override to patched 3.2+.
+      {:decimal, "~> 3.2", override: true}
     ]
   end
 
