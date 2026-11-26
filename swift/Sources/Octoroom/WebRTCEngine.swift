@@ -63,6 +63,18 @@ public final class WebRTCEngine: MediaEngine {
         let session = RTCAudioSession.sharedInstance()
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
+        let mode: AVAudioSession.Mode = enabled ? .videoChat : .voiceChat
+        let config = RTCAudioSessionConfiguration.webRTC()
+        var options = config.categoryOptions
+        if enabled {
+          options.insert(.defaultToSpeaker)
+        } else {
+          options.remove(.defaultToSpeaker)
+        }
+        config.mode = mode.rawValue
+        config.categoryOptions = options
+        RTCAudioSessionConfiguration.setWebRTC(config)
+        try session.setCategory(.playAndRecord, mode: mode, options: options)
         try session.overrideOutputAudioPort(enabled ? .speaker : .none)
       #endif
     }
