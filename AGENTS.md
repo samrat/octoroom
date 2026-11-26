@@ -20,6 +20,9 @@ native Apple clients:
   `Octoroom`, `OctoroomAgents`).
 - `examples/` — standalone Phoenix and iOS apps (`call`, `agent`, `meet`,
   `vision`, `ios`).
+- `website/` — public marketing site and documentation built with Astro and
+  Starlight (`src/pages/index.astro` for `/`, `src/content/docs/docs/` for
+  `/docs/...`).
 
 ## Common Commands
 
@@ -59,6 +62,10 @@ against `..` instead of Hex:
 - `docs/` holds internal development and operational guides (such as
   `docs/releasing.md`) and is not packaged into Hex tarballs. Do not link to
   `docs/` from packaged READMEs or `@moduledoc`s.
+- `website/` holds the public Astro + Starlight site and guides. Update
+  relevant pages in `website/src/content/docs/docs/` when changing public APIs,
+  and run `npm run build` in `website/` to verify. Avoid committing large binary
+  media (videos, large PNGs) to `website/` so SwiftPM clones stay small.
 
 ## Release Hygiene
 
