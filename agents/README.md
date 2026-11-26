@@ -57,9 +57,7 @@ Tool handlers get `speaker`, the participant who asked. From outside the
 room, `Octoroom.Agent.say/3`, `prompt/3` and `interrupt/2`. The history
 holds what people heard: an interrupted reply is cut where its audio
 stopped, using the outlet's flush report (see
-`Octoroom.Agent.Processors.AssistantCollector`). Still to come in phase 2:
-the outlet's `:drained` message, the history store, and the receptionist
-example.
+`Octoroom.Agent.Processors.AssistantCollector`).
 
 ### Gemini Live, OpenAI Live, and Nuance Live (video avatars)
 
@@ -69,7 +67,7 @@ instead of STT, an LLM and TTS:
 
 ```elixir
 def pipeline(_ctx),
-  do: Octoroom.Agent.Pipeline.Spec.gemini_live(model: "gemini-3.1-flash-live-preview", voice: "Puck")
+  do: Octoroom.Agent.Pipeline.Spec.gemini_live(model: "gemini-3.8-live", voice: "Puck")
 ```
 
 ```elixir

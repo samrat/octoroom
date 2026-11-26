@@ -1,0 +1,65 @@
+---
+title: Architecture
+description: How Octoroom splits media transport (Cloudflare Realtime SFU) from room state and policies (Phoenix).
+---
+
+Octoroom separates real-time media transport from application logic:
+
+- **Cloudflare Realtime SFU** acts as a commodity global WebRTC media pipe.
+- **Your Phoenix application** owns room membership, authentication, routing policies, server-side workers, and AI agent processes.
+
+## Why this architecture
+
+### Outbound-only WebRTC—no media infrastructure to operate
+
+Your Phoenix server needs **no public media endpoint, no open inbound UDP ports, and no TURN server**. Every browser, native Swift client, and server-side Elixir worker opens an outbound WebRTC peer connection to Cloudflare Realtime SFU.
+
+Cloudflare bills egress only ($0.05/GB after 1,000 GB/month free) with no per-minute SFU or participant fees—roughly 27,000 hours of 1-on-1 audio-only voice agent calls fit in the free tier.
+
+### App-owned multi-party routing
+
+Your room module's pure callbacks (`workers/1` and `subscriptions/2`) run after every room state change. Octoroom's policy reconciler diffs the desired routing against active Cloudflare sessions and executes the exact track pulls, closes, and gain updates needed.
+
+Because routing lives in your Phoenix app:
+- Tools and agents run in normal BEAM processes alongside Ecto, Phoenix PubSub, and LiveView.
+- Permissions, whisper tracks, per-track gain, and dynamic worker lifecycles are expressed as plain Elixir functions.
+
+### Survives server restarts and deploys
+
+When a client connects, the channel issues a signed `resume_token` (encrypted with your endpoint's `secret_key_base`, valid for `config :octoroom, resume_max_age:`, default 600s).
+
+If your Phoenix node restarts or deploys mid-call:
+1. Clients' WebRTC peer connections to Cloudflare stay up—audio and video keep flowing.
+2. When the Phoenix socket reconnects, the client rejoins with its `resume_token`.
+3. The room adopts the participant's existing Cloudflare session with **no WebRTC renegotiation**.
+4. Server-side workers restore checkpointed state (`save:` -> `ctx.saved`), restart with backoff on crashes, and keep output tracks published while restarting.
+
+### Accurate barge-in accounting & observability
+
+When a user interrupts an AI agent, `flush:` drops queued unplayed audio from the paced Opus outlet and reports the exact `dropped_ms` back to the worker. Agents use this to trim conversation history so the LLM only remembers what listeners actually heard.
+
+Structured `:telemetry` spans drive Phoenix LiveDashboard waterfalls and the browser Voice Timeline.
+
+### 100% offline test suites
+
+The Elixir, `octoroom_agents`, browser JS, and Swift test suites all run against an in-memory fake Cloudflare SFU and fake speech/LLM providers with zero network access.
+
+## How Octoroom compares
+
+| Alternative | How Octoroom differs |
+| --- | --- |
+| **LiveKit / Daily** | Room state, auth, and routing stay in your Phoenix app while Cloudflare Realtime SFU acts as a commodity egress-billed media pipe—no SFU cluster to operate and no per-minute participant fees. Tradeoff: media depends on Cloudflare's hosted SFU, you host your own Phoenix server, and SIP/managed video egress aren't built in yet. |
+| **Pipecat / LiveKit Agents** | Agents run as BEAM processes inside your Phoenix app (calling Ecto, PubSub, and LiveView directly) instead of a separate Python worker service. Vision uses lightweight client-captured frames (`sees:`) for VLM context, not high-FPS server-side CV pipelines. |
+| **Membrane / Fishjam** | Offloads SFU fan-out to Cloudflare so you write room policies and agents instead of operating media-server pipelines. |
+
+## Current status (`0.1.0`)
+
+**Working today:**
+- Browser (`octoroom.mjs`) and native Apple (`swift/`) rooms
+- Server-side routing policies, workers, and deploy/restart survival
+- Cascaded and speech-to-speech voice/vision agents with local ONNX VAD, turn detection, and TTS
+
+**Not built yet:**
+- Multi-node room clustering
+- SIP / PSTN telephony
+- Managed video recording / egress (custom per-track PCM audio recording workers work today, as shown in `examples/call`)

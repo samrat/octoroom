@@ -1,0 +1,35 @@
+---
+title: Examples
+description: Five standalone Phoenix and iOS apps demonstrating Octoroom capabilities.
+---
+
+The repository includes five runnable apps under [`examples/`](https://github.com/samrat/octoroom/tree/main/examples).
+
+Make sure you have installed `libsrtp` first (see [Getting Started](/docs/getting-started/)).
+
+## Example apps
+
+1. **[`examples/call`](https://github.com/samrat/octoroom/tree/main/examples/call)** *(zero accounts or keys needed)*
+   LiveView group video call with echo, metronome, and recording workers. Runs against `Octoroom.Cloudflare.Local` by default on localhost, or against real Cloudflare Realtime SFU when credentials are set.
+
+2. **[`examples/vision`](https://github.com/samrat/octoroom/tree/main/examples/vision)** *(Cloudflare + `GOOGLE_API_KEY` in Gemini Live mode)*
+   Talk to an agent that sees your camera and shared screen, switching between Cascaded (`TinyVoca` local TTS) and Gemini Live mid-call.
+
+3. **[`examples/agent`](https://github.com/samrat/octoroom/tree/main/examples/agent)**
+   1-on-1 voice agent that times each turn end-to-end as heard in the browser, plus a deterministic scripted booking agent (`Hello.Booking`).
+
+4. **[`examples/meet`](https://github.com/samrat/octoroom/tree/main/examples/meet)**
+   Group video call with multiple AI assistants, decision-model routing, and the live Voice Timeline latency waterfall.
+
+5. **[`examples/ios`](https://github.com/samrat/octoroom/tree/main/examples/ios)**
+   Native iOS SwiftUI app joining the exact same Phoenix rooms and interacting with the same AI agents.
+
+## Running the test suites
+
+All test suites run completely offline with fake Cloudflare and fake speech/LLM providers:
+
+```sh
+bin/test            # Elixir, agents, browser client (Node 22+), and Swift client
+bin/test all        # also builds the iOS example app (needs xcodegen)
+bin/test swift js   # run a subset of suites
+```

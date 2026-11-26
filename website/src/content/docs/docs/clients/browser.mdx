@@ -1,0 +1,83 @@
+---
+title: Browser Client (JS)
+description: Connect browsers to Octoroom rooms and AI agents with zero-npm ES modules.
+---
+
+Octoroom ships zero-npm browser ES modules in `priv/static/`:
+
+- `priv/static/octoroom.mjs` — Core `RoomClient` for Phoenix Channels + WebRTC media.
+- `agents/priv/static/octoroom_agents.mjs` — `agents(room)` helper for AI agent presence, transcripts, and text messages.
+
+## Joining a room
+
+```js
+import { RoomClient } from "octoroom";
+
+const room = new RoomClient({
+  socket, // connected Phoenix Socket
+  topic: `room:${roomId}`,
+  params: { name: "Ada" },
+  video: true, // optional: also publish camera on join
+});
+
+room.on("participants", (list) => renderParticipants(list));
+room.on("tracks", (tracks) => renderVideos(tracks));
+
+await room.join(); // requests mic (and camera if video: true), publishes, and plays remote audio
+```
+
+Remote audio plays automatically at the gain configured by the room server. For remote video, attach each video track's `stream` to a `<video>` element's `srcObject`:
+
+```js
+function renderVideos(tracks) {
+  for (const track of tracks) {
+    if (track.kind === "video") {
+      // track.source is "camera", "screen", or null (for a worker video output)
+      // track.participant_id identifies the sender
+      videoElement.srcObject = track.stream;
+    }
+  }
+}
+```
+
+## Media controls
+
+```js
+room.setMuted(true);          // mute mic
+await room.startCamera();     // publish camera after joining
+await room.shareScreen();     // publish screen share
+room.mute("camera", true);    // sends black frames without WebRTC renegotiation
+await room.stop("camera");    // unpublish camera
+await room.leave();
+```
+
+Whether a participant's camera is muted is reflected in `participants` via `participant.tracks.camera.muted`. Call `await room.levels()` to poll WebRTC audio levels (`{ local, remote, workers }`) for speaking indicators on participants and worker audio tracks.
+
+## Workers & AI agents
+
+Subscribe to worker state and events directly on `RoomClient`, or wrap it with `agents(room)` from `octoroom_agents.mjs`:
+
+```js
+import { agents } from "octoroom_agents";
+
+const ai = agents(room);
+
+ai.on("agents", (list) => {
+  // [{ id, name, description, state }] — listening, thinking, speaking, waiting
+  renderAgentList(list);
+});
+
+ai.on("transcript", ({ agent, items }) => {
+  renderTranscript(agent, items);
+});
+
+// Typed messages are always answered regardless of respond: / gate:
+await ai.say("assistant", "add Acme to the sheet");
+```
+
+Low-level worker messaging is also available via `await room.send("assistant", { text: "hi" })`, which rejects with `"not_allowed"`, `"no_worker"`, `"too_large"`, or `"rate_limited"` if refused by the server.
+
+## Reconnection & join timings
+
+- **Automatic resume:** When the Phoenix socket reconnects (including after a server restart), `RoomClient` rejoins with its `resume_token` so the existing WebRTC peer connection stays up. Listen for `"reconnecting"` and `"reconnected"` (`{ resumed }`).
+- **Join timings:** Listen for `"timings"` to inspect `join_ms`, `media_ms`, `ice_ms`, `publish_ms`, and `connect_ms` (these are also reported to the server as `Octoroom.Telemetry`).

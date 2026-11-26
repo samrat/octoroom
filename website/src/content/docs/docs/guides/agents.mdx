@@ -1,0 +1,139 @@
+---
+title: AI Voice & Vision Agents
+description: Build cascaded, speech-to-speech, and video avatar AI participants with octoroom_agents.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+`octoroom_agents` turns AI pipelines into first-class `Octoroom.Worker` participants. An agent hears the tracks your room policy routes to it, optionally sees camera/screen frames, calls tools directly inside your Phoenix app, and speaks back on its own track.
+
+## Defining an agent
+
+```elixir
+defmodule MyApp.Assistant do
+  use Octoroom.Agent
+  alias Octoroom.Agent.Pipeline.Spec
+
+  @impl true
+  def instructions(ctx),
+    do: "You are a voice assistant on a call for #{ctx.args.workspace}. Be brief."
+
+  @impl true
+  def tools(_ctx), do: [MyApp.Tools.set_theme()]
+
+  @impl true
+  def pipeline(_ctx) do
+    Spec.default(
+      stt: "soniox:stt-rt-v6",
+      llm: "google:gemini-3.5-flash",
+      tts: "tiny_voca:tiny-voca"
+    )
+  end
+end
+```
+
+Add the agent to your room in `workers/1` using `Octoroom.Agent.agent/3`:
+
+```elixir
+import Octoroom.Agent, only: [agent: 3]
+
+def workers(room) do
+  [
+    agent("assistant", MyApp.Assistant,
+      name: "Assistant",
+      hears: Enum.map(room.participants, &mic/1),
+      sees: Enum.flat_map(room.participants, &[camera(&1), screen(&1)]),
+      respond: :addressed,
+      args: %{workspace: room.assigns.workspace}
+    )
+  ]
+end
+```
+
+Because tools execute in the agent's Elixir process, tool handlers receive `speaker` (the participant who asked) and can directly broadcast to LiveViews over PubSub, query Ecto, or enforce your app's authorization rules.
+
+## Pipeline modes
+
+<Tabs>
+  <TabItem label="Cascaded (VAD → STT → LLM → TTS)">
+    Every speaker the agent hears gets their own front end (`Silero` VAD → STT → turn detection), feeding into a shared back end (`context → LLM → tools → chunker → TTS → collector`).
+
+    ```elixir
+    Spec.default(
+      stt: "soniox:stt-rt-v6",
+      llm: [provider: :google, model: "gemini-3.5-flash", reasoning_effort: :minimal],
+      tts: "inworld:inworld-tts-2",
+      # Optional: omit "Name: " prefixes on single-speaker or 1-on-1 calls (:auto | false)
+      context: [speaker_labels: :auto]
+    )
+    ```
+
+    Customize individual stages with `Spec.replace/3` or build a fully custom deterministic pipeline (see `examples/agent`'s `Hello.Booking`).
+  </TabItem>
+  <TabItem label="Gemini Live">
+    Speech-to-speech (and vision) via Google's Gemini Live API (`GOOGLE_API_KEY`):
+
+    ```elixir
+    def pipeline(_ctx) do
+      Spec.gemini_live(model: "gemini-3.8-live", voice: "Puck")
+    end
+    ```
+  </TabItem>
+  <TabItem label="OpenAI Live">
+    Speech-to-speech over WebRTC + sideband WebSocket (`OPENAI_API_KEY`), with optional tool delegation:
+
+    ```elixir
+    def pipeline(_ctx) do
+      Spec.openai_live(
+        model: "gpt-live-1.1",
+        voice: "marin",
+        delegation: [model: "gpt-5.4-mini"]
+      )
+    end
+    ```
+  </TabItem>
+  <TabItem label="Nuance Live (Video Avatars)">
+    Audiovisual avatar agent (`NUANCE_API_KEY`). Pass `video: true` to `agent/3` so the worker publishes an `"assistant/video"` output track:
+
+    ```elixir
+    # In the agent module
+    def pipeline(_ctx), do: Spec.nuance_live(persona: "sam")
+
+    # In the room's workers/1
+    agent("assistant", MyApp.Assistant, hears: [mic(p)], video: true)
+    ```
+
+    <Aside type="note">
+      Nuance Live uses WebRTC DataChannels. Add `{:ex_sctp, "~> 0.1.3"}` (requires Rust) to your
+      `mix.exs` and run `mix deps.compile ex_webrtc --force`.
+    </Aside>
+  </TabItem>
+</Tabs>
+
+## Multi-agent rooms & decision gating
+
+Cascaded agents support multi-party turn routing:
+
+- `respond: :addressed` — answers when addressed by name.
+- `gate: :decision` with `decisions: [model: "google:gemini-decision-1"]` — runs a lightweight decision model on each turn; implement `questions/1` and `decide/2` on your agent module for custom routing rules.
+- `agents/2` — mounts several agents in the same room, distinguishing them by name and `description:`.
+
+From outside the room, control any agent programmatically with `Octoroom.Agent.say/3`, `prompt/3`, and `interrupt/2`. To have an agent open the conversation automatically when it joins, implement `initial_say/1` (spoken verbatim via TTS) or `initial_prompt/1` (sent to the LLM to generate an opening turn).
+
+## Built-in speech providers
+
+`Spec.default/1` never picks hidden defaults—you always name the provider and model explicitly.
+
+| Stage | Built-in Providers | Env Var / Notes |
+| --- | --- | --- |
+| **STT** | `soniox`, `assembly_ai`, `reson8` | `SONIOX_API_KEY`, `ASSEMBLY_AI_API_KEY`, `RESON8_API_KEY` |
+| **TTS** | `inworld`, `assembly_ai`, `openai`, `tiny_voca` | `INWORLD_API_KEY`, `ASSEMBLY_AI_API_KEY`, `OPENAI_API_KEY`; **`tiny_voca`** runs locally on ONNX Runtime (`"tiny-voca"`, voices `"F2"` / `"M2"`, no API key) |
+| **VAD & Turn** | `Silero` VAD, `SmartTurn` (ONNX) | Precompiled `onnxruntime` NIFs; pre-fetch optional weights with `mix octoroom.models.download` |
+
+Register custom STT or TTS modules implementing `Octoroom.Agent.STT` or `Octoroom.Agent.TTS`:
+
+```elixir
+config :octoroom_agents,
+  stt_providers: [acme: MyApp.AcmeSTT],
+  tts_providers: [acme: MyApp.AcmeTTS]
+```

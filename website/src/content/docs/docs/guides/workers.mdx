@@ -1,0 +1,73 @@
+---
+title: Server-Side Workers
+description: Write Elixir processes that receive raw PCM audio from a room and publish audio or data back with Octoroom.Worker.
+---
+
+An `Octoroom.Worker` is a server-side participant: an Elixir process that hears input tracks and publishes output tracks as raw PCM audio—with WebRTC, Opus encoding/decoding, and Cloudflare session management handled for you.
+
+## Example: delayed echo worker
+
+```elixir
+defmodule MyApp.DelayEcho do
+  use Octoroom.Worker, audio: [rate: 16_000, channels: 1]
+
+  @impl true
+  def init(_args, _ctx), do: {:ok, :queue.new()}
+
+  @impl true
+  def handle_audio(_input, pcm, q) do
+    q = :queue.in(pcm, q)
+
+    if :queue.len(q) > 100 do
+      {{:value, out}, q} = :queue.out(q)
+      {:ok, q, play: {:default, out}}
+    else
+      {:ok, q}
+    end
+  end
+end
+```
+
+Start the worker from your room's `workers/1` callback using `worker/3`:
+
+```elixir
+def workers(room) do
+  [
+    worker("echo", MyApp.DelayEcho,
+      inputs: Enum.map(room.participants, &mic/1),
+      outputs: ["echo/audio"]
+    )
+  ]
+end
+```
+
+## Audio formats
+
+The `audio:` option configures the signed 16-bit little-endian (`s16le`) PCM format the worker receives (sample `rate` dividing 48 kHz, `channels` 1 or 2; defaults to 48 kHz stereo).
+
+If your worker hears at one sample rate and synthesizes speech at another, specify a separate `output:` format:
+
+```elixir
+use Octoroom.Worker, audio: [rate: 16_000, channels: 1, output: [rate: 24_000]]
+```
+
+## Return actions
+
+Worker callbacks return `{:ok, state}` or `{:ok, state, actions}`, where `actions` is a keyword list:
+
+- **`play: {output, pcm}`** — Queue PCM audio onto an output track (`:default` targets the first output). Outlets pace playback to real time, so you can push synthesized audio faster than real time.
+- **`flush: output`** — Drop queued unplayed audio for barge-in. The worker receives `handle_info({:octoroom, :flushed, output, dropped_ms}, state)` with the exact milliseconds dropped.
+- **`notify: {output, type, data}`** — Push a JSON-encodable `worker_event` to participants subscribed to `output` (or `{output, type, data, participant_id}` to target a single participant).
+- **`presence: %{state: string | nil, attributes: map}`** — Update the worker's visible state (e.g. `"listening"`, `"speaking"`) and metadata for subscribed clients.
+- **`emit: event`** — Broadcast `{:worker_event, worker_id, event}` to `scope: :room` subscribers only (never sent to clients).
+- **`save: term`** — Checkpoint state to `Octoroom.Store`. If the worker crashes, changes args, or the node restarts mid-call, the next start receives it in `ctx.saved`.
+
+## Lifecycle messages & crash resilience
+
+`handle_info/2` also notifies workers of topology changes without restarting them:
+
+- `{:octoroom, :inputs, names}`, `{:octoroom, :outputs, names}`, `{:octoroom, :data, names}` when `workers/1` updates tracks in place.
+- `{:octoroom, :subscribed, participant_id, output}` and `{:octoroom, :unsubscribed, participant_id, output}` as clients subscribe or unsubscribe.
+- Client messages sent via `room.send(worker_id, payload)` (subject to `Octoroom.Room.message/3` and configurable size/rate limits).
+
+If a worker crashes, the room restarts it with backoff while keeping its Cloudflare output tracks published—listeners hear a brief gap rather than a WebRTC renegotiation.

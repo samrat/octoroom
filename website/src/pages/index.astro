@@ -1,0 +1,1399 @@
+---
+import { Code } from 'astro:components';
+
+const roomCode = `defmodule MyApp.CallRoom do
+  use Octoroom.Room
+  import Octoroom.Agent, only: [agent: 3]
+
+  @impl true
+  def join(%{"name" => name}, _socket), do: {:ok, %{name: name}}
+
+  @impl true
+  def workers(%{participants: []}), do: []
+
+  def workers(room) do
+    [
+      agent("assistant", MyApp.Assistant,
+        name: "Assistant",
+        hears: Enum.map(room.participants, &mic/1),
+        sees: Enum.flat_map(room.participants, &[camera(&1), screen(&1)]),
+        respond: :addressed,
+        args: %{workspace: room.assigns.workspace}
+      )
+    ]
+  end
+end`;
+
+const agentCode = `defmodule MyApp.Assistant do
+  use Octoroom.Agent
+  alias Octoroom.Agent.Pipeline.Spec
+
+  @impl true
+  def instructions(ctx),
+    do: "You are a voice assistant on a call for #{ctx.args.workspace}. Be brief."
+
+  @impl true
+  def tools(_ctx), do: [MyApp.Tools.set_theme()]
+
+  @impl true
+  def pipeline(_ctx) do
+    Spec.default(
+      stt: "soniox:stt-rt-v6",
+      llm: "google:gemini-3.5-flash",
+      tts: "tiny_voca:tiny-voca"
+    )
+    # Or speech-to-speech / audiovisual:
+    # Spec.gemini_live(model: "gemini-3.8-live", voice: "Puck")
+    # Spec.openai_live(model: "gpt-live-1.1", voice: "marin")
+    # Spec.nuance_live(persona: "sam")
+  end
+end`;
+
+const browserCode = `import { RoomClient } from "octoroom";
+import { agents } from "octoroom_agents";
+
+const room = new RoomClient({
+  socket,
+  topic: \`room:\${roomId}\`,
+  params: { name: "Ada" },
+  video: true,
+});
+
+room.on("participants", (list) => renderParticipants(list));
+room.on("tracks", (tracks) => renderVideos(tracks));
+
+const ai = agents(room);
+ai.on("transcript", ({ agent, items }) => renderTranscript(agent, items));
+
+await room.join(); // publishes mic/camera, plays server-subscribed audio`;
+
+const swiftCode = `import Octoroom
+import OctoroomAgents
+import SwiftUI
+
+struct CallView: View {
+  let room: RoomClient     // @Observable
+  let agents: Agents       // @Observable
+
+  var body: some View {
+    ForEach(room.tracks.filter { $0.kind == .video }) { track in
+      VideoView(track)
+    }
+    ForEach(agents.agents) { agent in
+      Text("\\(agent.name): \\(agent.state?.rawValue ?? "")")
+    }
+  }
+}`;
+
+const features = [
+	{
+		title: 'Cloudflare SFU as a commodity pipe',
+		body: 'Outbound UDP only—no SFU cluster to operate, no TURN server, no open inbound ports. Cloudflare bills egress only ($0.05/GB after 1,000 GB/month free).',
+	},
+	{
+		title: 'App-owned multi-party routing',
+		body: 'Pure Elixir callbacks decide who hears and sees whom—per-track gain, whisper tracks, data-only outputs, and dynamic server-side workers.',
+	},
+	{
+		title: 'Survives restarts and deploys',
+		body: 'Signed resume tokens adopt existing Cloudflare sessions with zero WebRTC renegotiation. Workers checkpoint state and restart cleanly.',
+	},
+	{
+		title: 'Cascaded & live AI agents',
+		body: 'Run Silero VAD, SmartTurn, Soniox/AssemblyAI/Reson8 STT, ReqLLM, local TinyVoca ONNX TTS—or swap to Gemini Live, OpenAI Live, or Nuance Live avatars.',
+	},
+	{
+		title: 'Zero-npm JS & native Swift SDK',
+		body: 'Drop-in browser ES modules (octoroom.mjs) plus a native iOS 17+ and macOS 14+ SwiftPM SDK speaking the exact same Phoenix channel protocol.',
+	},
+	{
+		title: 'Accurate barge-in & offline tests',
+		body: 'Paced Opus outlets report exact dropped_ms on interruption so agent history matches what humans heard. Full Elixir, JS, and Swift suites run 100% offline.',
+	},
+];
+
+const examples = [
+	{
+		name: 'examples/call',
+		tag: 'Zero accounts needed',
+		desc: 'LiveView group video call with echo, metronome, and recording workers—runs locally via Octoroom.Cloudflare.Local.',
+		href: 'https://github.com/samrat/octoroom/tree/main/examples/call',
+	},
+	{
+		name: 'examples/vision',
+		tag: 'Camera + Screen',
+		desc: 'Voice + vision agent that sees your camera and shared screen, switching between Cascaded (TinyVoca) and Gemini Live mid-call.',
+		href: 'https://github.com/samrat/octoroom/tree/main/examples/vision',
+	},
+	{
+		name: 'examples/agent',
+		tag: 'Latency & Pipelines',
+		desc: '1-on-1 voice agent timing every turn end-to-end as heard in the browser, plus a deterministic scripted booking agent.',
+		href: 'https://github.com/samrat/octoroom/tree/main/examples/agent',
+	},
+	{
+		name: 'examples/meet',
+		tag: 'Multi-Agent',
+		desc: 'Group video call with multiple AI assistants, decision-model routing, and the live Voice Timeline latency waterfall.',
+		href: 'https://github.com/samrat/octoroom/tree/main/examples/meet',
+	},
+	{
+		name: 'examples/ios',
+		tag: 'SwiftUI',
+		desc: 'Native iOS app joining the exact same Phoenix rooms and speaking to the same AI agents.',
+		href: 'https://github.com/samrat/octoroom/tree/main/examples/ios',
+	},
+];
+---
+
+<!doctype html>
+<html lang="en" data-theme="light">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Octoroom — Build realtime AI voice agents in Elixir</title>
+		<meta
+			name="description"
+			content="Build realtime AI voice and vision agents directly inside your Elixir app, backed by Cloudflare Realtime SFU. Includes octoroom_agents, a zero-npm browser client, and a native Swift SDK."
+		/>
+		<link rel="canonical" href="https://octoroom.dev/" />
+		<meta property="og:type" content="website" />
+		<meta property="og:url" content="https://octoroom.dev/" />
+		<meta property="og:site_name" content="Octoroom" />
+		<meta property="og:title" content="Octoroom — Build realtime AI voice agents in Elixir" />
+		<meta
+			property="og:description"
+			content="Run voice and vision agents directly inside your Elixir app—backed by Cloudflare Realtime SFU with zero media infra to operate."
+		/>
+		<meta property="og:image" content="https://octoroom.dev/og.png" />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta
+			property="og:image:alt"
+			content="Octoroom — Build realtime AI voice agents in Elixir with Cloudflare Realtime SFU"
+		/>
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content="Octoroom — Build realtime AI voice agents in Elixir" />
+		<meta
+			name="twitter:description"
+			content="Run voice and vision agents directly inside your Elixir app—backed by Cloudflare Realtime SFU with zero media infra to operate."
+		/>
+		<meta name="twitter:image" content="https://octoroom.dev/og.png" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<script is:inline>
+			(() => {
+				const stored = localStorage.getItem('starlight-theme');
+				const theme = stored === 'dark' ? 'dark' : 'light';
+				if (stored === null) localStorage.setItem('starlight-theme', 'light');
+				document.documentElement.dataset.theme = theme;
+			})();
+		</script>
+	</head>
+	<body>
+		<header class="nav">
+			<div class="container nav-inner">
+				<a href="/" class="brand">
+					<img src="/favicon.svg" alt="" width="30" height="30" class="brand-mark" />
+					<span>Octoroom</span>
+					<span class="version-pill">v0.1.0</span>
+				</a>
+				<nav class="nav-links" aria-label="Primary">
+					<a href="/docs/">Docs</a>
+					<a href="/docs/guides/agents/">AI Agents</a>
+					<a href="/docs/clients/swift/">Swift SDK</a>
+					<a href="https://hexdocs.pm/octoroom" target="_blank" rel="noopener noreferrer">
+						HexDocs
+					</a>
+					<a
+						href="https://github.com/samrat/octoroom"
+						target="_blank"
+						rel="noopener noreferrer"
+						class="nav-github"
+						aria-label="GitHub"
+					>
+						<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+							<path
+								fill-rule="evenodd"
+								clip-rule="evenodd"
+								d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+							/>
+						</svg>
+						<span>GitHub</span>
+					</a>
+					<button
+						type="button"
+						class="theme-toggle"
+						id="theme-toggle"
+						aria-label="Toggle color theme"
+					>
+						<span class="icon-sun" aria-hidden="true">☀</span>
+						<span class="icon-moon" aria-hidden="true">☾</span>
+					</button>
+				</nav>
+			</div>
+		</header>
+
+		<main>
+			<section class="hero">
+				<div class="container hero-grid">
+					<div class="hero-copy">
+						<p class="eyebrow">Elixir · Phoenix · Cloudflare Realtime SFU</p>
+						<h1>Build realtime AI voice agents in Elixir.</h1>
+						<p class="lead">
+							Run voice and vision agents directly inside your Elixir app—calling Ecto, PubSub,
+							and LiveView tools natively, from 1-on-1 calls to multi-party rooms.
+						</p>
+						<p class="lead lead-secondary">
+							<strong>Zero media infra to operate.</strong> Cloudflare Realtime SFU carries the
+							WebRTC packets—no TURN server, no open inbound ports, and live calls that survive
+							deploys.
+						</p>
+						<div class="cta-row">
+							<a href="/docs/getting-started/" class="btn btn-primary">Get Started →</a>
+							<a href="/docs/architecture/" class="btn btn-secondary">How it works</a>
+							<a
+								href="https://github.com/samrat/octoroom"
+								target="_blank"
+								rel="noopener noreferrer"
+								class="btn btn-ghost"
+							>
+								<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+									<path
+										fill-rule="evenodd"
+										clip-rule="evenodd"
+										d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+									/>
+								</svg>
+								<span>GitHub</span>
+							</a>
+						</div>
+						<div class="install-bar">
+							<span class="install-label">mix.exs</span>
+							<code>&#123;:octoroom, "~&gt; 0.1.0"&#125;, &#123;:octoroom_agents, "~&gt; 0.1.0"&#125;</code>
+						</div>
+					</div>
+
+					<!-- Interactive-on-hover Agent Room Routing Graph -->
+					<div class="graph-card" id="routing-graph">
+						<div class="graph-header">
+							<span class="graph-title"><strong>Agent Room</strong> · CallRoom</span>
+							<span class="graph-hint" id="graph-hint">Hover a peer to inspect tracks</span>
+						</div>
+
+						<svg class="graph-svg" viewBox="0 0 560 296" fill="none" role="img" aria-label="Interactive Octoroom group call routing diagram through Cloudflare Realtime SFU">
+							<defs>
+								<clipPath id="o-ada"><circle cx="24" cy="20" r="13" /></clipPath>
+								<clipPath id="o-sam"><circle cx="24" cy="20" r="13" /></clipPath>
+								<clipPath id="o-ai"><circle cx="24" cy="20" r="13" /></clipPath>
+								<clipPath id="o-rec"><circle cx="24" cy="20" r="13" /></clipPath>
+							</defs>
+
+							<!-- WebRTC routing paths through Center Cloudflare SFU -->
+							<path id="e-ada" d="M160 72 C205 72, 210 122, 224 132" class="edge lit" />
+							<path id="e-sam" d="M160 224 C205 224, 210 174, 224 164" class="edge lit" />
+							<path id="e-ai" d="M400 72 C355 72, 350 122, 336 132" class="edge lit" />
+							<path id="e-rec" d="M400 224 C355 224, 350 174, 336 164" class="edge lit" />
+							<!-- Vision frames (camera -> AI Agent via SFU) -->
+							<path id="e-vision" d="M160 56 C236 16, 324 16, 400 56" class="edge edge-vision" />
+
+							<!-- Center Hub: Cloudflare Realtime SFU -->
+							<g class="hub-node interactive-node" data-peer="sfu" tabindex="0">
+								<rect
+									x="212"
+									y="100"
+									width="136"
+									height="96"
+									rx="20"
+									fill="var(--bg-card)"
+									stroke="var(--wave-primary)"
+									stroke-width="2"
+									class="node-box"
+								/>
+								<path
+									d="M268 121 C268 115.5, 272.5 111, 278 111 C282.5 111, 286.3 114, 287.5 118.2 C288.5 117.8, 289.5 117.5, 290.6 117.5 C294.7 117.5, 298 120.8, 298 124.8 C298 128.8, 294.7 132, 290.6 132 L268.5 132 C264.9 132, 262 129.1, 262 125.6 C262 122.7, 264.1 120.2, 266.9 119.6"
+									fill="#F38020"
+								/>
+								<text x="280" y="152" text-anchor="middle" font-size="12" font-weight="700" fill="var(--text)">
+									Cloudflare SFU
+								</text>
+								<text
+									x="280"
+									y="168"
+									text-anchor="middle"
+									font-family="var(--font-mono)"
+									font-size="9.5"
+									fill="var(--muted)"
+								>
+									WebRTC Media
+								</text>
+								<g transform="translate(261, 176)">
+									<rect x="0" y="0" width="3.5" height="10" rx="1.75" fill="var(--wave-primary)" class="eq-bar" />
+									<rect x="7" y="0" width="3.5" height="10" rx="1.75" fill="#53EAFD" class="eq-bar b2" />
+									<rect x="14" y="0" width="3.5" height="10" rx="1.75" fill="var(--wave-primary)" class="eq-bar b3" />
+									<rect x="21" y="0" width="3.5" height="10" rx="1.75" fill="#53EAFD" class="eq-bar b4" />
+									<rect x="28" y="0" width="3.5" height="10" rx="1.75" fill="var(--wave-primary)" class="eq-bar b2" />
+									<rect x="35" y="0" width="3.5" height="10" rx="1.75" fill="var(--wave-primary)" class="eq-bar" />
+								</g>
+							</g>
+
+							<!-- PEER 1: Ada (Browser) -->
+							<g class="peer-group interactive-node" id="peer-ada" data-peer="ada" tabindex="0" transform="translate(12, 34)">
+								<rect width="148" height="74" rx="14" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" class="node-box" />
+								<g transform="translate(10, 12)">
+									<path d="M15 29 C12 37, 8 42, 3 43" stroke="#193CB8" stroke-width="4" stroke-linecap="round" />
+									<path d="M33 29 C36 37, 40 42, 45 43" stroke="#193CB8" stroke-width="4" stroke-linecap="round" />
+									<path d="M20 31 C19 39, 17 45, 11 47" stroke="#155DFC" stroke-width="4" stroke-linecap="round" />
+									<path d="M28 31 C29 39, 31 45, 37 47" stroke="#155DFC" stroke-width="4" stroke-linecap="round" />
+									<circle cx="24" cy="20" r="13" fill="#193CB8" />
+									<g clip-path="url(#o-ada)"><ellipse cx="22" cy="18.5" rx="12" ry="12.5" fill="#155DFC" /></g>
+									<circle cx="29.5" cy="11.5" r="1.5" fill="#53EAFD" />
+									<circle cx="19" cy="22" r="1.6" fill="#2A2524" />
+									<circle cx="29" cy="22" r="1.6" fill="#2A2524" />
+									<path d="M21.5 25.5 Q24 28 26.5 25.5" stroke="#2A2524" stroke-width="1.5" stroke-linecap="round" />
+								</g>
+								<text x="64" y="29" font-size="12.5" font-weight="700" fill="var(--text)">Ada</text>
+								<text x="64" y="45" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted)">Browser</text>
+								<g transform="translate(64, 53)">
+									<rect x="0" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar" />
+									<rect x="6" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar b2" />
+									<rect x="12" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar b3" />
+									<rect x="18" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar b4" />
+								</g>
+							</g>
+
+							<!-- PEER 2: Sam (iOS / Swift) -->
+							<g class="peer-group interactive-node" id="peer-sam" data-peer="sam" tabindex="0" transform="translate(12, 188)">
+								<rect width="148" height="74" rx="14" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" class="node-box" />
+								<g transform="translate(10, 12)">
+									<path d="M15 29 C12 37, 8 42, 3 43" stroke="#0369A1" stroke-width="4" stroke-linecap="round" />
+									<path d="M33 29 C36 37, 40 42, 45 43" stroke="#0369A1" stroke-width="4" stroke-linecap="round" />
+									<path d="M20 31 C19 39, 17 45, 11 47" stroke="#0EA5E9" stroke-width="4" stroke-linecap="round" />
+									<path d="M28 31 C29 39, 31 45, 37 47" stroke="#0EA5E9" stroke-width="4" stroke-linecap="round" />
+									<circle cx="24" cy="20" r="13" fill="#0369A1" />
+									<g clip-path="url(#o-sam)"><ellipse cx="22" cy="18.5" rx="12" ry="12.5" fill="#0EA5E9" /></g>
+									<circle cx="29.5" cy="11.5" r="1.5" fill="#BAE6FD" />
+									<circle cx="19" cy="22" r="1.6" fill="#2A2524" />
+									<circle cx="29" cy="22" r="1.6" fill="#2A2524" />
+									<path d="M21.5 25.5 Q24 28 26.5 25.5" stroke="#2A2524" stroke-width="1.5" stroke-linecap="round" />
+								</g>
+								<text x="64" y="29" font-size="12.5" font-weight="700" fill="var(--text)">Sam</text>
+								<text x="64" y="45" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted)">iOS · Swift</text>
+								<g transform="translate(64, 53)">
+									<rect x="0" y="0" width="3" height="10" rx="1.5" fill="#0EA5E9" class="eq-bar b3" />
+									<rect x="6" y="0" width="3" height="10" rx="1.5" fill="#0EA5E9" class="eq-bar" />
+									<rect x="12" y="0" width="3" height="10" rx="1.5" fill="#0EA5E9" class="eq-bar b4" />
+									<rect x="18" y="0" width="3" height="10" rx="1.5" fill="#0EA5E9" class="eq-bar b2" />
+								</g>
+							</g>
+
+							<!-- PEER 3: Assistant (AI Agent) -->
+							<g class="peer-group interactive-node" id="peer-ai" data-peer="ai" tabindex="0" transform="translate(400, 34)">
+								<rect width="148" height="74" rx="14" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" class="node-box" />
+								<g transform="translate(10, 12)">
+									<path d="M10 21 C10 10, 16 5, 24 5 C32 5, 38 10, 38 21" stroke="var(--headset)" stroke-width="2.5" stroke-linecap="round" />
+									<path d="M15 29 C12 37, 8 42, 3 43" stroke="#193CB8" stroke-width="4" stroke-linecap="round" />
+									<path d="M33 29 C36 37, 40 42, 45 43" stroke="#193CB8" stroke-width="4" stroke-linecap="round" />
+									<path d="M20 31 C19 39, 17 45, 11 47" stroke="#447DFD" stroke-width="4" stroke-linecap="round" />
+									<path d="M28 31 C29 39, 31 45, 37 47" stroke="#447DFD" stroke-width="4" stroke-linecap="round" />
+									<circle cx="24" cy="20" r="13" fill="#193CB8" />
+									<g clip-path="url(#o-ai)"><ellipse cx="22" cy="18.5" rx="12" ry="12.5" fill="#447DFD" /></g>
+									<rect x="8.5" y="17" width="4.5" height="9" rx="2.2" fill="var(--headset)" />
+									<rect x="35" y="17" width="4.5" height="9" rx="2.2" fill="var(--headset)" />
+									<rect x="9.8" y="19" width="1.8" height="5" rx="0.9" fill="#53EAFD" />
+									<rect x="36.4" y="19" width="1.8" height="5" rx="0.9" fill="#53EAFD" />
+									<circle cx="19" cy="22" r="1.6" fill="#2A2524" />
+									<circle cx="29" cy="22" r="1.6" fill="#2A2524" />
+									<path d="M21.5 25.5 Q24 28 26.5 25.5" stroke="#2A2524" stroke-width="1.5" stroke-linecap="round" />
+								</g>
+								<text x="64" y="29" font-size="12.5" font-weight="700" fill="var(--text)">Assistant</text>
+								<text x="64" y="45" font-family="var(--font-mono)" font-size="9.5" fill="var(--accent-text)">AI Agent</text>
+								<g transform="translate(64, 53)">
+									<rect x="0" y="0" width="3" height="10" rx="1.5" fill="#53EAFD" class="eq-bar b2" />
+									<rect x="6" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar b4" />
+									<rect x="12" y="0" width="3" height="10" rx="1.5" fill="#53EAFD" class="eq-bar" />
+									<rect x="18" y="0" width="3" height="10" rx="1.5" fill="var(--wave-primary)" class="eq-bar b3" />
+								</g>
+							</g>
+
+							<!-- PEER 4: Recorder (Worker) -->
+							<g class="peer-group interactive-node" id="peer-rec" data-peer="rec" tabindex="0" transform="translate(400, 188)">
+								<rect width="148" height="74" rx="14" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" class="node-box" />
+								<g transform="translate(10, 12)">
+									<path d="M15 29 C12 37, 8 42, 3 43" stroke="#4338CA" stroke-width="4" stroke-linecap="round" />
+									<path d="M33 29 C36 37, 40 42, 45 43" stroke="#4338CA" stroke-width="4" stroke-linecap="round" />
+									<path d="M20 31 C19 39, 17 45, 11 47" stroke="#6366F1" stroke-width="4" stroke-linecap="round" />
+									<path d="M28 31 C29 39, 31 45, 37 47" stroke="#6366F1" stroke-width="4" stroke-linecap="round" />
+									<circle cx="24" cy="20" r="13" fill="#4338CA" />
+									<g clip-path="url(#o-rec)"><ellipse cx="22" cy="18.5" rx="12" ry="12.5" fill="#6366F1" /></g>
+									<circle cx="29.5" cy="11.5" r="1.5" fill="#C7D2FE" />
+									<circle cx="19" cy="22" r="1.6" fill="#2A2524" />
+									<circle cx="29" cy="22" r="1.6" fill="#2A2524" />
+									<path d="M21.5 25.5 Q24 28 26.5 25.5" stroke="#2A2524" stroke-width="1.5" stroke-linecap="round" />
+								</g>
+								<text x="64" y="29" font-size="12.5" font-weight="700" fill="var(--text)">Recorder</text>
+								<text x="64" y="45" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted)">Worker · PCM</text>
+								<g transform="translate(64, 53)">
+									<rect x="0" y="0" width="3" height="10" rx="1.5" fill="#6366F1" class="eq-bar b4" />
+									<rect x="6" y="0" width="3" height="10" rx="1.5" fill="#6366F1" class="eq-bar b2" />
+									<rect x="12" y="0" width="3" height="10" rx="1.5" fill="#6366F1" class="eq-bar b3" />
+									<rect x="18" y="0" width="3" height="10" rx="1.5" fill="#6366F1" class="eq-bar" />
+								</g>
+							</g>
+
+							<text x="86" y="282" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted)">
+								Clients · Phoenix Channel
+							</text>
+							<text x="474" y="282" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted)">
+								Phoenix BEAM · outbound WebRTC
+							</text>
+						</svg>
+
+						<div class="wave-footer">
+							<span class="cf-pill"><span class="cf-dot"></span>Cloudflare SFU</span>
+							<div class="live-wave-box" aria-hidden="true">
+								<svg class="live-wave-svg" viewBox="0 0 600 22" preserveAspectRatio="none" fill="none">
+									<path
+										d="M0 11 Q 15 2, 30 11 T 60 11 T 90 11 T 120 11 T 150 11 T 180 11 T 210 11 T 240 11 T 270 11 T 300 11 T 330 11 T 360 11 T 390 11 T 420 11 T 450 11 T 480 11 T 510 11 T 540 11 T 570 11 T 600 11"
+										stroke="var(--wave-primary)"
+										stroke-width="2"
+									/>
+									<path
+										d="M0 11 Q 15 20, 30 11 T 60 11 T 90 11 T 120 11 T 150 11 T 180 11 T 210 11 T 240 11 T 270 11 T 300 11 T 330 11 T 360 11 T 390 11 T 420 11 T 450 11 T 480 11 T 510 11 T 540 11 T 570 11 T 600 11"
+										stroke="#53EAFD"
+										stroke-width="1.5"
+										opacity="0.82"
+									/>
+								</svg>
+							</div>
+							<span class="route-code" id="route-code">default_subscriptions/2 · 4 peers</span>
+						</div>
+					</div>
+				</div>
+			</section>
+
+			<section class="code-section">
+				<div class="container">
+					<div class="section-head">
+						<p class="eyebrow">What It Looks Like</p>
+						<h2>Define agents and rooms in Elixir. Drop-in clients everywhere else.</h2>
+					</div>
+					<div class="code-panel">
+						<div class="code-tabs" role="tablist" aria-label="Code examples">
+							<button type="button" role="tab" aria-selected="true" data-tab="agent" class="tab active">
+								AI Agent (Elixir)
+							</button>
+							<button type="button" role="tab" aria-selected="false" data-tab="room" class="tab">
+								Room Policy
+							</button>
+							<button type="button" role="tab" aria-selected="false" data-tab="browser" class="tab">
+								Browser JS
+							</button>
+							<button type="button" role="tab" aria-selected="false" data-tab="swift" class="tab">
+								SwiftUI
+							</button>
+						</div>
+						<div class="code-slot" data-panel="agent">
+							<Code code={agentCode} lang="elixir" theme="github-dark" />
+						</div>
+						<div class="code-slot hidden" data-panel="room">
+							<Code code={roomCode} lang="elixir" theme="github-dark" />
+						</div>
+						<div class="code-slot hidden" data-panel="browser">
+							<Code code={browserCode} lang="js" theme="github-dark" />
+						</div>
+						<div class="code-slot hidden" data-panel="swift">
+							<Code code={swiftCode} lang="swift" theme="github-dark" />
+						</div>
+					</div>
+				</div>
+			</section>
+
+			<section class="features-section">
+				<div class="container">
+					<div class="section-head">
+						<p class="eyebrow">Why Octoroom</p>
+						<h2>Built for voice and multimodal AI agents inside your app.</h2>
+					</div>
+					<div class="feature-grid">
+						{
+							features.map((item) => (
+								<article class="feature-card">
+									<h3>{item.title}</h3>
+									<p>{item.body}</p>
+								</article>
+							))
+						}
+					</div>
+				</div>
+			</section>
+
+			<section class="examples-section">
+				<div class="container">
+					<div class="section-head">
+						<p class="eyebrow">Try It</p>
+						<h2>Five runnable examples in the repository.</h2>
+					</div>
+					<div class="examples-grid">
+						{
+							examples.map((ex) => (
+								<a href={ex.href} target="_blank" rel="noopener noreferrer" class="example-card">
+									<div class="example-top">
+										<code>{ex.name}</code>
+										<span class="example-tag">{ex.tag}</span>
+									</div>
+									<p>{ex.desc}</p>
+								</a>
+							))
+						}
+					</div>
+				</div>
+			</section>
+		</main>
+
+		<footer class="footer">
+			<div class="container footer-inner">
+				<p>
+					Octoroom · Apache-2.0 · Built for Elixir &amp; Phoenix.
+				</p>
+				<div class="footer-links">
+					<a href="/docs/">Documentation</a>
+					<a href="https://hex.pm/packages/octoroom" target="_blank" rel="noopener noreferrer">Hex.pm</a>
+					<a href="https://hexdocs.pm/octoroom" target="_blank" rel="noopener noreferrer">HexDocs</a>
+					<a href="https://github.com/samrat/octoroom" target="_blank" rel="noopener noreferrer">GitHub</a>
+				</div>
+			</div>
+		</footer>
+
+		<script is:inline>
+			// Code section tabs
+			const tabs = document.querySelectorAll('[data-tab]');
+			const panels = document.querySelectorAll('[data-panel]');
+			tabs.forEach((tab) => {
+				tab.addEventListener('click', () => {
+					const target = tab.getAttribute('data-tab');
+					tabs.forEach((t) => {
+						const active = t === tab;
+						t.classList.toggle('active', active);
+						t.setAttribute('aria-selected', String(active));
+					});
+					panels.forEach((p) => {
+						p.classList.toggle('hidden', p.getAttribute('data-panel') !== target);
+					});
+				});
+			});
+
+			// Interactive-on-hover Group Call routing graph
+			const graph = document.getElementById('routing-graph');
+			const nodes = document.querySelectorAll('.interactive-node');
+			const edges = {
+				ada: document.getElementById('e-ada'),
+				sam: document.getElementById('e-sam'),
+				ai: document.getElementById('e-ai'),
+				rec: document.getElementById('e-rec'),
+				vision: document.getElementById('e-vision'),
+			};
+			const peerEls = {
+				ada: document.getElementById('peer-ada'),
+				sam: document.getElementById('peer-sam'),
+				ai: document.getElementById('peer-ai'),
+				rec: document.getElementById('peer-rec'),
+			};
+			const routeCode = document.getElementById('route-code');
+			const graphHint = document.getElementById('graph-hint');
+
+			const HOVER_STATES = {
+				default: {
+					lit: ['ada', 'sam', 'ai', 'rec'],
+					cyan: [],
+					activePeers: ['ada', 'sam', 'ai', 'rec'],
+					focused: null,
+					code: 'default_subscriptions/2 · 4 peers',
+					hint: 'Hover a peer to inspect tracks',
+				},
+				ada: {
+					lit: ['ada', 'sam', 'ai', 'rec'],
+					cyan: ['vision'],
+					activePeers: ['ada', 'sam', 'ai', 'rec'],
+					focused: 'ada',
+					code: 'Ada → mic, cam · hears Sam, Assistant',
+					hint: 'Browser publishes mic + camera via SFU',
+				},
+				sam: {
+					lit: ['sam', 'ada', 'ai', 'rec'],
+					cyan: [],
+					activePeers: ['sam', 'ada', 'ai', 'rec'],
+					focused: 'sam',
+					code: 'Sam → mic · hears Ada, Assistant',
+					hint: 'Swift SDK joins the same Phoenix channel',
+				},
+				ai: {
+					lit: ['ai', 'ada', 'sam'],
+					cyan: ['vision'],
+					activePeers: ['ai', 'ada', 'sam'],
+					focused: 'ai',
+					code: 'Assistant ← hears: [mics], sees: [cam]',
+					hint: 'AI Agent opens outbound WebRTC to SFU',
+				},
+				rec: {
+					lit: ['rec', 'ada', 'sam', 'ai'],
+					cyan: [],
+					activePeers: ['rec', 'ada', 'sam', 'ai'],
+					focused: 'rec',
+					code: 'Recorder ← PCM inputs (data-only)',
+					hint: 'Server worker receives raw s16le PCM',
+				},
+				sfu: {
+					lit: ['ada', 'sam', 'ai', 'rec'],
+					cyan: ['vision'],
+					activePeers: ['ada', 'sam', 'ai', 'rec'],
+					focused: 'sfu',
+					code: 'Cloudflare SFU · outbound UDP · 0 open ports',
+					hint: 'Media survives Phoenix deploys & restarts',
+				},
+			};
+
+			function applyHover(key) {
+				const state = HOVER_STATES[key] || HOVER_STATES.default;
+				Object.entries(edges).forEach(([k, el]) => {
+					if (!el) return;
+					const isLit = state.lit.includes(k);
+					const isCyan = state.cyan.includes(k);
+					const isPrimary = state.focused && state.focused === k;
+					el.setAttribute(
+						'class',
+						'edge' +
+							(k === 'vision' ? ' edge-vision' : '') +
+							(isLit ? ' lit' : '') +
+							(isCyan ? ' lit-cyan' : '') +
+							(isPrimary ? ' primary-edge' : ''),
+					);
+				});
+				Object.entries(peerEls).forEach(([k, el]) => {
+					if (!el) return;
+					const isDimmed = !state.activePeers.includes(k);
+					const isFocused = state.focused === k;
+					el.setAttribute(
+						'class',
+						'peer-group interactive-node' +
+							(isDimmed ? ' dimmed' : '') +
+							(isFocused ? ' focused' : ''),
+					);
+				});
+				if (routeCode) routeCode.textContent = state.code;
+				if (graphHint) graphHint.textContent = state.hint;
+			}
+
+			nodes.forEach((node) => {
+				const key = node.getAttribute('data-peer');
+				node.addEventListener('mouseenter', () => applyHover(key));
+				node.addEventListener('focus', () => applyHover(key));
+				node.addEventListener('click', () => applyHover(key));
+				node.addEventListener('blur', () => applyHover('default'));
+			});
+
+			graph?.addEventListener('mouseleave', () => applyHover('default'));
+
+			// Theme toggle
+			const toggle = document.getElementById('theme-toggle');
+			toggle?.addEventListener('click', () => {
+				const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+				document.documentElement.dataset.theme = next;
+				localStorage.setItem('starlight-theme', next);
+			});
+		</script>
+
+		<style>
+			/* SoloTerm-matched light-first palette */
+			:root {
+				--bg: #ffffff;
+				--bg-elev: #f9f9f8;
+				--bg-muted: #f2f2f2;
+				--bg-card: #ffffff;
+				--bg-code: #161414;
+				--code-bar: #1f1c1b;
+				--code-border: #2e2a28;
+				--border: #e6e6e4;
+				--border-strong: #d4d2cf;
+				--text: #2a2524;
+				--muted: #78716b;
+				--accent: #155dfc;
+				--accent-text: #155dfc;
+				--accent-border: #193cb8;
+				--accent-hover: #193cb8;
+				--accent-glow: #53eafd;
+				--accent-soft: #eff6ff;
+				--accent-soft-border: #dbeafe;
+				--wave-primary: #155dfc;
+				--headset: #2a2524;
+				--cyan: #06b6d4;
+				--cf: #f38020;
+				--font-sans:
+					'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+					sans-serif;
+				--font-mono:
+					'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+			}
+
+			:root[data-theme='dark'] {
+				--bg: #17191f;
+				--bg-elev: #1e2129;
+				--bg-muted: #2a2f3b;
+				--bg-card: #252933;
+				--bg-code: #13151b;
+				--code-bar: #1b1e26;
+				--code-border: #343948;
+				--border: #323746;
+				--border-strong: #474e63;
+				--text: #f4f6fa;
+				--muted: #b8c0d0;
+				--accent: #2563eb;
+				--accent-text: #8ab8ff;
+				--accent-border: #3b82f6;
+				--accent-hover: #3b82f6;
+				--accent-glow: #53eafd;
+				--accent-soft: rgba(59, 130, 246, 0.18);
+				--accent-soft-border: rgba(138, 184, 255, 0.34);
+				--wave-primary: #60a5fa;
+				--headset: #e4e7ef;
+				--cyan: #53eafd;
+				--cf: #fb923c;
+			}
+
+			*,
+			*::before,
+			*::after {
+				box-sizing: border-box;
+			}
+
+			html,
+			body {
+				margin: 0;
+				padding: 0;
+				background: var(--bg);
+				color: var(--text);
+				font-family: var(--font-sans);
+				line-height: 1.6;
+				-webkit-font-smoothing: antialiased;
+			}
+
+			a {
+				color: inherit;
+				text-decoration: none;
+			}
+
+			code,
+			pre {
+				font-family: var(--font-mono);
+			}
+
+			.container {
+				max-width: 1160px;
+				margin: 0 auto;
+				padding: 0 1.5rem;
+			}
+
+			.nav {
+				position: sticky;
+				top: 0;
+				z-index: 20;
+				background: color-mix(in srgb, var(--bg) 88%, transparent);
+				backdrop-filter: blur(12px);
+				border-bottom: 1px solid var(--border);
+			}
+
+			.nav-inner {
+				height: 64px;
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 1rem;
+			}
+
+			.brand {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.6rem;
+				font-weight: 700;
+				font-size: 1.05rem;
+				letter-spacing: -0.02em;
+			}
+
+			.brand-mark {
+				display: block;
+			}
+
+			.version-pill {
+				font-family: var(--font-mono);
+				font-size: 0.72rem;
+				font-weight: 500;
+				padding: 0.12rem 0.5rem;
+				border-radius: 999px;
+				background: var(--accent-soft);
+				border: 1px solid var(--accent-soft-border);
+				color: var(--accent-text);
+			}
+
+			.nav-links {
+				display: flex;
+				align-items: center;
+				gap: 1.25rem;
+				font-size: 0.92rem;
+				color: var(--muted);
+			}
+
+			.nav-links a:hover {
+				color: var(--text);
+			}
+
+			.nav-github {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.4rem;
+				color: var(--text);
+				font-weight: 500;
+			}
+
+			.theme-toggle {
+				background: var(--bg-elev);
+				border: 1px solid var(--border);
+				color: var(--text);
+				width: 34px;
+				height: 34px;
+				border-radius: 8px;
+				cursor: pointer;
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				font-size: 0.95rem;
+			}
+
+			.theme-toggle:hover {
+				border-color: var(--border-strong);
+			}
+
+			:root[data-theme='dark'] .icon-moon {
+				display: none;
+			}
+
+			:root[data-theme='light'] .icon-sun {
+				display: none;
+			}
+
+			.hero {
+				padding: 4.25rem 0 4rem;
+				border-bottom: 1px solid var(--border);
+			}
+
+			.hero-grid {
+				display: grid;
+				grid-template-columns: minmax(0, 0.94fr) minmax(0, 1.12fr);
+				gap: 2.75rem;
+				align-items: center;
+			}
+
+			.eyebrow {
+				font-family: var(--font-mono);
+				font-size: 0.78rem;
+				text-transform: uppercase;
+				letter-spacing: 0.08em;
+				color: var(--accent-text);
+				margin: 0 0 0.9rem;
+			}
+
+			h1 {
+				font-size: clamp(2.1rem, 3.6vw, 3.1rem);
+				line-height: 1.08;
+				letter-spacing: -0.035em;
+				margin: 0 0 1.2rem;
+			}
+
+			.lead {
+				font-size: 1.04rem;
+				color: var(--muted);
+				margin: 0 0 0.85rem;
+				max-width: 48ch;
+			}
+
+			.lead-secondary {
+				margin-bottom: 1.75rem;
+				font-size: 0.98rem;
+			}
+
+			.lead-secondary strong {
+				color: var(--text);
+				font-weight: 600;
+			}
+
+			.cta-row {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.7rem;
+				margin-bottom: 1.65rem;
+			}
+
+			.btn {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				gap: 0.45rem;
+				padding: 0.68rem 1.15rem;
+				border-radius: 9px;
+				font-weight: 600;
+				font-size: 0.94rem;
+				transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+			}
+
+			.btn-primary {
+				background: var(--accent);
+				border: 1px solid var(--accent-border);
+				color: #ffffff;
+				box-shadow:
+					inset 0 1px 0 rgba(83, 234, 253, 0.38),
+					0 1px 2px rgba(21, 93, 252, 0.22);
+			}
+
+			.btn-primary:hover {
+				background: var(--accent-hover);
+			}
+
+			.btn-secondary {
+				background: var(--bg-elev);
+				border: 1px solid var(--border);
+				color: var(--text);
+			}
+
+			.btn-secondary:hover {
+				border-color: var(--border-strong);
+				background: var(--bg-muted);
+			}
+
+			.btn-ghost {
+				color: var(--muted);
+			}
+
+			.btn-ghost:hover {
+				color: var(--text);
+			}
+
+			.install-bar {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.65rem;
+				padding: 0.5rem 0.85rem;
+				border-radius: 9px;
+				background: var(--bg-elev);
+				border: 1px solid var(--border);
+				font-size: 0.81rem;
+				max-width: 100%;
+				overflow-x: auto;
+			}
+
+			.install-label {
+				font-family: var(--font-mono);
+				color: var(--muted);
+				font-size: 0.74rem;
+				padding-right: 0.6rem;
+				border-right: 1px solid var(--border);
+			}
+
+			/* Interactive Group Call Routing Graph */
+			.graph-card {
+				background: var(--bg-elev);
+				border: 1px solid var(--border);
+				border-radius: 16px;
+				padding: 1rem 1.15rem 0.9rem;
+				display: flex;
+				flex-direction: column;
+				gap: 0.6rem;
+			}
+
+			.graph-header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 0.75rem;
+				flex-wrap: wrap;
+				font-family: var(--font-mono);
+				font-size: 0.73rem;
+				color: var(--muted);
+			}
+
+			.graph-title strong {
+				color: var(--text);
+			}
+
+			.graph-svg {
+				width: 100%;
+				height: auto;
+				display: block;
+			}
+
+			.interactive-node {
+				cursor: pointer;
+				outline: none;
+			}
+
+			.node-box {
+				transition: stroke 0.18s ease, stroke-width 0.18s ease, filter 0.18s ease;
+			}
+
+			.interactive-node:hover .node-box,
+			.interactive-node:focus .node-box,
+			.peer-group.focused .node-box {
+				stroke: var(--accent);
+				stroke-width: 2.2;
+				filter: drop-shadow(0 4px 12px rgba(21, 93, 252, 0.16));
+			}
+
+			.peer-group {
+				transition: opacity 0.2s ease;
+			}
+
+			.peer-group.dimmed {
+				opacity: 0.36;
+			}
+
+			.edge {
+				stroke: var(--border-strong);
+				stroke-width: 2;
+				opacity: 0.45;
+				transition: stroke 0.2s ease, opacity 0.2s ease, stroke-width 0.2s ease;
+			}
+
+			.edge-vision {
+				opacity: 0.2;
+			}
+
+			.edge.lit {
+				stroke: var(--wave-primary);
+				stroke-width: 2.6;
+				opacity: 0.92;
+				stroke-dasharray: 6 6;
+				animation: dashFlow 1.25s linear infinite;
+			}
+
+			.edge.primary-edge {
+				stroke-width: 3.4;
+				opacity: 1;
+				animation-duration: 0.75s;
+			}
+
+			.edge.lit-cyan {
+				stroke: var(--cyan);
+				stroke-width: 2.6;
+				opacity: 1;
+				stroke-dasharray: 6 6;
+				animation: dashFlow 1s linear infinite;
+			}
+
+			@keyframes dashFlow {
+				to {
+					stroke-dashoffset: -24;
+				}
+			}
+
+			.eq-bar {
+				transform-box: fill-box;
+				transform-origin: center bottom;
+				animation: eqPulse 0.95s ease-in-out infinite;
+			}
+
+			.eq-bar.b2 {
+				animation-delay: 0.16s;
+			}
+			.eq-bar.b3 {
+				animation-delay: 0.32s;
+			}
+			.eq-bar.b4 {
+				animation-delay: 0.2s;
+			}
+
+			.peer-group.dimmed .eq-bar {
+				animation: none;
+				opacity: 0.25;
+			}
+
+			@keyframes eqPulse {
+				0%,
+				100% {
+					transform: scaleY(0.35);
+				}
+				50% {
+					transform: scaleY(1);
+				}
+			}
+
+			.wave-footer {
+				background: var(--bg);
+				border: 1px solid var(--border);
+				border-radius: 10px;
+				padding: 0.55rem 0.75rem;
+				display: grid;
+				grid-template-columns: auto 1fr auto;
+				align-items: center;
+				gap: 0.75rem;
+			}
+
+			.cf-pill {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.4rem;
+				font-family: var(--font-mono);
+				font-size: 0.71rem;
+				font-weight: 600;
+				color: var(--text);
+				white-space: nowrap;
+			}
+
+			.cf-dot {
+				width: 8px;
+				height: 8px;
+				border-radius: 50%;
+				background: var(--cf);
+			}
+
+			.live-wave-box {
+				overflow: hidden;
+				height: 22px;
+			}
+
+			.live-wave-svg {
+				width: 200%;
+				height: 22px;
+				animation: slideWave 3.8s linear infinite;
+			}
+
+			@keyframes slideWave {
+				from {
+					transform: translateX(0);
+				}
+				to {
+					transform: translateX(-50%);
+				}
+			}
+
+			.route-code {
+				font-family: var(--font-mono);
+				font-size: 0.7rem;
+				color: var(--accent-text);
+				background: var(--accent-soft);
+				border: 1px solid var(--accent-soft-border);
+				padding: 0.2rem 0.55rem;
+				border-radius: 6px;
+				white-space: nowrap;
+			}
+
+			/* Code Section (moved below the fold) */
+			.code-section,
+			.examples-section {
+				padding: 4.25rem 0;
+				border-bottom: 1px solid var(--border);
+				background: var(--bg-elev);
+			}
+
+			.features-section {
+				padding: 4.25rem 0;
+				border-bottom: 1px solid var(--border);
+				background: var(--bg);
+			}
+
+			.section-head {
+				margin-bottom: 2.25rem;
+			}
+
+			.section-head h2 {
+				font-size: clamp(1.5rem, 2.5vw, 2.1rem);
+				letter-spacing: -0.025em;
+				margin: 0;
+				max-width: 30ch;
+			}
+
+			.code-panel {
+				background: var(--bg-code);
+				border: 1px solid var(--code-border);
+				border-radius: 14px;
+				overflow: hidden;
+				box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+			}
+
+			.code-tabs {
+				display: flex;
+				gap: 0.25rem;
+				padding: 0.6rem 0.75rem 0;
+				background: var(--code-bar);
+				border-bottom: 1px solid var(--code-border);
+				overflow-x: auto;
+			}
+
+			.tab {
+				background: transparent;
+				border: none;
+				border-bottom: 2px solid transparent;
+				color: #a8a29e;
+				font-family: var(--font-mono);
+				font-size: 0.78rem;
+				padding: 0.5rem 0.75rem 0.6rem;
+				cursor: pointer;
+				white-space: nowrap;
+			}
+
+			.tab:hover {
+				color: #f7f5f3;
+			}
+
+			.tab.active {
+				color: #ffffff;
+				border-bottom-color: #53eafd;
+			}
+
+			.code-slot :global(pre.astro-code) {
+				margin: 0;
+				padding: 1.25rem;
+				background-color: var(--bg-code) !important;
+				font-size: 0.83rem;
+				line-height: 1.65;
+				overflow-x: auto;
+			}
+
+			.hidden {
+				display: none;
+			}
+
+			.feature-grid {
+				display: grid;
+				grid-template-columns: repeat(3, minmax(0, 1fr));
+				gap: 1.25rem;
+			}
+
+			.feature-card {
+				background: var(--bg-elev);
+				border: 1px solid var(--border);
+				border-radius: 12px;
+				padding: 1.35rem;
+			}
+
+			.feature-card h3 {
+				margin: 0 0 0.5rem;
+				font-size: 1.02rem;
+				letter-spacing: -0.015em;
+			}
+
+			.feature-card p {
+				margin: 0;
+				font-size: 0.91rem;
+				color: var(--muted);
+			}
+
+			.examples-grid {
+				display: grid;
+				grid-template-columns: repeat(3, minmax(0, 1fr));
+				gap: 1.15rem;
+			}
+
+			.example-card {
+				background: var(--bg-card);
+				border: 1px solid var(--border);
+				border-radius: 12px;
+				padding: 1.25rem;
+				display: flex;
+				flex-direction: column;
+				gap: 0.6rem;
+				transition: border-color 0.15s ease, transform 0.15s ease;
+			}
+
+			.example-card:hover {
+				border-color: var(--accent-text);
+				transform: translateY(-1px);
+			}
+
+			.example-top {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 0.5rem;
+			}
+
+			.example-top code {
+				font-weight: 600;
+				font-size: 0.88rem;
+			}
+
+			.example-tag {
+				font-family: var(--font-mono);
+				font-size: 0.7rem;
+				padding: 0.15rem 0.5rem;
+				border-radius: 999px;
+				background: var(--accent-soft);
+				border: 1px solid var(--accent-soft-border);
+				color: var(--accent-text);
+				white-space: nowrap;
+			}
+
+			.example-card p {
+				margin: 0;
+				font-size: 0.89rem;
+				color: var(--muted);
+			}
+
+			.footer {
+				padding: 2.25rem 0;
+				font-size: 0.88rem;
+				color: var(--muted);
+				background: var(--bg);
+			}
+
+			.footer-inner {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				flex-wrap: wrap;
+				gap: 1rem;
+			}
+
+			.footer-links {
+				display: flex;
+				gap: 1.25rem;
+			}
+
+			.footer-links a:hover {
+				color: var(--text);
+			}
+
+			@media (prefers-reduced-motion: reduce) {
+				.edge.lit,
+				.edge.lit-cyan,
+				.live-wave-svg,
+				.eq-bar {
+					animation: none !important;
+				}
+			}
+
+			@media (max-width: 960px) {
+				.hero-grid {
+					grid-template-columns: 1fr;
+				}
+				.feature-grid,
+				.examples-grid {
+					grid-template-columns: repeat(2, minmax(0, 1fr));
+				}
+			}
+
+			@media (max-width: 640px) {
+				.nav-links a:not(:first-child):not(.nav-github) {
+					display: none;
+				}
+				.nav-github span {
+					display: none;
+				}
+				.wave-footer {
+					grid-template-columns: 1fr;
+					gap: 0.45rem;
+				}
+				.feature-grid,
+				.examples-grid {
+					grid-template-columns: 1fr;
+				}
+			}
+		</style>
+	</body>
+</html>

@@ -1,0 +1,110 @@
+---
+title: Rooms & Routing Policies
+description: Control authentication, publish permissions, track subscriptions, and server-side workers with Octoroom.Room.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+An `Octoroom.Room` module defines who can join a room, which server-side workers should run, and which tracks each participant hears and sees.
+
+```elixir
+defmodule MyApp.CallRoom do
+  use Octoroom.Room
+  import Octoroom.Agent, only: [agent: 3]
+
+  @impl true
+  def mount(room_id) do
+    {:ok, %{workspace: MyApp.Workspaces.get!(room_id)}}
+  end
+
+  @impl true
+  def join(%{"name" => name}, socket) do
+    {:ok, %{name: name, user_id: socket.assigns.user_id}}
+  end
+
+  @impl true
+  def workers(%{participants: []}), do: []
+
+  def workers(room) do
+    [
+      agent("assistant", MyApp.Assistant,
+        name: "Assistant",
+        hears: Enum.map(room.participants, &mic/1),
+        sees: Enum.flat_map(room.participants, &[camera(&1), screen(&1)]),
+        respond: :addressed,
+        args: %{workspace: room.assigns.workspace}
+      )
+    ]
+  end
+
+  @impl true
+  def subscriptions(listener, room) do
+    default_subscriptions(listener, room)
+  end
+end
+```
+
+## Callbacks
+
+| Callback | Required | Purpose |
+| --- | --- | --- |
+| `join/2` | Yes | Authorize a client in the channel process and return `{:ok, meta}` or `{:error, reason}`. |
+| `mount/1` | No | Runs once when the room starts; returns `{:ok, assigns}` stored in `room.assigns`. |
+| `workers/1` | No | Returns the list of `worker/3` (or `agent/3`) specs that should currently be running. |
+| `subscriptions/2` | No | Returns the tracks `listener` should receive. Defaults to `default_subscriptions/2`. |
+| `message/3` | No | Optional gate (`boolean`) controlling whether `sender` may message `worker_id` from a client. |
+
+<Aside type="tip">
+  Both `workers/1` and `subscriptions/2` must be **pure and fast**—they run after every room state
+  change using only the `%Octoroom.Room{}` struct. If a callback raises or returns an invalid shape,
+  the room keeps its last good routing state, logs the error, and emits
+  `[:octoroom, :policy, :error]` telemetry.
+</Aside>
+
+## Restricting publishable sources
+
+Each participant can publish up to one track per source: `"mic"`, `"camera"`, `"screen"`, and `"screen_audio"`, referenced inside policies with `mic/1`, `camera/1`, `screen/1`, and `screen_audio/1`.
+
+To restrict what a participant may publish, include `:publish` in the metadata returned by `join/2`:
+
+```elixir
+@impl true
+def join(%{"name" => name}, _socket) do
+  # Audio-only room
+  {:ok, %{name: name, publish: ["mic"]}}
+end
+```
+
+The room server refuses any track publish outside that list.
+
+## Custom subscriptions & per-track gain
+
+Use the imported helpers (`mic/1`, `camera/1`, `screen/1`, `screen_audio/1`, `track/1`, `gain/2`, `others/2`) to implement stage/audience splits, whisper channels, or ducking:
+
+```elixir
+@impl true
+def subscriptions(listener, room) do
+  peers =
+    room
+    |> others(listener)
+    |> Enum.flat_map(fn p ->
+      [gain(mic(p), 0.8), camera(p), screen(p)]
+    end)
+
+  worker_outputs = Enum.flat_map(room.workers, & &1.outputs)
+  peers ++ worker_outputs
+end
+```
+
+## Subscribing to room events from LiveView or backend processes
+
+Use `Octoroom.subscribe/2` to receive `{:octoroom, room_id, event}` messages in any Elixir process:
+
+- **`scope: {:participant, id}`** — Receives only the events sent to that participant (`:joined`, `:left`, `:updated`, `:published`, `:worker`, `:worker_notify`). Ideal for a LiveView rendering the room for one user.
+- **`scope: :room`** — Receives full room telemetry and operational events (all joins/leaves, `:subscriptions`, `:disconnected`, `:output_live`, `:worker_event`, `:worker_down`, `:error`). Ideal for admin views or analytics.
+
+```elixir
+Octoroom.subscribe(room_id, scope: {:participant, participant_id})
+```
+
+Subscriptions survive room restarts, and processes may subscribe before a room or participant exists.

@@ -1,0 +1,146 @@
+---
+title: Getting Started
+description: Install Octoroom in a Phoenix app and launch your first voice and video room.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## 1. System requirements
+
+Octoroom uses `ex_webrtc`, which requires the system `libsrtp` library:
+
+<Tabs>
+  <TabItem label="macOS">
+    ```sh
+    brew install srtp
+    ```
+  </TabItem>
+  <TabItem label="Debian / Ubuntu">
+    ```sh
+    apt install libsrtp2-dev
+    ```
+  </TabItem>
+</Tabs>
+
+Add this to your app's `config/config.exs` so `ex_libsrtp` builds against your system `libsrtp` (the precompiled artifact links a `libcrypto` that isn't on the default path):
+
+```elixir
+# config/config.exs
+config :bundlex, :disable_precompiled_os_deps, apps: [:ex_libsrtp]
+```
+
+## 2. Add dependencies
+
+Add `:octoroom` (and optionally `:octoroom_agents` if you want AI voice/vision participants) to `mix.exs`:
+
+```elixir
+defp deps do
+  [
+    {:octoroom, "~> 0.1.0"},
+    {:octoroom_agents, "~> 0.1.0"} # optional: AI voice & vision agents
+  ]
+end
+```
+
+Then fetch and compile:
+
+```sh
+mix deps.get
+```
+
+## 3. Configure the SFU backend
+
+### Local development (no Cloudflare account required)
+
+Octoroom ships with `Octoroom.Cloudflare.Local`, an in-process localhost SFU backed by `ex_webrtc`. It lets you test multi-party audio, video, and workers locally with zero credentials:
+
+```elixir
+# config/dev.exs
+config :octoroom,
+  cloudflare: [client: Octoroom.Cloudflare.Local],
+  ice_servers: []
+```
+
+<Aside type="caution">
+  `Octoroom.Cloudflare.Local` is for local development only—there is no TURN, no clustering, and
+  sessions live inside a single BEAM node.
+</Aside>
+
+### Production (Cloudflare Realtime SFU)
+
+In production, configure `Octoroom.Cloudflare.HTTP` (the default client) with your Cloudflare Realtime SFU app credentials:
+
+```elixir
+# config/runtime.exs
+config :octoroom,
+  cloudflare: [
+    client: Octoroom.Cloudflare.HTTP,
+    app_id: System.fetch_env!("CLOUDFLARE_SFU_APP_ID"),
+    app_secret: System.fetch_env!("CLOUDFLARE_SFU_APP_SECRET")
+  ]
+```
+
+## 4. Define a Room and Phoenix Channel
+
+A room is a module using `Octoroom.Room`. Only `join/2` is required—`subscriptions/2` defaults to subscribing every participant to every other participant's mic, camera, screen share, and every worker output:
+
+```elixir
+defmodule MyApp.CallRoom do
+  use Octoroom.Room
+
+  @impl true
+  def join(%{"name" => name}, _socket) do
+    {:ok, %{name: name}}
+  end
+end
+```
+
+Mount a Phoenix channel backed by your room:
+
+```elixir
+defmodule MyAppWeb.RoomChannel do
+  use Octoroom.Phoenix.Channel, room: MyApp.CallRoom
+end
+```
+
+Register it in your Phoenix `UserSocket`:
+
+```elixir
+# lib/my_app_web/channels/user_socket.ex
+channel "room:*", MyAppWeb.RoomChannel
+```
+
+The room ID is everything after the first `:` in the topic—so `"room:lobby"` starts room `"lobby"`, and `"room:support:1234"` starts room `"support:1234"`.
+
+## 5. Connect from the browser
+
+Octoroom includes a zero-npm ES module browser client at `priv/static/octoroom.mjs`:
+
+```js
+import { RoomClient } from "octoroom";
+
+const room = new RoomClient({
+  socket, // a connected Phoenix Socket
+  topic: "room:lobby",
+  params: { name: "Ada" },
+  video: true,
+});
+
+room.on("participants", (list) => console.log("Participants:", list));
+room.on("tracks", (tracks) => {
+  // Remote audio plays automatically; attach remote video tracks to <video> elements
+  for (const track of tracks) {
+    if (track.kind === "video") {
+      videoEl.srcObject = track.stream;
+    }
+  }
+});
+
+await room.join();
+```
+
+## Next steps
+
+- Learn how the media and control planes fit together in [Architecture](/docs/architecture/).
+- Customize audio routing, whisper tracks, and permissions in [Rooms & Routing Policies](/docs/guides/rooms/).
+- Add AI voice and vision participants in [AI Voice & Vision Agents](/docs/guides/agents/).

@@ -1,0 +1,49 @@
+---
+title: Octoroom Documentation
+description: Build realtime AI voice and vision agents in Elixir, backed by Cloudflare Realtime SFU.
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Octoroom is a toolkit for building realtime AI voice and vision agents—from 1-on-1 calls to multi-party rooms—directly inside your Elixir/Phoenix application, backed by [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/).
+
+Cloudflare carries the WebRTC media while your Phoenix app owns room state, authentication, routing policies, and server-side workers.
+
+<CardGrid>
+  <LinkCard
+    title="Getting Started"
+    description="Install libsrtp, add Octoroom to your Phoenix app, and run your first room locally with zero external accounts."
+    href="/docs/getting-started/"
+  />
+  <LinkCard
+    title="Architecture"
+    description="How Cloudflare SFU, outbound WebRTC workers, and signed resume tokens keep calls alive across deploys."
+    href="/docs/architecture/"
+  />
+  <LinkCard
+    title="Rooms & Routing Policies"
+    description="Write pure Elixir callbacks (workers/1, subscriptions/2) to control who hears and sees whom."
+    href="/docs/guides/rooms/"
+  />
+  <LinkCard
+    title="AI Voice & Vision Agents"
+    description="Add cascaded voice pipelines, local ONNX TTS, Gemini Live, OpenAI Live, or Nuance Live video avatars."
+    href="/docs/guides/agents/"
+  />
+</CardGrid>
+
+## Packages & Clients
+
+| Component | Package / Path | API Reference |
+| --- | --- | --- |
+| Core rooms & SFU client | `octoroom` (`lib/`) | [HexDocs — octoroom](https://hexdocs.pm/octoroom) |
+| AI voice & vision agents | `octoroom_agents` (`agents/`) | [HexDocs — octoroom_agents](https://hexdocs.pm/octoroom_agents) |
+| Browser client (zero-npm) | `priv/static/octoroom.mjs` | [Browser Client Guide](/docs/clients/browser/) |
+| Native Apple SDK (iOS 17+ / macOS 14+) | `swift/` (SwiftPM) | [Swift SDK Guide](/docs/clients/swift/) |
+
+<Card title="Need module-level Elixir API docs?" icon="open-book">
+  Octoroom publishes full module and function reference docs on HexDocs for both{' '}
+  <a href="https://hexdocs.pm/octoroom">octoroom</a> and{' '}
+  <a href="https://hexdocs.pm/octoroom_agents">octoroom_agents</a>. Use this site for architecture,
+  guides, and cross-platform client walkthroughs.
+</Card>

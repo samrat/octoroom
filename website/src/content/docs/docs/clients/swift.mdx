@@ -1,0 +1,107 @@
+---
+title: Swift SDK (iOS & macOS)
+description: Native iOS 17+ and macOS 14+ SwiftPM client for Octoroom rooms and AI agents.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The Swift SDK is a native port of the browser client for **iOS 17+** and **macOS 14+**. It speaks the exact same Phoenix channel protocol, so iOS, macOS, and browser users join the same rooms under the same `subscriptions/2` policy with zero server changes.
+
+## Installation
+
+Add Octoroom via Swift Package Manager (the `Package.swift` manifest lives at the repository root):
+
+```swift
+// Package.swift
+dependencies: [
+  .package(url: "https://github.com/samrat/octoroom.git", branch: "main")
+]
+
+// Target dependencies
+.product(name: "Octoroom", package: "octoroom")
+.product(name: "OctoroomAgents", package: "octoroom") // optional: AI agent helpers
+```
+
+### Package products
+
+- **`OctoroomCore`** — Phoenix Channels client, signaling, and data types behind a `MediaEngine` protocol (no WebRTC dependency, fast offline unit tests).
+- **`Octoroom`** — WebRTC engine (`stasel/WebRTC`), mic/camera/screen capture, and SwiftUI `VideoView`. Re-exports `OctoroomCore`.
+- **`OctoroomAgents`** — `@Observable` `Agents` client for agent presence, transcripts, and typed messages.
+
+## Joining a room
+
+```swift
+import Octoroom
+import SwiftUI
+
+@MainActor
+func makeRoom(token: String) -> RoomClient {
+  let socket = PhoenixSocket(
+    endpoint: URL(string: "wss://example.com/socket")!,
+    params: ["token": token]
+  )
+  return RoomClient(
+    socket: socket,
+    topic: "room:lobby",
+    params: ["name": "Ada"],
+    video: true
+  )
+}
+
+try await room.join()
+room.setMuted(true)
+room.mute(.camera, true)    // sends black frames; no renegotiation
+try await room.startCamera()
+try await room.shareScreen()
+await room.stop(.camera)
+room.leave()
+```
+
+## SwiftUI views & AI agents
+
+Both `RoomClient` and `Agents` are `@Observable`, so SwiftUI views bind to them directly:
+
+```swift
+import Octoroom
+import OctoroomAgents
+import SwiftUI
+
+struct CallView: View {
+  let room: RoomClient
+  let agents: Agents
+
+  var body: some View {
+    VStack {
+      ForEach(room.tracks.filter { $0.kind == .video }) { track in
+        VideoView(track) // remote video
+      }
+      if let camera = room.localTracks[.camera] {
+        VideoView(camera) // self view, mirrored
+      }
+      ForEach(agents.agents) { agent in
+        Text("\(agent.name): \(agent.state?.rawValue ?? "")")
+      }
+      ForEach(agents.transcript("assistant")) { item in
+        Text(item.text)
+      }
+    }
+  }
+}
+```
+
+For imperative events, iterate `for await event in room.events()` (`.roomEvent`, `.reconnecting`, `.reconnected(resumed:)`, `.connection`, `.workerEvent`, `.left(reason)`, `.error`). Call `await room.levels()` for speaking-indicator audio levels across `local`, `remote` participants, and `workers` output tracks.
+
+## Platform notes
+
+- **Permissions:** Add `NSMicrophoneUsageDescription` and `NSCameraUsageDescription` to `Info.plist`.
+- **Screen sharing:** iOS captures the app's own screen via ReplayKit (for whole-device capture, feed `engine.makeFrameTrack()` from a broadcast upload extension). macOS uses ScreenCaptureKit and requires Screen Recording permission. Native clients do not publish `screen_audio`.
+- **Audio route & CallKit:** On iOS, `WebRTCEngine(speaker: true)` (default) routes to the loudspeaker; pass `false` for the earpiece or switch dynamically with `try engine.setSpeaker(true/false)`. For CallKit calls, pass `manualAudio: true` and forward `CXProviderDelegate` callbacks to `WebRTCEngine.audioSessionDidActivate(_:)` and `WebRTCEngine.audioSessionDidDeactivate(_:)`.
+- **Custom media:** Pass `media: [.camera: track]` using `engine.makeFrameTrack()` to push custom `CVPixelBuffer`s.
+- **Leaving on quit:** Call `room.leave()` when ending a call; otherwise the server holds the participant for the resume grace period.
+
+<Aside type="note">
+  In the iOS Simulator, the SDK keeps WebRTC's default audio session because CoreAudio deadlocks
+  when capture starts in `videoChat` mode.
+</Aside>
+
+See [`examples/ios`](https://github.com/samrat/octoroom/tree/main/examples/ios) for a complete runnable SwiftUI app.

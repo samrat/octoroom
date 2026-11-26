@@ -129,8 +129,8 @@ Building needs the system `libsrtp` library (see [Requirements](#requirements)).
 
 | Alternative                  | How Octoroom differs                                                                                                                                                                                                                                                             |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **LiveKit / Daily**          | Octoroom avoids hosted video/chat SaaS lock-in and per-minute SFU billing—room state, auth, and routing stay in your Phoenix app while Cloudflare carries the media. Tradeoff: you host your own app server, and SIP/server-side recording aren't built in yet.                  |
-| **Pipecat / LiveKit Agents** | Octoroom is built for multi-party, multi-agent rooms inside your web app rather than spawning a separate Python worker process per 1-on-1 call. Octoroom's vision uses lightweight client-captured frames (`sees:`) for VLM context, not high-FPS server-side YOLO/CV pipelines. |
+| **LiveKit / Daily**          | Room state, auth, and routing stay in your Phoenix app while Cloudflare Realtime SFU acts as a commodity egress-billed media pipe—no SFU cluster to operate and no per-minute participant fees. Tradeoff: media depends on Cloudflare's hosted SFU, you host your own Phoenix server, and SIP/managed video egress aren't built in yet. |
+| **Pipecat / LiveKit Agents** | Agents run as BEAM processes inside your Phoenix app (calling Ecto, PubSub, and LiveView directly) instead of a separate Python worker service. Octoroom's vision uses lightweight client-captured frames (`sees:`) for VLM context, not high-FPS server-side YOLO/CV pipelines. |
 | **Membrane / Fishjam**       | Octoroom offloads SFU fan-out to Cloudflare so you write room policies and agents instead of operating media-server pipelines.                                                                                                                                                   |
 
 ## Requirements
@@ -168,8 +168,9 @@ Early (`0.1.0`). Working today: browser and Swift rooms, server-side
 routing policies, deploy/restart survival, cascaded and speech-to-speech
 voice/vision agents, and local ONNX VAD/turn-detection/TTS.
 
-Not built yet: multi-node room clustering, SIP/PSTN telephony, and server-side
-recording/egress.
+Not built yet: multi-node room clustering, SIP/PSTN telephony, and managed
+video recording/egress (custom per-track PCM audio recording workers work
+today, as shown in `examples/call`).
 
 Building voice/video rooms or AI voice agents in production? Or interested in
-SIP, recording, or commercial support? Reach out at [mail@samrat.me](mailto:mail@samrat.me).
+SIP, managed egress, or commercial support? Reach out at [mail@samrat.me](mailto:mail@samrat.me).
