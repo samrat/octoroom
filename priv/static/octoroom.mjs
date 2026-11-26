@@ -460,7 +460,8 @@ export class RoomClient {
 
   async onRenegotiate({op_id, sdp}) {
     const pc = this.pc
-    await pc.setRemoteDescription({type: "offer", sdp})
+    const safeSdp = dropConflictingExtmaps(pc, sdp)
+    await pc.setRemoteDescription({type: "offer", sdp: safeSdp})
     await pc.setLocalDescription(await pc.createAnswer())
     await this.push("answer", {op_id, sdp: pc.localDescription.sdp})
   }
@@ -484,7 +485,7 @@ export class RoomClient {
       await pc.setLocalDescription(await pc.createOffer())
       const mids = Object.fromEntries(added.map(([source, t]) => [source, t.mid]))
       const {sdp} = await this.push("push_offer", {op_id, sdp: pc.localDescription.sdp, mids})
-      await pc.setRemoteDescription({type: "answer", sdp})
+      await pc.setRemoteDescription({type: "answer", sdp: dropConflictingExtmaps(pc, sdp)})
     } catch (error) {
       if (pc.signalingState === "have-local-offer") await pc.setLocalDescription({type: "rollback"})
       for (const [, t] of added) t.stop()
@@ -502,7 +503,7 @@ export class RoomClient {
     }
     await pc.setLocalDescription(await pc.createOffer())
     const {sdp} = await this.push("close_offer", {op_id, sdp: pc.localDescription.sdp})
-    await pc.setRemoteDescription({type: "answer", sdp})
+    await pc.setRemoteDescription({type: "answer", sdp: dropConflictingExtmaps(pc, sdp)})
   }
 
   onTracks({added, removed, reset}) {
@@ -747,6 +748,115 @@ export class RoomClient {
 
 function addSender(pc, track) {
   return pc.addTransceiver(track, {direction: "sendonly", streams: [new MediaStream([track])]})
+}
+
+const EXTMAP_RE = /^a=extmap:(\d+)(?:\/[^\s]+)?\s+(\S+)/
+
+function splitSdpSections(sdp) {
+  const lines = sdp.split(/\r?\n/)
+  const session = []
+  const media = []
+  let current = null
+
+  for (const line of lines) {
+    if (line.startsWith("m=")) {
+      const port = line.split(" ")[1] || ""
+      current = {port, mid: null, lines: [line]}
+      media.push(current)
+    } else if (current) {
+      if (line.startsWith("a=mid:")) current.mid = line.slice(6).trim()
+      current.lines.push(line)
+    } else {
+      session.push(line)
+    }
+  }
+
+  return {session, media}
+}
+
+function collectActiveExtmaps(sdps) {
+  const midById = new Map()
+  const midByUri = new Map()
+  const bundleById = new Map()
+  const bundleByUri = new Map()
+
+  for (const sdp of sdps) {
+    if (typeof sdp !== "string" || !sdp.includes("a=extmap:")) continue
+    for (const sec of splitSdpSections(sdp).media) {
+      if (sec.port === "0" || !sec.mid) continue
+      let byId = midById.get(sec.mid)
+      let byUri = midByUri.get(sec.mid)
+      if (!byId) {
+        byId = new Map()
+        byUri = new Map()
+        midById.set(sec.mid, byId)
+        midByUri.set(sec.mid, byUri)
+      }
+      for (const line of sec.lines) {
+        const m = EXTMAP_RE.exec(line)
+        if (!m) continue
+        const [, id, uri] = m
+        if (!byId.has(id)) byId.set(id, uri)
+        if (!byUri.has(uri)) byUri.set(uri, id)
+        if (!bundleById.has(id)) bundleById.set(id, uri)
+        if (!bundleByUri.has(uri)) bundleByUri.set(uri, id)
+      }
+    }
+  }
+
+  return {midById, midByUri, bundleById, bundleByUri}
+}
+
+// Chromium rejects remote SDP offers/answers that reassign an active RTP header
+// extension ID to a different URI (or move a URI to a different ID) on an active
+// MID / BUNDLE group. Dropping colliding `a=extmap` lines lets `createAnswer()`
+// cleanly omit those extensions per RFC 8285 instead of failing negotiation.
+function dropConflictingExtmaps(pc, sdp) {
+  if (typeof sdp !== "string" || !sdp.includes("a=extmap:")) return sdp
+  const prior = [
+    pc.currentRemoteDescription?.sdp || pc.remoteDescription?.sdp,
+    pc.currentLocalDescription?.sdp || pc.localDescription?.sdp,
+  ]
+  const {midById, midByUri, bundleById, bundleByUri} = collectActiveExtmaps(prior)
+  if (bundleById.size === 0) return sdp
+
+  const eol = sdp.includes("\r\n") ? "\r\n" : "\n"
+  const sections = splitSdpSections(sdp)
+  const seenId = new Map(bundleById)
+  const seenUri = new Map(bundleByUri)
+  let changed = false
+
+  const mediaLines = sections.media.flatMap((sec) => {
+    if (sec.port === "0") return sec.lines
+    const existingById = sec.mid ? midById.get(sec.mid) : null
+    const existingByUri = sec.mid ? midByUri.get(sec.mid) : null
+
+    return sec.lines.filter((line) => {
+      const m = EXTMAP_RE.exec(line)
+      if (!m) return true
+      const [, id, uri] = m
+
+      if (existingById?.get(id) === uri) return true
+
+      const midConflict =
+        (existingById?.has(id) && existingById.get(id) !== uri) ||
+        (existingByUri?.has(uri) && existingByUri.get(uri) !== id)
+      const bundleConflict =
+        (seenId.has(id) && seenId.get(id) !== uri) ||
+        (seenUri.has(uri) && seenUri.get(uri) !== id)
+
+      if (midConflict || bundleConflict) {
+        changed = true
+        return false
+      }
+
+      seenId.set(id, uri)
+      seenUri.set(uri, id)
+      return true
+    })
+  })
+
+  return changed ? [...sections.session, ...mediaLines].join(eol) : sdp
 }
 
 function sameCaptureConfig(a, b) {

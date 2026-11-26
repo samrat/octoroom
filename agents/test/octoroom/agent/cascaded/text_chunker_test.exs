@@ -46,4 +46,13 @@ defmodule Octoroom.Agent.Cascaded.TextChunkerTest do
     assert {[^clause], state} = TextChunker.push(state, clause <> " " <> rest)
     assert {[^rest], _state} = TextChunker.flush(state)
   end
+
+  test "does not slice mid-word after multibyte UTF-8 characters like em-dashes" do
+    text = "Got it—Thursday, Nov 26 at 3 PM. What's your name and phone number?"
+
+    assert {["Got it—Thursday, Nov 26 at 3 PM.", "What's your name and phone number?"], state} =
+             TextChunker.push(TextChunker.new(), text)
+
+    assert {[], _state} = TextChunker.flush(state)
+  end
 end

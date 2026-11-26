@@ -189,6 +189,16 @@ class FakeTransceiver {
  * `remoteOffer({"3": "audio"})`. Unless `autoConnect` is off, the connection
  * is up once the first answer is applied.
  */
+function parseSdpMids(sdp) {
+  const entries = []
+  let kind = null
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith("m=")) kind = line.slice(2).split(" ")[0]
+    else if (line.startsWith("a=mid:") && kind) entries.push([line.slice(6).trim(), kind])
+  }
+  return entries
+}
+
 export class FakePeerConnection {
   static instances = []
   static autoConnect = true
@@ -276,7 +286,10 @@ export class FakePeerConnection {
     this.remoteDescription = description
     if (description.type === "offer") {
       this.signalingState = "have-remote-offer"
-      for (const [mid, kind] of Object.entries(JSON.parse(description.sdp))) {
+      const entries = description.sdp.startsWith("v=")
+        ? parseSdpMids(description.sdp)
+        : Object.entries(JSON.parse(description.sdp))
+      for (const [mid, kind] of entries) {
         if (this.mid(mid)) continue
         const transceiver = new FakeTransceiver(null, kind, "recvonly")
         transceiver.mid = mid

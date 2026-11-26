@@ -90,7 +90,7 @@ defmodule Octoroom.Agent.Cascaded.TextChunker do
     regex
     |> Regex.scan(text, return: :index)
     |> Enum.find_value(fn [{index, length} | _] ->
-      candidate = String.slice(text, 0, index + length) |> clean()
+      candidate = binary_part(text, 0, index + length) |> clean()
 
       if word_count(candidate) >= min_words do
         candidate

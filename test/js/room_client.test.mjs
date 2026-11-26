@@ -528,6 +528,54 @@ describe("what the server pulls", () => {
     assert.equal((await channel.next("answer")).payload.op_id, "op-2")
   })
 
+  test("drops colliding a=extmap lines on renegotiation so Chrome does not reject active MIDs", async () => {
+    const ctx = await join()
+    const {channel, pc} = ctx
+    pc.remoteDescription = {
+      type: "answer",
+      sdp: [
+        "v=0",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        "a=mid:0",
+        "a=extmap:2 urn:ietf:params:rtp-hdrext:ssrc-audio-level",
+        "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid",
+        "m=video 9 UDP/TLS/RTP/SAVPF 96",
+        "a=mid:1",
+        "a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+        "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid",
+        "a=extmap:5 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+        "",
+      ].join("\r\n"),
+    }
+
+    const offer = [
+      "v=0",
+      "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+      "a=mid:0",
+      "a=extmap:2 urn:ietf:params:rtp-hdrext:ssrc-audio-level",
+      "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid",
+      "m=video 9 UDP/TLS/RTP/SAVPF 96",
+      "a=mid:1",
+      "a=extmap:1 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+      "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid",
+      "m=video 9 UDP/TLS/RTP/SAVPF 96",
+      "a=mid:2",
+      "a=extmap:1 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+      "a=extmap:6 urn:ietf:params:rtp-hdrext:toffset",
+      "",
+    ].join("\r\n")
+
+    channel.emit("renegotiate", {op_id: "op-extmap", sdp: offer})
+    const answer = await channel.next("answer")
+    assert.equal(answer.payload.op_id, "op-extmap")
+    const applied = pc.remoteDescription.sdp
+    assert.ok(!applied.includes("a=extmap:1 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"))
+    assert.ok(applied.includes("a=extmap:2 urn:ietf:params:rtp-hdrext:ssrc-audio-level"))
+    assert.ok(applied.includes("a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid"))
+    assert.ok(applied.includes("a=extmap:6 urn:ietf:params:rtp-hdrext:toffset"))
+    assert.deepEqual(ctx.emitted("error"), [])
+  })
+
   test("an answer the server refuses is reported", async () => {
     const ctx = await join()
     ctx.channel.emit("renegotiate", {op_id: "op-1", sdp: remoteOffer({1: "audio"})})
