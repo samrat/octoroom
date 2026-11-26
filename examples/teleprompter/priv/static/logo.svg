@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <clipPath id="octoroom-logo-dome">
+      <circle cx="256" cy="212" r="114" />
+    </clipPath>
+    <clipPath id="octoroom-logo-room">
+      <rect x="44" y="42" width="424" height="356" rx="76" />
+    </clipPath>
+  </defs>
+
+  <rect x="44" y="42" width="424" height="356" rx="76" fill="#EFF6FF" stroke="#193CB8" stroke-width="22" />
+  <g clip-path="url(#octoroom-logo-room)">
+    <rect x="44" y="302" width="424" height="106" fill="#DBEAFE" />
+  </g>
+
+  <circle cx="404" cy="104" r="18" fill="#10B981" />
+  <circle cx="404" cy="104" r="7" fill="#D1FAE5" />
+
+  <path
+    d="M178 264 C184 316, 158 352, 122 352 C98 352, 92 332, 96 306"
+    stroke="#193CB8"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+  <path
+    d="M334 264 C328 316, 354 352, 390 352 C414 352, 420 332, 416 306"
+    stroke="#193CB8"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+
+  <path d="M192 276 C210 334, 302 334, 320 276 Z" fill="#193CB8" />
+
+  <path
+    d="M214 302 C198 368, 166 436, 98 442"
+    stroke="#155DFC"
+    stroke-width="30"
+    stroke-linecap="round"
+  />
+  <path
+    d="M298 302 C314 368, 346 436, 414 442"
+    stroke="#155DFC"
+    stroke-width="30"
+    stroke-linecap="round"
+  />
+  <path
+    d="M238 312 C238 392, 218 456, 164 468"
+    stroke="#155DFC"
+    stroke-width="30"
+    stroke-linecap="round"
+  />
+  <path
+    d="M274 312 C274 392, 294 456, 348 468"
+    stroke="#155DFC"
+    stroke-width="30"
+    stroke-linecap="round"
+  />
+
+  <circle cx="256" cy="212" r="114" fill="#193CB8" />
+  <g clip-path="url(#octoroom-logo-dome)">
+    <ellipse cx="239" cy="198" rx="108" ry="112" fill="#155DFC" />
+  </g>
+
+  <circle cx="300" cy="136" r="10" fill="#53EAFD" />
+  <circle cx="322" cy="159" r="6.8" fill="#53EAFD" />
+  <circle cx="297" cy="164" r="4.3" fill="#93C5FD" />
+
+  <circle cx="208" cy="229" r="10.5" fill="#2A2524" />
+  <circle cx="304" cy="229" r="10.5" fill="#2A2524" />
+  <path
+    d="M234 254 Q256 276 278 254"
+    stroke="#2A2524"
+    stroke-width="9"
+    stroke-linecap="round"
+  />
+</svg>
