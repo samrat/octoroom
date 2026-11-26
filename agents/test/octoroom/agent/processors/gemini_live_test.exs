@@ -256,11 +256,19 @@ defmodule Octoroom.Agent.Processors.GeminiLiveTest do
     assert fresh[:fallback_setup][:system_instruction] == "Be brief."
   end
 
-  test "sends the initial text once set up and started" do
-    harness = start(initial_text: "Greet them.")
-    assert Test.timer_pending?(harness, :gemini, :initial_text)
-    Test.fire_timer(harness, :gemini, :initial_text)
+  test "sends the initial prompt once set up and started" do
+    harness = start(initial_prompt: "Greet them.")
+    assert Test.timer_pending?(harness, :gemini, :initial_prompt)
+    Test.fire_timer(harness, :gemini, :initial_prompt)
     assert_received {:to_gemini, {:text, "Greet them."}}
+  end
+
+  test "sends initial_say verbatim once set up and started" do
+    harness = start(initial_say: "Welcome aboard!")
+    assert Test.timer_pending?(harness, :gemini, :initial_say)
+    Test.fire_timer(harness, :gemini, :initial_say)
+    assert_received {:to_gemini, {:text, text}}
+    assert text =~ "Welcome aboard!"
   end
 
   test "forwards compression, transcription and modality options to setup" do

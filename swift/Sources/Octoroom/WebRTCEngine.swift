@@ -10,9 +10,14 @@ import ImageIO
 public final class WebRTCEngine: MediaEngine {
   public let factory: RTCPeerConnectionFactory
 
-  /// - Parameter speaker: on iOS, play through the loudspeaker (as video
-  ///   calls do) rather than the earpiece.
-  public init(speaker: Bool = true) {
+  /// - Parameters:
+  ///   - speaker: on iOS, play through the loudspeaker (as video calls do)
+  ///     rather than the earpiece.
+  ///   - manualAudio: on iOS, set `RTCAudioSession.useManualAudio` when using
+  ///     CallKit, then forward `CXProviderDelegate`'s `didActivate` and
+  ///     `didDeactivate` callbacks to `audioSessionDidActivate(_:)` and
+  ///     `audioSessionDidDeactivate(_:)`.
+  public init(speaker: Bool = true, manualAudio: Bool = false) {
     Self.initializeOnce
     // WebRTC's default is playAndRecord in voiceChat mode (the earpiece).
     // videoChat mode routes to the loudspeaker and allows Bluetooth by
@@ -25,11 +30,43 @@ public final class WebRTCEngine: MediaEngine {
         config.mode = AVAudioSession.Mode.videoChat.rawValue
         RTCAudioSessionConfiguration.setWebRTC(config)
       }
+      if manualAudio {
+        RTCAudioSession.sharedInstance().useManualAudio = true
+      }
     #endif
     factory = RTCPeerConnectionFactory(
       encoderFactory: RTCDefaultVideoEncoderFactory(),
       decoderFactory: RTCDefaultVideoDecoderFactory())
   }
+
+  #if os(iOS)
+    /// Forwards CallKit's `provider(_:didActivate:)` callback to WebRTC's shared
+    /// audio session so CallKit apps don't need to import `WebRTC` directly.
+    public nonisolated static func audioSessionDidActivate(_ audioSession: AVAudioSession) {
+      let session = RTCAudioSession.sharedInstance()
+      session.audioSessionDidActivate(audioSession)
+      if session.useManualAudio { session.isAudioEnabled = true }
+    }
+
+    /// Forwards CallKit's `provider(_:didDeactivate:)` callback to WebRTC's shared
+    /// audio session.
+    public nonisolated static func audioSessionDidDeactivate(_ audioSession: AVAudioSession) {
+      let session = RTCAudioSession.sharedInstance()
+      if session.useManualAudio { session.isAudioEnabled = false }
+      session.audioSessionDidDeactivate(audioSession)
+    }
+
+    /// Switches audio playback between the loudspeaker (`true`) and the
+    /// default route / earpiece or Bluetooth (`false`) mid-call on iOS.
+    public func setSpeaker(_ enabled: Bool) throws {
+      #if !targetEnvironment(simulator)
+        let session = RTCAudioSession.sharedInstance()
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        try session.overrideOutputAudioPort(enabled ? .speaker : .none)
+      #endif
+    }
+  #endif
 
   private static let initializeOnce: Void = { RTCInitializeSSL() }()
 

@@ -97,11 +97,12 @@ defmodule Octoroom.Agent.Processors.NuanceLive do
       reply_to: Map.get(ctx, :runner) || self(),
       tools: tools,
       context: Keyword.get(opts, :context, Map.get(ctx, :context, %{})) || %{},
-      initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      initial_prompt: Keyword.get(opts, :initial_prompt, Map.get(ctx, :initial_prompt)),
+      initial_say: Keyword.get(opts, :initial_say, Map.get(ctx, :initial_say)),
       out_resample: nil,
       started?: false,
       session_started?: false,
-      sent_initial_text?: false,
+      sent_initial?: false,
       generating?: false,
       discard?: false,
       hearing?: false,
@@ -166,7 +167,7 @@ defmodule Octoroom.Agent.Processors.NuanceLive do
 
   def handle_frame(%Frames.Start{} = frame, :downstream, state) do
     state = %{state | started?: true}
-    {[{:push, frame, :downstream}], maybe_send_initial_text(state)}
+    {[{:push, frame, :downstream}], maybe_send_initial(state)}
   end
 
   def handle_frame(%Frames.Interruption{} = frame, :downstream, state) do
@@ -324,7 +325,7 @@ defmodule Octoroom.Agent.Processors.NuanceLive do
     dur = if state.connect_started_at, do: max(now() - state.connect_started_at, 0)
     emit_session(state, :started, if(dur, do: %{duration_ms: dur}, else: %{}))
     state = %{state | session_started?: true, connect_started_at: nil}
-    {[], maybe_send_initial_text(state)}
+    {[], maybe_send_initial(state)}
   end
 
   defp event({:video_rtp, %ExRTP.Packet{} = packet, codec}, state) do
@@ -530,15 +531,30 @@ defmodule Octoroom.Agent.Processors.NuanceLive do
 
   defp maybe_flush_tool_results(state), do: state
 
-  defp maybe_send_initial_text(
-         %{sent_initial_text?: false, started?: true, session_started?: true} = state
-       )
-       when is_binary(state.initial_text) and state.initial_text != "" do
-    send_nuance(state, {:json, Protocol.response_create_frame(instructions: state.initial_text)})
-    %{state | sent_initial_text?: true}
+  defp maybe_send_initial(%{sent_initial?: false, started?: true, session_started?: true} = state)
+       when is_binary(state.initial_say) and state.initial_say != "" do
+    send_nuance(
+      state,
+      {:json,
+       Protocol.response_create_frame(
+         instructions: "Say this to the user right now: " <> state.initial_say
+       )}
+    )
+
+    %{state | sent_initial?: true}
   end
 
-  defp maybe_send_initial_text(state), do: state
+  defp maybe_send_initial(%{sent_initial?: false, started?: true, session_started?: true} = state)
+       when is_binary(state.initial_prompt) and state.initial_prompt != "" do
+    send_nuance(
+      state,
+      {:json, Protocol.response_create_frame(instructions: state.initial_prompt)}
+    )
+
+    %{state | sent_initial?: true}
+  end
+
+  defp maybe_send_initial(state), do: state
 
   defp ensure_user_idle_timer(%{user_idle_timer?: true} = state), do: {[], state}
 

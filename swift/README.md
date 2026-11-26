@@ -64,8 +64,9 @@ struct CallView: View {
 Remote audio plays by itself, at the gain the server sets. For anything
 that isn't state, use `for await event in room.events()`. You get
 `.roomEvent`, `.reconnecting`, `.reconnected(resumed:)`, `.connection`,
-`.left(reason)` and `.error`. `await room.levels()` returns audio levels
-for speaking indicators.
+`.left(reason)` and `.error`. `await room.levels()` returns `AudioLevels`
+(`local`, `remote`, and `workers`) for speaking indicators on both
+participants and AI worker tracks.
 
 Workers the room shows this client (AI agents, say) are in `room.workers`,
 with their presence (`state`, `attributes`); their events come as
@@ -95,10 +96,15 @@ try await agents.say("add Acme to the sheet", to: "assistant")
 - **Permissions.** Add `NSMicrophoneUsageDescription` and
   `NSCameraUsageDescription` to your Info.plist. The client asks for
   access when it opens each device.
-- **Audio route.** On iOS, `WebRTCEngine(speaker: true)` (the default)
-  plays through the loudspeaker, as video calls do. Pass `false` for the
-  earpiece. The simulator always keeps WebRTC's default audio session: its
-  CoreAudio deadlocks when capture starts in `videoChat` mode.
+- **Audio route & CallKit.** On iOS, `WebRTCEngine(speaker: true)` (the
+  default) plays through the loudspeaker, as video calls do. Pass `false` for
+  the earpiece, or toggle at runtime with `try engine.setSpeaker(true/false)`.
+  When integrating with CallKit, pass `manualAudio: true` and forward your
+  `CXProviderDelegate` audio session callbacks to
+  `WebRTCEngine.audioSessionDidActivate(audioSession)` and
+  `WebRTCEngine.audioSessionDidDeactivate(audioSession)`. The simulator always keeps
+  WebRTC's default audio session: its CoreAudio deadlocks when capture starts
+  in `videoChat` mode.
 - **Leaving on quit.** Browsers say goodbye on `pagehide`. An app should
   call `room.leave()` when it's done with the call. Otherwise the server
   holds the participant for the resume grace period.

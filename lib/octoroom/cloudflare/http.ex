@@ -170,34 +170,51 @@ defmodule Octoroom.Cloudflare.HTTP do
   defp retry?(_method, _path, _result), do: false
 
   defp request_once(config, method, path, body) do
-    request_fun = Map.get(config, :request_fun, &Req.request/1)
-    started = System.monotonic_time(:millisecond)
+    with {:ok, app_id} <- fetch_credential(config, :app_id),
+         {:ok, app_secret} <- fetch_credential(config, :app_secret) do
+      request_fun = Map.get(config, :request_fun, &Req.request/1)
+      started = System.monotonic_time(:millisecond)
 
-    opts =
-      [
+      opts =
+        [
+          method: method,
+          url: "#{@base_url}/#{app_id}#{path}",
+          auth: {:bearer, app_secret},
+          retry: false,
+          # Pulling a track Cloudflare has no packets for yet is held ~8 s.
+          receive_timeout: 20_000
+        ]
+        |> then(fn opts -> if body, do: Keyword.put(opts, :json, body), else: opts end)
+
+      result = request_fun.(opts)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      response = handle_response(path, result)
+
+      :telemetry.execute([:octoroom, :cloudflare, :request], %{duration_ms: elapsed}, %{
+        room_id: config[:room_id],
         method: method,
-        url: "#{@base_url}/#{config.app_id}#{path}",
-        auth: {:bearer, config.app_secret},
-        retry: false,
-        # Pulling a track Cloudflare has no packets for yet is held ~8 s.
-        receive_timeout: 20_000
-      ]
-      |> then(fn opts -> if body, do: Keyword.put(opts, :json, body), else: opts end)
+        path: path,
+        result: elem(response, 0)
+      })
 
-    result = request_fun.(opts)
-    elapsed = System.monotonic_time(:millisecond) - started
+      Logger.debug("Cloudflare #{method} #{path} in #{elapsed} ms")
+      response
+    end
+  end
 
-    response = handle_response(path, result)
+  defp fetch_credential(config, key) do
+    case Map.get(config, key) do
+      value when is_binary(value) and value != "" ->
+        {:ok, value}
 
-    :telemetry.execute([:octoroom, :cloudflare, :request], %{duration_ms: elapsed}, %{
-      room_id: config[:room_id],
-      method: method,
-      path: path,
-      result: elem(response, 0)
-    })
-
-    Logger.debug("Cloudflare #{method} #{path} in #{elapsed} ms")
-    response
+      _ ->
+        {:error,
+         {:cloudflare_not_configured,
+          "Cloudflare Realtime SFU #{inspect(key)} is missing. Configure " <>
+            "`config :octoroom, cloudflare: [app_id: ..., app_secret: ...]`, or for " <>
+            "localhost dev use `config :octoroom, cloudflare: [client: Octoroom.Cloudflare.Local], ice_servers: []`."}}
+    end
   end
 
   defp handle_response(path, {:ok, %{status: status, body: body}}) when status in 200..299 do

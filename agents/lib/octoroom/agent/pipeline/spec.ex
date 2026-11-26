@@ -113,8 +113,11 @@ defmodule Octoroom.Agent.Pipeline.Spec do
     alias Octoroom.Agent.Processors
     alias Octoroom.Agent.{STT, TTS}
 
-    opts = Keyword.validate!(opts, [:stt, :llm, :tts, :transcriber, :preemptive, vad: []])
+    opts =
+      Keyword.validate!(opts, [:stt, :llm, :tts, :transcriber, :preemptive, vad: [], context: []])
+
     vad = opts[:vad]
+    context_opts = opts[:context]
 
     preemptive_opt =
       case Keyword.fetch(opts, :preemptive) do
@@ -175,7 +178,7 @@ defmodule Octoroom.Agent.Pipeline.Spec do
 
     back =
       back
-      |> processor(:context, Processors.Context)
+      |> processor(:context, Processors.Context, context_opts)
       |> processor(:llm, Processors.LLM, llm)
       |> processor(:tools, Processors.Tools)
       |> processor(:chunker, Processors.TextChunker)

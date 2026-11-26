@@ -88,7 +88,7 @@ Eight recorded questions, one at a time:
   Nemotron's first text follows about 0.2 s later, and AssemblyAI's first
   audio 0.3 s after that.
 - **The greeting doesn't wait for the listener.** It starts 100 ms after
-  the agent does (`initial_text/1`), and only the LLM's time hides that the
+  the agent does (`initial_prompt/1`), and only the LLM's time hides that the
   browser may not be pulling the agent's track yet. In one run its first
   sound reached the tab 21 ms after the track did. Nothing was clipped in
   the runs checked, but nothing makes sure of it.

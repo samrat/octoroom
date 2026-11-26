@@ -16,7 +16,7 @@ defmodule Vision.GeminiAssistant do
   end
 
   @impl true
-  def initial_text(_ctx),
+  def initial_prompt(_ctx),
     do: "Greet me briefly and let me know you can see my camera or screen once I share it."
 
   @impl true

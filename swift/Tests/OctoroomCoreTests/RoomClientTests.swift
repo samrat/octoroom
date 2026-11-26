@@ -339,14 +339,23 @@ final class Harness {
     let h = Harness()
     try await h.join()
     h.engine.pc.addRemote(mid: "r1", kind: .audio)
-    h.push("tracks", ["added": [["mid": "r1", "track": "p2/mic", "kind": "audio", "source": "mic", "participant_id": "p2", "gain": 1]], "removed": []])
-    try await until { h.room.tracks.count == 1 }
+    h.engine.pc.addRemote(mid: "r2", kind: .audio)
+    h.push("tracks", [
+      "added": [
+        ["mid": "r1", "track": "p2/mic", "kind": "audio", "source": "mic", "participant_id": "p2", "gain": 1],
+        ["mid": "r2", "track": "assistant", "kind": "audio", "source": .null, "participant_id": .null, "gain": 1],
+      ],
+      "removed": [],
+    ])
+    try await until { h.room.tracks.count == 2 }
     h.engine.pc.stats = [
       StatsEntry(type: "inbound-rtp", kind: "audio", mid: "r1", audioLevel: 0.4),
+      StatsEntry(type: "inbound-rtp", kind: "audio", mid: "r2", audioLevel: 0.6),
       StatsEntry(type: "media-source", kind: "audio", trackIdentifier: h.engine.opened[0].id, audioLevel: 0.7),
     ]
     let levels = await h.room.levels()
     #expect(levels.remote == ["p2": 0.4])
+    #expect(levels.workers == ["assistant": 0.6])
     #expect(levels.local == 0.7)
   }
 }

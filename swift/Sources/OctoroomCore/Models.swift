@@ -208,10 +208,13 @@ public struct AudioLevels: Sendable, Hashable {
   public var local: Double = 0
   /// By participant id.
   public var remote: [String: Double] = [:]
+  /// By worker audio output track name (e.g. `"assistant"`).
+  public var workers: [String: Double] = [:]
 
-  public init(local: Double = 0, remote: [String: Double] = [:]) {
+  public init(local: Double = 0, remote: [String: Double] = [:], workers: [String: Double] = [:]) {
     self.local = local
     self.remote = remote
+    self.workers = workers
   }
 }
 

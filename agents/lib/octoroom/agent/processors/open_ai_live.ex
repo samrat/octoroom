@@ -37,7 +37,8 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   delegation map), `:idle_timeout_s` (`5..60` seconds before standby, or `nil`
   to omit; WebRTC only), `:wake_policy` (`:speech`, `[type: :speech,
   vad_threshold: 0.5]`, or a map; WebRTC only), `:initial_items`, and,
-  defaulting to the runner context's, `:instructions`, `:initial_text`,
+  defaulting to the runner context's, `:instructions`, `:initial_prompt`,
+  `:initial_say`,
   `:tools` and `:context`. The transport starts only under a runner; for tests,
   pass `send: fn message -> ... end` to capture what would go to OpenAI, and
   feed its events with `{:openai_live_socket, event}`.
@@ -56,7 +57,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   alias Octoroom.Agent.ToolResult
 
   @output_sample_rate 24_000
-  @initial_text_delay_ms 1_000
+  @initial_prompt_delay_ms 1_000
   # Quiet gap with no input audio before telling OpenAI Live to feed silence.
   @audio_end_ms 200
   # Idle gaps used to finalize full-duplex transcript/audio bursts.
@@ -138,13 +139,14 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
       reply_to: Map.get(ctx, :runner) || self(),
       tools: tools,
       context: Keyword.get(opts, :context, Map.get(ctx, :context, %{})) || %{},
-      initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      initial_prompt: Keyword.get(opts, :initial_prompt, Map.get(ctx, :initial_prompt)),
+      initial_say: Keyword.get(opts, :initial_say, Map.get(ctx, :initial_say)),
       sample_rate: sample_rate,
       in_resample: nil,
       out_resample: nil,
       started?: false,
       session_started?: false,
-      sent_initial_text?: false,
+      sent_initial?: false,
       input_muted?: false,
       generating?: false,
       discard?: false,
@@ -235,7 +237,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
 
   def handle_frame(%Frames.Start{} = frame, :downstream, state) do
     state = %{state | started?: true}
-    {[{:push, frame, :downstream} | initial_text_timer(state)], state}
+    {[{:push, frame, :downstream} | initial_timer(state)], state}
   end
 
   def handle_frame(%Frames.Interruption{} = frame, :downstream, state) do
@@ -315,9 +317,19 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
   # -- Timers --
 
   @impl true
-  def handle_timer(:initial_text, %{sent_initial_text?: false} = state) do
-    send_openai(state, {:commentary, state.initial_text})
-    {[], %{state | sent_initial_text?: true}}
+  def handle_timer(:initial_say, %{sent_initial?: false} = state) do
+    send_openai(
+      state,
+      {:commentary,
+       "[From the app] Say this, word for word, and nothing else: " <> inspect(state.initial_say)}
+    )
+
+    {[], %{state | sent_initial?: true}}
+  end
+
+  def handle_timer(:initial_prompt, %{sent_initial?: false} = state) do
+    send_openai(state, {:commentary, state.initial_prompt})
+    {[], %{state | sent_initial?: true}}
   end
 
   def handle_timer(:audio_end, state) do
@@ -420,7 +432,7 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
     dur = if state.connect_started_at, do: max(now() - state.connect_started_at, 0)
     emit_session(state, :started, if(dur, do: %{duration_ms: dur}, else: %{}))
     state = %{state | session_started?: true, connect_started_at: nil}
-    {initial_text_timer(state), state}
+    {initial_timer(state), state}
   end
 
   defp event({:audio, _pcm, _rate}, %{discard?: true} = state) do
@@ -609,13 +621,15 @@ defmodule Octoroom.Agent.Processors.OpenAILive do
     ConversationEvents.commit(state, :assistant, status)
   end
 
-  defp initial_text_timer(
-         %{sent_initial_text?: false, started?: true, session_started?: true} = s
-       )
-       when is_binary(s.initial_text) and s.initial_text != "",
-       do: [{:timer, :initial_text, @initial_text_delay_ms}]
+  defp initial_timer(%{sent_initial?: false, started?: true, session_started?: true} = s)
+       when is_binary(s.initial_say) and s.initial_say != "",
+       do: [{:timer, :initial_say, @initial_prompt_delay_ms}]
 
-  defp initial_text_timer(_state), do: []
+  defp initial_timer(%{sent_initial?: false, started?: true, session_started?: true} = s)
+       when is_binary(s.initial_prompt) and s.initial_prompt != "",
+       do: [{:timer, :initial_prompt, @initial_prompt_delay_ms}]
+
+  defp initial_timer(_state), do: []
 
   defp now, do: System.monotonic_time(:millisecond)
 

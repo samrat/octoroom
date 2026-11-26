@@ -966,22 +966,35 @@ describe("the room", () => {
     )
   })
 
-  test("levels come from the mic's and the remote mics' stats", async () => {
+  test("levels come from the mic's, remote mics', and worker outputs' stats", async () => {
     const ctx = await join()
-    await pull(ctx, [BOB_MIC, BOB_CAMERA])
+    const AGENT_AUDIO = {
+      mid: "3",
+      track: "assistant",
+      kind: "audio",
+      source: null,
+      participant_id: null,
+      gain: 1.0,
+    }
+    await pull(ctx, [BOB_MIC, BOB_CAMERA, AGENT_AUDIO])
     const [mic] = browser.devices.streams[0].getAudioTracks()
 
     ctx.pc.stats = [
       {type: "inbound-rtp", kind: "audio", mid: "1", audioLevel: 0.4},
       {type: "inbound-rtp", kind: "video", mid: "2"},
+      {type: "inbound-rtp", kind: "audio", mid: "3", audioLevel: 0.6},
       {type: "inbound-rtp", kind: "audio", mid: "8", audioLevel: 0.9},
       {type: "media-source", kind: "audio", trackIdentifier: mic.id, audioLevel: 0.7},
       {type: "media-source", kind: "audio", trackIdentifier: "another", audioLevel: 0.1},
     ]
-    assert.deepEqual(await ctx.room.levels(), {local: 0.7, remote: {p2: 0.4}})
+    assert.deepEqual(await ctx.room.levels(), {
+      local: 0.7,
+      remote: {p2: 0.4},
+      workers: {assistant: 0.6},
+    })
 
     await ctx.room.leave()
-    assert.deepEqual(await ctx.room.levels(), {local: 0, remote: {}})
+    assert.deepEqual(await ctx.room.levels(), {local: 0, remote: {}, workers: {}})
   })
 
   test("on() returns a function that removes the listener", async () => {

@@ -119,7 +119,7 @@ defmodule Octoroom.Agent.Worker do
 
   `Octoroom.Agent.agent/3` builds these from an `Octoroom.Agent` module:
   `:agent` (the module) and `:args` (its `ctx.args`), whose callbacks fill
-  in `:instructions`, `:tools`, `:initial_text` and the pipelines. Given
+  in `:instructions`, `:tools`, `:initial_prompt`, `:initial_say` and the pipelines. Given
   directly:
 
     * `:front_end`, `:back_end` - the pipeline specs, both needed (see
@@ -132,7 +132,7 @@ defmodule Octoroom.Agent.Worker do
     * `:name` (default `"Assistant"`), `:respond`, `:follow_up_ms` (default
       10 s), `:gate` (`:name`, the default, or `:decision`), `:thresholds`,
       `:decisions` (options for the decision stage) - see above
-    * `:instructions`, `:initial_text`, `:tools` - read by the context and
+    * `:instructions`, `:initial_prompt`, `:initial_say`, `:tools` - read by the context and
       tools stages
     * `:tool_context` - the map tool handlers receive (`room_id`,
       `agent_id`, and `speaker`, the participant whose turn started the
@@ -264,6 +264,7 @@ defmodule Octoroom.Agent.Worker do
         # Options the back end set on front-end stages with `UpdateStage`,
         # by stage name, for front ends started later.
         front_updates: %{},
+        failed_fronts: MapSet.new(),
         # Mixed (no front end, as for Gemini Live): every input goes into
         # one mix, which the back end hears a chunk at a time. `mix_at` is
         # when the next chunk is due.
@@ -419,6 +420,12 @@ defmodule Octoroom.Agent.Worker do
       Enum.reduce(audio_inputs -- Map.keys(state.fronts), {state, []}, &add_front/2)
 
     state = Enum.reduce(Map.keys(state.fronts) -- audio_inputs, state, &drop_front/2)
+
+    state = %{
+      state
+      | failed_fronts: MapSet.intersection(state.failed_fronts, MapSet.new(audio_inputs))
+    }
+
     {state, actions} = sync_video_inputs(video_inputs, state, actions)
     result(state, actions)
   end
@@ -765,7 +772,8 @@ defmodule Octoroom.Agent.Worker do
     from_module = %{
       instructions: module.instructions(agent_ctx),
       tools: module.tools(agent_ctx),
-      initial_text: if(ctx.resumed, do: nil, else: module.initial_text(agent_ctx))
+      initial_prompt: if(ctx.resumed, do: nil, else: module.initial_prompt(agent_ctx)),
+      initial_say: if(ctx.resumed, do: nil, else: module.initial_say(agent_ctx))
     }
 
     case module.pipeline(agent_ctx) do
@@ -896,7 +904,8 @@ defmodule Octoroom.Agent.Worker do
       telemetry: %{room_id: ctx.room_id, agent_id: ctx.id},
       instructions: Map.get(args, :instructions),
       # Carrying on a conversation: no greeting.
-      initial_text: if(restored?(ctx, restore), do: nil, else: Map.get(args, :initial_text)),
+      initial_prompt: if(restored?(ctx, restore), do: nil, else: Map.get(args, :initial_prompt)),
+      initial_say: if(restored?(ctx, restore), do: nil, else: Map.get(args, :initial_say)),
       tools: Map.get(args, :tools, []),
       context: tool_context,
       restore: restore,
@@ -987,27 +996,31 @@ defmodule Octoroom.Agent.Worker do
   # -- Front ends: one per input --
 
   defp add_front(input, {state, actions}) do
-    ctx = %{
-      runner: self(),
-      session_id: "#{state.room_id}/#{state.id}/#{input}",
-      telemetry: %{room_id: state.room_id, agent_id: state.id, input: input}
-    }
+    if MapSet.member?(state.failed_fronts, input) do
+      {state, actions}
+    else
+      ctx = %{
+        runner: self(),
+        session_id: "#{state.room_id}/#{state.id}/#{input}",
+        telemetry: %{room_id: state.room_id, agent_id: state.id, input: input}
+      }
 
-    case Core.new(state.front_spec, ctx) do
-      {:ok, core} ->
-        core = Core.observe(core, [Frames.VADUserStoppedSpeaking])
-        state = put_in(state.fronts[input], %{core: core, host: Host.new()})
-        {commands, core} = Core.push(core, %Frames.Start{session_id: ctx.session_id})
-        state = put_in(state.fronts[input].core, core)
-        acc = front_commands(input, commands, state, actions)
+      case Core.new(state.front_spec, ctx) do
+        {:ok, core} ->
+          core = Core.observe(core, [Frames.VADUserStoppedSpeaking])
+          state = put_in(state.fronts[input], %{core: core, host: Host.new()})
+          {commands, core} = Core.push(core, %Frames.Start{session_id: ctx.session_id})
+          state = put_in(state.fronts[input].core, core)
+          acc = front_commands(input, commands, state, actions)
 
-        Enum.reduce(state.front_updates, acc, fn {name, opts}, acc ->
-          push_front(input, %Frames.UpdateStage{stage: name, opts: opts}, acc)
-        end)
+          Enum.reduce(state.front_updates, acc, fn {name, opts}, acc ->
+            push_front(input, %Frames.UpdateStage{stage: name, opts: opts}, acc)
+          end)
 
-      {:error, reason} ->
-        Logger.warning("agent #{state.id} can't hear #{input}: #{inspect(reason)}")
-        {state, actions}
+        {:error, reason} ->
+          Logger.warning("agent #{state.id} can't hear #{input}: #{inspect(reason)}")
+          {%{state | failed_fronts: MapSet.put(state.failed_fronts, input)}, actions}
+      end
     end
   end
 
@@ -1555,8 +1568,14 @@ defmodule Octoroom.Agent.Worker do
 
   defp back_command({:notify, event}, state), do: {state, [emit: {:agent, event}]}
 
-  defp back_command({:interrupted, _generation}, state),
-    do: set_presence(%{state | turn: nil, speaking_until: now()}, "listening", flush: :default)
+  defp back_command({:interrupted, _generation}, state) do
+    actions =
+      if Enum.any?(state.outputs, &(Map.get(state.output_kinds, &1, :audio) == :audio)),
+        do: [flush: :default],
+        else: []
+
+    set_presence(%{state | turn: nil, speaking_until: now()}, "listening", actions)
+  end
 
   defp back_command({:observe, %Frames.LLMText{}}, %{turn: %{} = turn} = state)
        when not is_map_key(turn, :llm),

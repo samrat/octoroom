@@ -287,11 +287,19 @@ defmodule Octoroom.Agent.Processors.OpenAILiveTest do
     assert fresh[:setup][:instructions] == "Be brief."
   end
 
-  test "sends initial_text once session_started and Start have both arrived" do
-    harness = start(initial_text: "Greet them.")
-    assert Test.timer_pending?(harness, :openai, :initial_text)
-    Test.fire_timer(harness, :openai, :initial_text)
+  test "sends initial_prompt once session_started and Start have both arrived" do
+    harness = start(initial_prompt: "Greet them.")
+    assert Test.timer_pending?(harness, :openai, :initial_prompt)
+    Test.fire_timer(harness, :openai, :initial_prompt)
     assert_received {:to_openai, {:commentary, "Greet them."}}
+  end
+
+  test "sends initial_say verbatim once session_started and Start have both arrived" do
+    harness = start(initial_say: "Hello from OpenAI Live.")
+    assert Test.timer_pending?(harness, :openai, :initial_say)
+    Test.fire_timer(harness, :openai, :initial_say)
+    assert_received {:to_openai, {:commentary, text}}
+    assert text =~ "Hello from OpenAI Live."
   end
 
   test "forwards idle_timeout_s and wake_policy to setup and notifies pause/resume" do

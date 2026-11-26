@@ -33,7 +33,8 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   `[trigger_tokens: ..., target_tokens: ...]`; defaults to `104_857` / `52_428`),
   `:input_audio_transcription` (default `true`), `:output_audio_transcription`
   (default `true`), `:response_modalities` (default `["AUDIO"]`), and,
-  defaulting to the runner context's, `:instructions`, `:initial_text`,
+  defaulting to the runner context's, `:instructions`, `:initial_prompt`,
+  `:initial_say`,
   `:tools` and `:context`. The socket starts only under a runner; for tests,
   pass `send: fn message -> ... end` to capture what would go to Gemini, and
   feed its events with `{:gemini_live_socket, event}` messages.
@@ -51,7 +52,7 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   alias Octoroom.Agent.ToolExecutor
   alias Octoroom.Agent.ToolResult
 
-  @initial_text_delay_ms 1_000
+  @initial_prompt_delay_ms 1_000
   # How long without input audio before the model is told the stream paused
   # (everyone muted), so it doesn't wait for the rest of a sentence.
   @audio_end_ms 200
@@ -119,10 +120,11 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
       reply_to: Map.get(ctx, :runner) || self(),
       tools: tools,
       context: Keyword.get(opts, :context, Map.get(ctx, :context, %{})) || %{},
-      initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      initial_prompt: Keyword.get(opts, :initial_prompt, Map.get(ctx, :initial_prompt)),
+      initial_say: Keyword.get(opts, :initial_say, Map.get(ctx, :initial_say)),
       started?: false,
       setup_complete?: false,
-      sent_initial_text?: false,
+      sent_initial?: false,
       # The model is generating a reply, and whether to drop the rest of it
       # (interrupted here, not by the model).
       generating?: false,
@@ -227,7 +229,7 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
 
   def handle_frame(%Frames.Start{} = frame, :downstream, state) do
     state = %{state | started?: true}
-    {[{:push, frame, :downstream} | initial_text_timer(state)], state}
+    {[{:push, frame, :downstream} | initial_timer(state)], state}
   end
 
   def handle_frame(%Frames.Interruption{} = frame, :downstream, %{interrupting?: true} = state),
@@ -293,9 +295,19 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
   def handle_frame(frame, direction, state), do: {[{:push, frame, direction}], state}
 
   @impl true
-  def handle_timer(:initial_text, %{sent_initial_text?: false} = state) do
-    send_gemini(state, {:text, state.initial_text})
-    {[], %{state | sent_initial_text?: true}}
+  def handle_timer(:initial_say, %{sent_initial?: false} = state) do
+    send_gemini(
+      state,
+      {:text,
+       "[From the app] Say this, word for word, and nothing else: " <> inspect(state.initial_say)}
+    )
+
+    {[], %{state | sent_initial?: true}}
+  end
+
+  def handle_timer(:initial_prompt, %{sent_initial?: false} = state) do
+    send_gemini(state, {:text, state.initial_prompt})
+    {[], %{state | sent_initial?: true}}
   end
 
   def handle_timer(:audio_end, state) do
@@ -366,7 +378,7 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     dur = if state.connect_started_at, do: max(now() - state.connect_started_at, 0)
     emit_session(state, :started, if(dur, do: %{duration_ms: dur}, else: %{}))
     state = %{state | setup_complete?: true, connect_started_at: nil}
-    {initial_text_timer(state), state}
+    {initial_timer(state), state}
   end
 
   defp event({:audio, _pcm, _rate}, %{discard?: true} = state), do: {[], state}
@@ -497,11 +509,15 @@ defmodule Octoroom.Agent.Processors.GeminiLive do
     |> Map.put(:model_text, "")
   end
 
-  defp initial_text_timer(%{sent_initial_text?: false, started?: true, setup_complete?: true} = s)
-       when is_binary(s.initial_text) and s.initial_text != "",
-       do: [{:timer, :initial_text, @initial_text_delay_ms}]
+  defp initial_timer(%{sent_initial?: false, started?: true, setup_complete?: true} = s)
+       when is_binary(s.initial_say) and s.initial_say != "",
+       do: [{:timer, :initial_say, @initial_prompt_delay_ms}]
 
-  defp initial_text_timer(_state), do: []
+  defp initial_timer(%{sent_initial?: false, started?: true, setup_complete?: true} = s)
+       when is_binary(s.initial_prompt) and s.initial_prompt != "",
+       do: [{:timer, :initial_prompt, @initial_prompt_delay_ms}]
+
+  defp initial_timer(_state), do: []
 
   defp now, do: System.monotonic_time(:millisecond)
 

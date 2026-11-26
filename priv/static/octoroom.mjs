@@ -428,17 +428,22 @@ export class RoomClient {
   }
 
   /**
-   * Audio levels (0..1) per remote participant and for the local mic, from
-   * WebRTC stats: {local: number, remote: {participant_id: number}}.
+   * Audio levels (0..1) per remote participant, per worker output track, and
+   * for the local mic, from WebRTC stats:
+   * `{local: number, remote: {participant_id: number}, workers: {track: number}}`.
    */
   async levels() {
-    const result = {local: 0, remote: {}}
+    const result = {local: 0, remote: {}, workers: {}}
     if (!this.pc) return result
     const stats = await this.pc.getStats()
     stats.forEach((s) => {
       if (s.type === "inbound-rtp" && s.kind === "audio") {
         const info = this.remote.get(s.mid)
-        if (info?.source === "mic") result.remote[info.participant_id] = s.audioLevel ?? 0
+        if (info?.source === "mic") {
+          result.remote[info.participant_id] = s.audioLevel ?? 0
+        } else if (info && info.source == null && info.track) {
+          result.workers[info.track] = s.audioLevel ?? 0
+        }
       } else if (s.type === "media-source" && s.kind === "audio" && s.trackIdentifier === this.local.get("mic")?.track.id) {
         result.local = s.audioLevel ?? 0
       }

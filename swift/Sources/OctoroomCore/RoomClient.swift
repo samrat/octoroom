@@ -514,17 +514,20 @@ public final class RoomClient {
     emit(.local)
   }
 
-  /// Audio levels (0...1) per remote participant and for the local mic.
+  /// Audio levels (0...1) per remote participant, per worker output track, and for the local mic.
   public func levels() async -> AudioLevels {
     var result = AudioLevels()
     guard let pc else { return result }
     let micId = local[.mic]?.media.id
     for entry in await pc.stats() where entry.kind == "audio" {
       if entry.type == "inbound-rtp", let mid = entry.mid,
-        let track = tracks.first(where: { $0.mid == mid }), track.source == .mic,
-        let participantId = track.participantId
+        let track = tracks.first(where: { $0.mid == mid })
       {
-        result.remote[participantId] = entry.audioLevel ?? 0
+        if track.source == .mic, let participantId = track.participantId {
+          result.remote[participantId] = entry.audioLevel ?? 0
+        } else if track.source == nil {
+          result.workers[track.info.track] = entry.audioLevel ?? 0
+        }
       } else if entry.type == "media-source", entry.trackIdentifier == micId {
         result.local = entry.audioLevel ?? 0
       }

@@ -401,7 +401,7 @@ defmodule Octoroom.Agent.WorkerTest do
   end
 
   test "a restarted agent carries on the conversation, and apps can read it", ctx do
-    %{alice: alice} = start(ctx, 50, %{initial_text: "Greet everyone."})
+    %{alice: alice} = start(ctx, 50, %{initial_prompt: "Greet everyone."})
     # The greeting starts 100 ms after the agent does.
     assert_receive {:llm, ["Be brief.", "Greet everyone."]}, 1_000
 

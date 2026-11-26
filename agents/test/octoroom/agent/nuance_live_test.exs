@@ -208,7 +208,7 @@ defmodule Octoroom.Agent.NuanceLiveTest do
           owner: test_pid,
           runner: test_pid,
           instructions: "You are Sam.",
-          initial_text: "Say hello!",
+          initial_prompt: "Say hello!",
           tools: [tool]
         })
 

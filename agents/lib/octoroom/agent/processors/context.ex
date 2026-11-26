@@ -22,8 +22,8 @@ defmodule Octoroom.Agent.Processors.Context do
       silently, or a new turn about it
     * `Prompt` - a turn from the app (`Octoroom.Agent.prompt/3`), marked as
       not said by anyone on the call
-    * `Start` - after `initial_delay_ms`, the agent's `initial_text` starts a
-      turn
+    * `Start` - after `initial_delay_ms`, the agent's `initial_say` (spoken
+      verbatim) or `initial_prompt` (answered by the model) starts the call
 
   It also emits the owner's conversation events (`Octoroom.Agent.ConversationEvents`),
   and sends the owner `{:voice_pipeline, pid, {:memory, memory}}` whenever
@@ -33,8 +33,10 @@ defmodule Octoroom.Agent.Processors.Context do
   runner context) carries on from it.
 
   Options (each defaults to the runner context's value): `:instructions`,
-  `:initial_text`, `:tools`; plus `:max_tool_rounds` (4), `:max_history` (20),
-  `:initial_delay_ms` (100).
+  `:initial_prompt`, `:initial_say`, `:tools`; plus `:max_tool_rounds` (4), `:max_history` (20),
+  `:initial_delay_ms` (100), and `:speaker_labels` (`true` by default: always
+  prepend `[speaker]` when present; `false` to omit; `:auto` to omit in 1-on-1
+  calls and prepend once more than one distinct speaker has been heard).
   """
 
   use Octoroom.Agent.Processor
@@ -80,12 +82,15 @@ defmodule Octoroom.Agent.Processors.Context do
 
     state = %{
       instructions: Keyword.get(opts, :instructions, Map.get(ctx, :instructions)),
-      initial_text: Keyword.get(opts, :initial_text, Map.get(ctx, :initial_text)),
+      initial_prompt: Keyword.get(opts, :initial_prompt, Map.get(ctx, :initial_prompt)),
+      initial_say: Keyword.get(opts, :initial_say, Map.get(ctx, :initial_say)),
       restore_prompt: restore_prompt,
       tools: Keyword.get(opts, :tools, Map.get(ctx, :tools, [])),
       max_tool_rounds: Keyword.get(opts, :max_tool_rounds, 4),
       max_history: Keyword.get(opts, :max_history, 20),
       initial_delay_ms: Keyword.get(opts, :initial_delay_ms, 100),
+      speaker_labels: Keyword.get(opts, :speaker_labels, true),
+      speakers_seen: MapSet.new(),
       frame_ttl_ms: Keyword.get(opts, :frame_ttl_ms, 10_000),
       max_frames: Keyword.get(opts, :max_frames, 4),
       clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
@@ -144,9 +149,14 @@ defmodule Octoroom.Agent.Processors.Context do
        do:
          {[{:push, frame, :downstream}, {:timer, :restore_prompt, state.initial_delay_ms}], state}
 
-  defp frame(%Frames.Start{} = frame, :downstream, %{initial_text: text} = state)
+  defp frame(%Frames.Start{} = frame, :downstream, %{initial_say: text} = state)
        when is_binary(text) and text != "",
-       do: {[{:push, frame, :downstream}, {:timer, :initial_text, state.initial_delay_ms}], state}
+       do: {[{:push, frame, :downstream}, {:timer, :initial_say, state.initial_delay_ms}], state}
+
+  defp frame(%Frames.Start{} = frame, :downstream, %{initial_prompt: text} = state)
+       when is_binary(text) and text != "",
+       do:
+         {[{:push, frame, :downstream}, {:timer, :initial_prompt, state.initial_delay_ms}], state}
 
   defp frame(
          %Frames.Transcription{turn_id: turn_id, text: text} = frame,
@@ -158,7 +168,8 @@ defmodule Octoroom.Agent.Processors.Context do
 
   defp frame(%Frames.PreemptiveTranscription{text: text} = frame, :downstream, state)
        when is_binary(text) and text != "" do
-    content = if is_binary(frame.speaker), do: "[#{frame.speaker}] " <> text, else: text
+    {speaker, state} = effective_speaker(frame.speaker, state)
+    content = if is_binary(speaker), do: "[#{speaker}] " <> text, else: text
     message = %{role: "user", content: content}
     history = append(state.history, message, state)
 
@@ -184,7 +195,8 @@ defmodule Octoroom.Agent.Processors.Context do
         |> ConversationEvents.commit(:user, :completed, extra)
       end)
 
-    message = %{role: "user", content: user_content(frame)}
+    {speaker, state} = effective_speaker(frame.speaker, state)
+    message = %{role: "user", content: user_content(%{frame | speaker: speaker})}
 
     if frame.respond,
       do: start_turn(message, state, speaker_source: frame.source),
@@ -193,7 +205,14 @@ defmodule Octoroom.Agent.Processors.Context do
 
   defp frame(%Frames.UserAudio{} = frame, :downstream, state) do
     {events, reservation} = ConversationEvents.reserve(state.events)
-    turn = %{reservation: reservation, speaker: frame.speaker, source: frame.source}
+    {speaker, state} = effective_speaker(frame.speaker, state)
+
+    turn = %{
+      reservation: reservation,
+      speaker: frame.speaker,
+      label_speaker: speaker,
+      source: frame.source
+    }
 
     state = %{
       state
@@ -201,7 +220,7 @@ defmodule Octoroom.Agent.Processors.Context do
         audio_turns: Map.put(state.audio_turns, frame.turn_id, turn)
     }
 
-    message = AudioTurn.message(frame.audio, frame.sample_rate, frame.turn_id, frame.speaker)
+    message = AudioTurn.message(frame.audio, frame.sample_rate, frame.turn_id, speaker)
 
     if frame.respond,
       do: start_turn(message, state, speaker_source: frame.source),
@@ -298,9 +317,19 @@ defmodule Octoroom.Agent.Processors.Context do
 
   defp frame(frame, direction, state), do: {[{:push, frame, direction}], state}
 
-  defp timer(:initial_text, state) do
-    {effects, state} = start_turn(%{role: "user", content: state.initial_text}, state)
-    {[{:notify, {:status, "Thinking"}} | effects], state}
+  defp timer(:initial_say, %{initial_say: text} = state) when is_binary(text) and text != "" do
+    history = append(state.history, @reply_pending, state)
+
+    {[
+       {:push, %Frames.LLMResponseStart{}, :downstream},
+       {:push, %Frames.LLMText{text: text}, :downstream},
+       {:push, %Frames.LLMResponseEnd{}, :downstream}
+     ], %{state | history: history, initial_say: nil, initial_prompt: nil}}
+  end
+
+  defp timer(:initial_prompt, state) do
+    {effects, state} = start_turn(%{role: "user", content: state.initial_prompt}, state)
+    {[{:notify, {:status, "Thinking"}} | effects], %{state | initial_prompt: nil}}
   end
 
   defp timer(:restore_prompt, %{restore_prompt: nil} = state), do: {[], state}
@@ -333,11 +362,24 @@ defmodule Octoroom.Agent.Processors.Context do
     events =
       ConversationEvents.commit_reserved(state.events, :user, turn.reservation, text, extra)
 
-    labelled = if turn.speaker, do: "[#{turn.speaker}] " <> text, else: text
+    label_speaker = Map.get(turn, :label_speaker, turn.speaker)
+    labelled = if label_speaker, do: "[#{label_speaker}] " <> text, else: text
     history = AudioTurn.replace_with_transcript(state.history, frame.turn_id, labelled)
     notice = {:notify, {:transcription, %{status: "final", text: text}}}
     {[notice], %{state | events: events, audio_turns: audio_turns, history: history}}
   end
+
+  defp effective_speaker(speaker, %{speaker_labels: false} = state) when is_binary(speaker),
+    do: {nil, state}
+
+  defp effective_speaker(speaker, %{speaker_labels: :auto} = state)
+       when is_binary(speaker) and speaker != "" do
+    seen = MapSet.put(state.speakers_seen, speaker)
+    state = %{state | speakers_seen: seen}
+    {if(MapSet.size(seen) > 1, do: speaker, else: nil), state}
+  end
+
+  defp effective_speaker(speaker, state), do: {speaker, state}
 
   defp user_content(%Frames.Transcription{speaker: speaker} = frame) when is_binary(speaker),
     do: "[#{speaker}] " <> user_content(%{frame | speaker: nil})

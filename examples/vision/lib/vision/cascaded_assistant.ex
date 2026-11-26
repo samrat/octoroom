@@ -19,7 +19,7 @@ defmodule Vision.CascadedAssistant do
   end
 
   @impl true
-  def initial_text(_ctx),
+  def initial_prompt(_ctx),
     do: "Greet me briefly and let me know I can turn on my camera or share my screen."
 
   @impl true

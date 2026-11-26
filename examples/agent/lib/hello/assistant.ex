@@ -121,7 +121,7 @@ defmodule Hello.Assistant do
   end
 
   @impl true
-  def initial_text(_ctx),
+  def initial_prompt(_ctx),
     do: "Answer the phone warmly in one short sentence as the receptionist at Elixir Clinic."
 
   @impl true

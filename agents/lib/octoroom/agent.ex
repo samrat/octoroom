@@ -112,12 +112,20 @@ defmodule Octoroom.Agent do
   @callback tools(ctx) :: [%Octoroom.Agent.Tool{}]
 
   @doc """
-  Something to answer as soon as the agent starts, as if a person had said
-  it ("Greet the visitor"). Not used when the agent restarts during a room's
-  recovery (`ctx.resumed`) or carries on a saved conversation, so it
-  doesn't greet twice.
+  Prompt sent to the model as soon as the agent starts so it generates an
+  opening reply ("Greet the visitor"). Mirrors `Octoroom.Agent.prompt/3`.
+  Not used when the agent restarts during a room's recovery (`ctx.resumed`)
+  or carries on a saved conversation, so it doesn't greet twice.
   """
-  @callback initial_text(ctx) :: String.t() | nil
+  @callback initial_prompt(ctx) :: String.t() | nil
+
+  @doc """
+  Words spoken verbatim as soon as the agent starts, straight to
+  text-to-speech (like `Octoroom.Agent.say/3`). Takes precedence over
+  `initial_prompt/1` if both are set. Not used on `ctx.resumed` or restored
+  conversations.
+  """
+  @callback initial_say(ctx) :: String.t() | nil
 
   @doc """
   What the agent runs: `{front_end, back_end}` pipeline specs. The one
@@ -163,7 +171,10 @@ defmodule Octoroom.Agent do
       def tools(_ctx), do: []
 
       @impl Octoroom.Agent
-      def initial_text(_ctx), do: nil
+      def initial_prompt(_ctx), do: nil
+
+      @impl Octoroom.Agent
+      def initial_say(_ctx), do: nil
 
       @impl Octoroom.Agent
       def questions(ctx), do: Octoroom.Agent.default_questions(ctx)
@@ -173,7 +184,8 @@ defmodule Octoroom.Agent do
 
       defoverridable instructions: 1,
                      tools: 1,
-                     initial_text: 1,
+                     initial_prompt: 1,
+                     initial_say: 1,
                      questions: 1,
                      decide: 2
     end

@@ -39,6 +39,75 @@ defmodule Octoroom.Agent.Processors.ContextTest do
            ]
   end
 
+  test "speaker_labels: false omits [speaker] in LLM history while keeping event metadata" do
+    harness =
+      processor(:context, Context, speaker_labels: false)
+      |> Harness.start!(ctx: %{owner: self()})
+      |> Harness.push(%Frames.PreemptiveTranscription{text: "Hello", speaker: "iPhone"})
+      |> Harness.push(%Frames.Transcription{text: "Hello there.", speaker: "iPhone", turn_id: 1})
+
+    assert [%{role: "user", content: "Hello"}] =
+             harness
+             |> Harness.outputs(Frames.PreemptiveLLMContext)
+             |> List.last()
+             |> Map.fetch!(:messages)
+
+    assert history(harness) == [
+             %{role: "user", content: "Hello there."},
+             %{role: "assistant", content: nil, reply_pending: true}
+           ]
+
+    assert_received {:voice_pipeline, _,
+                     {:conversation, %{role: "user", text: "Hello there.", speaker: "iPhone"}}}
+  end
+
+  test "speaker_labels: :auto omits labels for a single speaker and enables them once a second speaker joins" do
+    harness =
+      processor(:context, Context, speaker_labels: :auto)
+      |> Harness.start!(ctx: %{owner: self()})
+      |> Harness.push(%Frames.Transcription{text: "Hi.", speaker: "Alice", turn_id: 1})
+      |> Harness.push(%Frames.AssistantMessage{text: "Hello!"}, :upstream)
+      |> Harness.push(%Frames.Transcription{text: "How are you?", speaker: "Alice", turn_id: 2})
+      |> Harness.push(%Frames.AssistantMessage{text: "Doing great."}, :upstream)
+      |> Harness.push(%Frames.Transcription{text: "Me too!", speaker: "Bob", turn_id: 3})
+      |> Harness.push(%Frames.AssistantMessage{text: "Hi Bob!"}, :upstream)
+
+    assert history(harness) == [
+             %{role: "user", content: "Hi."},
+             %{role: "assistant", content: "Hello!"},
+             %{role: "user", content: "How are you?"},
+             %{role: "assistant", content: "Doing great."},
+             %{role: "user", content: "[Bob] Me too!"},
+             %{role: "assistant", content: "Hi Bob!"}
+           ]
+  end
+
+  test "initial_say speaks verbatim without invoking the LLM, and fills history when played" do
+    harness =
+      processor(:context, Context, initial_say: "Deploy passed. Ready to ship?")
+      |> Harness.start!(ctx: %{owner: self()})
+      |> Harness.push(%Frames.Start{})
+
+    assert Harness.timer_pending?(harness, :context, :initial_say)
+    harness = Harness.fire_timer(harness, :context, :initial_say)
+
+    assert Harness.outputs(harness, Frames.LLMContext) == []
+
+    assert [%Frames.LLMText{text: "Deploy passed. Ready to ship?"}] =
+             Harness.outputs(harness, Frames.LLMText)
+
+    harness =
+      Harness.push(
+        harness,
+        %Frames.AssistantMessage{text: "Deploy passed. Ready to ship?"},
+        :upstream
+      )
+
+    assert history(harness) == [
+             %{role: "assistant", content: "Deploy passed. Ready to ship?"}
+           ]
+  end
+
   test "an interrupted reply says so, and an empty one leaves no trace" do
     harness =
       start()
