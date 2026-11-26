@@ -156,23 +156,43 @@ defmodule Call.Captioner do
   @moduledoc """
   Live captions: streams every mic it hears to Soniox's real-time
   speech-to-text, one WebSocket per input, and emits
-  `{:caption, track, %{text: text, done: done?}}` as words arrive. A line is
-  `done` at the end of an utterance; until then its text may still change.
+  `{:captions, captions}` as words arrive. A line is `done` at the end of an
+  utterance; until then its text may still change.
 
-  Needs `config :call, soniox_api_key:`. After a restart (the room
-  recovering) it starts over with new sockets: captions pause while it's
-  down, and pick up again.
+  Needs `config :call, soniox_api_key:`. Saves the transcript via `save:` so
+  it survives crashes and deploys: after a restart it restores `ctx.saved`,
+  opens new Soniox sockets, and picks up where it left off.
   """
   use Octoroom.Worker, audio: [rate: 16_000, channels: 1]
 
   require Logger
 
+  @max_captions 20
+
   @impl true
   def init(_args, ctx) do
     if ctx.resumed, do: Logger.info("Captioner resumed after #{ctx.resumed.gone_ms} ms")
 
-    {:ok,
-     %{key: Application.fetch_env!(:call, :soniox_api_key), inputs: %{}, sockets: %{}, wait: %{}}}
+    captions =
+      case ctx.saved do
+        list when is_list(list) -> Enum.map(list, &Map.put(&1, :done, true))
+        _ -> []
+      end
+
+    speakers = Map.new(ctx.participants, fn p -> {"#{p.id}/mic", p.meta.name} end)
+
+    state = %{
+      room_id: ctx.room_id,
+      key: Application.fetch_env!(:call, :soniox_api_key),
+      inputs: %{},
+      sockets: %{},
+      wait: %{},
+      speakers: speakers,
+      captions: captions
+    }
+
+    actions = if captions != [], do: [save: captions, emit: {:captions, captions}], else: []
+    {:ok, state, actions}
   end
 
   @impl true
@@ -190,8 +210,15 @@ defmodule Call.Captioner do
   @impl true
   def handle_info({:soniox, socket, {kind, text}}, state) when kind in [:partial, :final] do
     case state.sockets[socket] do
-      nil -> {:ok, state}
-      input -> {:ok, state, emit: {:caption, input, %{text: text, done: kind == :final}}}
+      nil ->
+        {:ok, state}
+
+      input ->
+        {speaker, state} = speaker_name(state, input)
+        entry = %{track: input, speaker: speaker, text: text, done: kind == :final}
+        captions = put_caption(state.captions, entry)
+        state = %{state | captions: captions}
+        {:ok, state, emit: {:captions, captions}, save: captions}
     end
   end
 
@@ -211,6 +238,36 @@ defmodule Call.Captioner do
   end
 
   def handle_info(_message, state), do: {:ok, state}
+
+  defp put_caption(captions, entry) do
+    captions =
+      case Enum.find_index(captions, &(&1.track == entry.track and not &1.done)) do
+        nil -> captions ++ [entry]
+        i -> List.replace_at(captions, i, entry)
+      end
+
+    Enum.take(captions, -@max_captions)
+  end
+
+  defp speaker_name(state, input) do
+    case state.speakers[input] do
+      name when is_binary(name) ->
+        {name, state}
+
+      nil ->
+        speakers =
+          case Octoroom.Room.state(state.room_id) do
+            %{participants: participants} ->
+              Map.new(participants, fn p -> {"#{p.id}/mic", p.meta.name} end)
+
+            _ ->
+              %{}
+          end
+
+        speakers = Map.merge(state.speakers, speakers)
+        {speakers[input], %{state | speakers: speakers}}
+    end
+  end
 
   defp socket(state, input) do
     # Monotonic time can be negative: no entry means not waiting.
@@ -275,6 +332,8 @@ defmodule Call.SonioxSocket do
       audio_format: "pcm_s16le",
       sample_rate: 16_000,
       num_channels: 1,
+      language_hints: ["en"],
+      language_hints_strict: true,
       enable_endpoint_detection: true
     }
 

@@ -46,9 +46,15 @@ end
 # SONIOX_API_KEY: for live captions (optional).
 config :call, soniox_api_key: fetch.("SONIOX_API_KEY")
 
-# OCTOROOM_STORE: where the room store's snapshot lives, so rooms survive a
-# restart of this app (defaults to the system temp directory).
-if path = fetch.("OCTOROOM_STORE"), do: config(:octoroom, store: {Octoroom.Store.ETS, path: path})
+port = String.to_integer(System.get_env("PORT") || "4300")
 
-if port = System.get_env("PORT"),
-  do: config(:call, Call.Endpoint, http: [port: String.to_integer(port)])
+# OCTOROOM_STORE: where the room store's snapshot lives, so rooms survive a
+# restart of this app. Defaults to one per port in tmp/ (matching examples/meet
+# and examples/agent) so other local servers don't overwrite the snapshot.
+store_path =
+  fetch.("OCTOROOM_STORE") || Path.expand("../tmp/octoroom-#{port}.store", __DIR__)
+
+config :octoroom, store: {Octoroom.Store.ETS, path: store_path}
+
+if System.get_env("PORT"),
+  do: config(:call, Call.Endpoint, http: [port: port])

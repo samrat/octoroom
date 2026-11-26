@@ -131,6 +131,7 @@ const Call = {
     room.on("state", (state) => {
       this.pushEvent("client", {state, participant_id: room.participantId})
       this.buttons(state !== "idle")
+      if (state === "idle") this.renderVideos()
     })
     room.on("connection", (state) => this.status(`Media: ${state}`))
     room.on("tracks", (tracks) => {
@@ -147,7 +148,7 @@ const Call = {
     room.on("reconnected", ({resumed}) =>
       this.status(resumed ? "Reconnected: resumed the same session." : "Reconnected as a new participant; publishing again…"),
     )
-    room.on("left", () => this.cleanup())
+    room.on("left", () => this.cleanup(room))
 
     this.status(this.tone ? `Joining with a ${this.tone.frequency} Hz test tone…` : "Joining…")
     const started = performance.now()
@@ -315,7 +316,8 @@ const Call = {
     for (const [id, level] of Object.entries(remote)) set(id, level)
   },
 
-  cleanup() {
+  cleanup(room) {
+    if (!room || this.room === room) this.room = null
     clearInterval(this.meters)
     this.tone?.stop()
     this.tone = null
@@ -327,10 +329,19 @@ const Call = {
     document.querySelectorAll("[id^=level-]").forEach((el) => (el.style.width = "0"))
   },
 
+  // LiveView still patches attributes on `#call` even with `phx-update="ignore"`,
+  // which strips `.in-call` / `.has-camera` when it re-renders or reconnects.
+  updated() {
+    if (this.room) this.buttons(this.room.state !== "idle")
+  },
+
   // LiveView reconnected (e.g. after a server restart): its server side
   // starts afresh and needs to know who this tab is again.
   reconnected() {
-    if (this.room) this.pushEvent("client", {state: this.room.state, participant_id: this.room.participantId})
+    if (this.room) {
+      this.buttons(this.room.state !== "idle")
+      this.pushEvent("client", {state: this.room.state, participant_id: this.room.participantId})
+    }
   },
 
   destroyed() {

@@ -119,7 +119,8 @@ defmodule Call.Layouts do
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Octoroom call</title>
+        <title>Octoroom</title>
+        <link rel="icon" type="image/svg+xml" href="/assets/logo.svg" />
         <style>
           :root {
             color-scheme: light;
@@ -131,8 +132,8 @@ defmodule Call.Layouts do
             --faint: #78716c;
             --border: #e7e5e4;
             --border-strong: #d6d3d1;
-            --accent: #ea580c;
-            --accent-hover: #c2410c;
+            --accent: #155dfc;
+            --accent-hover: #193cb8;
             --ok-bg: #ecfdf5;
             --ok-border: #a7f3d0;
             --ok-fg: #047857;
@@ -154,7 +155,16 @@ defmodule Call.Layouts do
             display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;
             padding-bottom: 18px; border-bottom: 1px solid var(--border); margin-bottom: 24px;
           }
-          h1 { font-size: 22px; font-weight: 650; margin: 0; letter-spacing: -0.025em; }
+          h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.02em; color: var(--muted); }
+          .brand-head { display: flex; align-items: center; gap: 10px; }
+          .brand {
+            display: inline-flex; align-items: center; gap: 9px;
+            text-decoration: none; color: var(--fg); font-weight: 700;
+            font-size: 20px; letter-spacing: -0.03em;
+          }
+          .brand:hover { text-decoration: none; color: var(--accent); }
+          .brand-mark { display: block; width: 32px; height: 32px; flex-shrink: 0; }
+          .brand-sep { color: var(--border-strong); font-weight: 400; font-size: 20px; user-select: none; }
           .badges {
             display: flex; gap: 8px; align-items: center;
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--faint);
@@ -237,6 +247,7 @@ defmodule Call.Layouts do
           .captions {
             background: var(--card); border: 1px solid var(--border);
             border-radius: 12px; padding: 12px 16px; margin-top: 16px;
+            max-height: 240px; overflow-y: auto;
           }
           .captions .line { margin: 4px 0; }
           .captions .partial { color: var(--faint); }
@@ -313,13 +324,14 @@ defmodule Call.Components do
   @doc "Join, mute, camera and screen controls, run by the `Call` hook in app.js."
   attr :room, :string, required: true
   attr :card, :boolean, default: false
+  attr :in_call?, :boolean, default: false
   attr :local_sfu?, :boolean, default: false
 
   def call_controls(assigns) do
     ~H"""
     <div
       id="call"
-      class={["controls", @card && "card"]}
+      class={["controls", @card && "card", @in_call? && "in-call"]}
       phx-hook="Call"
       phx-update="ignore"
       data-room={@room}
@@ -391,7 +403,7 @@ defmodule Call.CallLive do
         me: nil,
         viewer: viewer,
         viewers: viewers(room),
-        captions: [],
+        captions: saved_captions(room),
         recorded: %{},
         recording_dir: nil,
         captions?: Call.Room.captions_available?(),
@@ -408,6 +420,12 @@ defmodule Call.CallLive do
         socket
       ),
       do: {:noreply, assign(socket, recorded: seconds, recording_dir: dir)}
+
+  def handle_info(
+        {:octoroom, _room, {:worker_event, "captioner", {:captions, captions}}},
+        socket
+      ),
+      do: {:noreply, assign(socket, captions: captions)}
 
   def handle_info(
         {:octoroom, _room, {:worker_event, "captioner", {:caption, track, line}}},
@@ -465,10 +483,17 @@ defmodule Call.CallLive do
   defp load(socket) do
     room = socket.assigns.room
 
-    {participants, workers, outputs, assigns} =
+    {room_up?, participants, workers, outputs, assigns} =
       case Octoroom.Room.state(room) do
-        %{} = s -> {s.participants, s.workers, s.outputs, s.assigns}
-        {:error, :no_room} -> {[], [], %{}, %{}}
+        %{} = s -> {true, s.participants, s.workers, s.outputs, s.assigns}
+        {:error, :no_room} -> {false, [], [], %{}, %{}}
+      end
+
+    captions =
+      cond do
+        room_up? and not (assigns[:captions] || false) -> []
+        socket.assigns.captions == [] -> saved_captions(room)
+        true -> socket.assigns.captions
       end
 
     labels = [
@@ -495,6 +520,7 @@ defmodule Call.CallLive do
       outputs: outputs,
       stats: stats,
       assigns: assigns,
+      captions: captions,
       names: names,
       my_echo: me != nil and me.meta.echo,
       my_video: me == nil or me.meta.video
@@ -523,6 +549,13 @@ defmodule Call.CallLive do
     for {_id, %{metas: [meta | _]}} <- Call.Presence.list(presence_topic(room)), do: meta.name
   end
 
+  defp saved_captions(room) do
+    case Octoroom.Worker.saved(room, "captioner") do
+      list when is_list(list) -> list
+      _ -> []
+    end
+  end
+
   # The newest lines last. A track's line in progress is replaced as Soniox
   # revises it; a done line stays.
   defp caption(captions, track, line) do
@@ -534,7 +567,7 @@ defmodule Call.CallLive do
         i -> List.replace_at(captions, i, entry)
       end
 
-    Enum.take(captions, -8)
+    Enum.take(captions, -20)
   end
 
   defp input_note(worker, input) do
@@ -560,7 +593,31 @@ defmodule Call.CallLive do
     ~H"""
     <main>
       <div class="head">
-        <h1>Room “{@room}”</h1>
+        <div class="brand-head" style="display:flex;align-items:center;gap:10px;">
+          <a
+            href="/"
+            class="brand"
+            style="display:inline-flex;align-items:center;gap:9px;text-decoration:none;color:#1c1917;font-weight:700;font-size:20px;letter-spacing:-0.03em;"
+          >
+            <img
+              src="/assets/logo.svg"
+              alt="Octoroom"
+              width="32"
+              height="32"
+              class="brand-mark"
+              style="display:block;width:32px;height:32px;flex-shrink:0;"
+            />
+            <span class="brand-name">Octoroom</span>
+          </a>
+          <span
+            class="brand-sep"
+            aria-hidden="true"
+            style="color:#d6d3d1;font-weight:400;font-size:20px;user-select:none;"
+          >
+            /
+          </span>
+          <h1 style="font-size:19px;font-weight:600;margin:0;color:#57534e;">Room “{@room}”</h1>
+        </div>
         <div class="badges">
           <span class="pill">{if @local_sfu?, do: "LOCAL SFU", else: "CLOUDFLARE SFU"}</span>
           <span :if={@participants != []} class="pill live">
@@ -571,7 +628,7 @@ defmodule Call.CallLive do
 
       <div id="videos" class="videos" phx-update="ignore"></div>
 
-      <.call_controls room={@room} card={true} local_sfu?={@local_sfu?} />
+      <.call_controls room={@room} card={true} in_call?={@me != nil} local_sfu?={@local_sfu?} />
 
       <div :if={@participants != []} class="roster">
         <div :for={p <- @participants} id={"p-#{p.id}"} class="member">
@@ -592,7 +649,7 @@ defmodule Call.CallLive do
       <div :if={@assigns[:captions]} class="captions" id="captions">
         <p :if={@captions == []} class="empty">Captions are on. Say something…</p>
         <p :for={c <- @captions} class={["line", not c.done && "partial"]}>
-          <strong>{name(@names, c.track)}:</strong> {c.text}
+          <strong>{Map.get(@names, c.track) || c[:speaker] || c.track}:</strong> {c.text}
         </p>
       </div>
 
@@ -786,7 +843,7 @@ defmodule Call.Endpoint do
     from: {:octoroom, "priv/static"},
     only: ~w(octoroom.mjs)
 
-  plug Plug.Static, at: "/assets", from: {:call, "priv/static"}, only: ~w(app.js)
+  plug Plug.Static, at: "/assets", from: {:call, "priv/static"}, only: ~w(app.js logo.svg)
 
   plug Call.Router
 end
